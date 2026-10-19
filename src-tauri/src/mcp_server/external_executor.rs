@@ -10,11 +10,13 @@
 //   `CommandSource::ExternalMcp` 与 `docs/mcp-server.md` 的安全说明。
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use tauri::AppHandle;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::RwLock as TokioRwLock;
 
@@ -25,6 +27,25 @@ use crate::mcp_server::sftp_ops::{FileInfo, SftpExecutor, TransferResult};
 use crate::ssh::auth::AuthMethod;
 use crate::ssh::connection::ConnectionConfig;
 use crate::SshManager;
+
+/// 外部调用生命周期事件（GUI 可见会话用）。
+///
+/// payload 分两相：
+/// - `phase: "started"`：`{phase, connectionId, connectionName, host, sessionId,
+///   command, seq, source, startedAt}`
+/// - `phase: "finished"`：`{phase, connectionId, seq, status, exitCode, finishedAt, error?}`
+pub const EXEC_EVENT: &str = "mcp://external-exec";
+
+/// 外部调用输出 chunk 事件（复用 executor 的流式协议）：
+/// `{type:"toolOutput", toolCallId:"mcp:{connectionId}:{seq}", chunk}`。
+pub const OUTPUT_EVENT: &str = "mcp://exec-output";
+
+fn now_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
 
 /// 「连接不存在」错误的前缀。
 ///
@@ -71,6 +92,13 @@ pub struct ExternalExecutor {
     /// 刻意不写系统密钥链：临时连接的语义就是「随进程生灭」，
     /// 落盘反而制造出没人清理的凭据残留。
     temp_auth: RwLock<HashMap<String, AuthMethod>>,
+    /// GUI 内启动的 MCP 服务持有 AppHandle：外部调用因此能把命令与输出
+    /// 实时推到界面（见 `EXEC_EVENT` / `OUTPUT_EVENT`）。CLI 无头模式为
+    /// `None`，行为与旧版一致（不产生任何 GUI 事件）。
+    app: Option<AppHandle>,
+    /// 可见命令的全局序号：每个 chunk 的 `toolCallId` 编码
+    /// `mcp:{connectionId}:{seq}`，前端据此把输出路由回对应会话。
+    seq: AtomicU64,
 }
 
 /// 连接信息（不含敏感数据）
@@ -107,6 +135,7 @@ impl ExternalExecutor {
         connection_store: Arc<TokioRwLock<ConnectionStore>>,
         command_exec: Arc<CommandExecutionManager>,
         ssh_manager: Arc<SshManager>,
+        app: Option<AppHandle>,
     ) -> Self {
         let sftp_executor = SftpExecutor::new(ssh_manager.clone());
         Self {
@@ -116,6 +145,8 @@ impl ExternalExecutor {
             sftp_executor,
             sessions: TokioMutex::new(HashMap::new()),
             temp_auth: RwLock::new(HashMap::new()),
+            app,
+            seq: AtomicU64::new(0),
         }
     }
 
@@ -251,6 +282,75 @@ impl ExternalExecutor {
         }
     }
 
+    /// 执行 SSH 命令并**实时推送到 GUI**（外部 AI / 用户输入共用）。
+    ///
+    /// 与 [`Self::execute_command`] 的执行语义完全一致（无头会话复用、死会话
+    /// 重建重试），差别只在事件：
+    /// - 命令开始发 [`EXEC_EVENT`]（`phase:"started"`）；
+    /// - 输出经 [`OUTPUT_EVENT`] 流式下发（每个 chunk 携带
+    ///   `toolCallId = "mcp:{connectionId}:{seq}"` 供前端路由）；
+    /// - 结束发 [`EXEC_EVENT`]（`phase:"finished"`，含状态与退出码）。
+    ///
+    /// 无 AppHandle（CLI 无头模式）时行为等价静默版——不产生任何 GUI 事件。
+    ///
+    /// `source` 区分「外部 AI 派发」与「用户在界面输入」，前端据此标注来源。
+    pub async fn execute_command_visible(
+        &self,
+        connection_id: &str,
+        command: &str,
+        timeout_ms: Option<u64>,
+        source: CommandSource,
+    ) -> Result<CommandOutput, AppError> {
+        log::info!(
+            "[MCP External] execute_command_visible: connection={}, source={:?}, timeout={:?}ms",
+            connection_id,
+            source,
+            timeout_ms
+        );
+
+        let session_id = self.ensure_session(connection_id).await?;
+        let conn = self.saved_connection(connection_id).await?;
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
+
+        self.emit_started(connection_id, &conn, &session_id, command, seq, source);
+
+        match self
+            .submit_on_visible(connection_id, &session_id, command, timeout_ms, seq, source)
+            .await
+        {
+            Ok(out) => {
+                self.emit_finished(connection_id, seq, "completed", Some(out.exit_code), None);
+                Ok(out)
+            }
+            Err(e) if is_dead_session_error(&e) => {
+                log::info!(
+                    "[MCP External] 会话 {} 已失效（{}），重建后重试一次",
+                    session_id,
+                    e
+                );
+                self.sessions.lock().await.remove(connection_id);
+                let fresh = self.ensure_session(connection_id).await?;
+                match self
+                    .submit_on_visible(connection_id, &fresh, command, timeout_ms, seq, source)
+                    .await
+                {
+                    Ok(out) => {
+                        self.emit_finished(connection_id, seq, "completed", Some(out.exit_code), None);
+                        Ok(out)
+                    }
+                    Err(e2) => {
+                        self.emit_finished(connection_id, seq, "failed", None, Some(e2.to_string()));
+                        Err(e2)
+                    }
+                }
+            }
+            Err(e) => {
+                self.emit_finished(connection_id, seq, "failed", None, Some(e.to_string()));
+                Err(e)
+            }
+        }
+    }
+
     /// 在指定会话上跑一条命令并归一化结果。
     async fn submit_on(
         &self,
@@ -279,6 +379,98 @@ impl ExternalExecutor {
                 Err(AppError::Agent(format!("Command cancelled: {:?}", reason)))
             }
             SubmitOutcome::Failed { error } => Err(error),
+        }
+    }
+
+    /// 可见版 `submit_on`：AppHandle 存在时声明流式输出，每个 chunk 经
+    /// [`OUTPUT_EVENT`] 实时下发（`toolCallId` 编码连接与序号）。
+    async fn submit_on_visible(
+        &self,
+        connection_id: &str,
+        session_id: &str,
+        command: &str,
+        timeout_ms: Option<u64>,
+        seq: u64,
+        source: CommandSource,
+    ) -> Result<CommandOutput, AppError> {
+        let mut ticket = CommandTicket::new(session_id, command, source).timeout(
+            timeout_ms
+                .map(Duration::from_millis)
+                .unwrap_or(Duration::from_secs(30)),
+        );
+
+        let app = self.app.clone();
+        if app.is_some() {
+            ticket = ticket.streaming(OUTPUT_EVENT, format!("mcp:{}:{}", connection_id, seq));
+        }
+
+        match self.command_exec.submit_opt(app.as_ref(), ticket).await {
+            SubmitOutcome::Completed { output, exit } => Ok(CommandOutput {
+                stdout: output,
+                stderr: String::new(), // exec 通道 stdout/stderr 合流，见 executor 模块注释
+                exit_code: exit.code.unwrap_or(1) as i32,
+            }),
+            SubmitOutcome::TimedOut { output } => Err(AppError::Agent(format!(
+                "Command timed out。已收到的部分输出：{}",
+                output
+            ))),
+            SubmitOutcome::Cancelled { reason } => {
+                Err(AppError::Agent(format!("Command cancelled: {:?}", reason)))
+            }
+            SubmitOutcome::Failed { error } => Err(error),
+        }
+    }
+
+    fn emit_started(
+        &self,
+        connection_id: &str,
+        conn: &SavedConnection,
+        session_id: &str,
+        command: &str,
+        seq: u64,
+        source: CommandSource,
+    ) {
+        if let Some(app) = &self.app {
+            crate::emit_event(
+                app,
+                EXEC_EVENT,
+                &serde_json::json!({
+                    "phase": "started",
+                    "connectionId": connection_id,
+                    "connectionName": conn.name,
+                    "host": conn.host,
+                    "sessionId": session_id,
+                    "command": command,
+                    "seq": seq,
+                    "source": source,
+                    "startedAt": now_millis(),
+                }),
+            );
+        }
+    }
+
+    fn emit_finished(
+        &self,
+        connection_id: &str,
+        seq: u64,
+        status: &str,
+        exit_code: Option<i32>,
+        error: Option<String>,
+    ) {
+        if let Some(app) = &self.app {
+            crate::emit_event(
+                app,
+                EXEC_EVENT,
+                &serde_json::json!({
+                    "phase": "finished",
+                    "connectionId": connection_id,
+                    "seq": seq,
+                    "status": status,
+                    "exitCode": exit_code,
+                    "finishedAt": now_millis(),
+                    "error": error,
+                }),
+            );
         }
     }
 
@@ -560,7 +752,7 @@ mod tests {
             .await,
         );
         let store = Arc::new(TokioRwLock::new(ConnectionStore::new()));
-        let executor = ExternalExecutor::new(store.clone(), exec_mgr, Arc::new(ssh));
+        let executor = ExternalExecutor::new(store.clone(), exec_mgr, Arc::new(ssh), None);
 
         // 空表：查不到
         assert!(!executor.connection_exists("nope").await);
@@ -592,7 +784,7 @@ mod tests {
             .await,
         );
         let store = Arc::new(TokioRwLock::new(ConnectionStore::new()));
-        let executor = ExternalExecutor::new(store, exec_mgr, Arc::new(ssh));
+        let executor = ExternalExecutor::new(store, exec_mgr, Arc::new(ssh), None);
 
         // 大小写在边界处归一：内部存 "Password"，外部只认小写 "password"
         let id = executor

@@ -641,7 +641,7 @@ mod tests {
         let store = Arc::new(tokio::sync::RwLock::new(
             crate::config::connections::ConnectionStore::new(),
         ));
-        let executor = Arc::new(ExternalExecutor::new(store, exec_mgr, Arc::new(ssh)));
+        let executor = Arc::new(ExternalExecutor::new(store, exec_mgr, Arc::new(ssh), None));
         let registry = ToolRegistry::new_with_agent_tasks(executor, dir);
         let runner = registry
             .agent_task_runner()

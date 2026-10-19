@@ -12,9 +12,11 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use serde::Serialize;
-use tauri::State;
+use tauri::{AppHandle, State};
 
+use crate::command_exec::CommandSource;
 use crate::error::AppError;
+use crate::mcp_server::external_executor::CommandOutput;
 use crate::mcp_server::http_transport::{
     generate_token, HttpConfig, HttpRuntimeInfo, DEFAULT_BIND, DEFAULT_HTTP_PORT,
 };
@@ -46,6 +48,7 @@ pub async fn mcp_server_status() -> Option<HttpRuntimeInfo> {
 #[tauri::command]
 pub async fn mcp_server_start_http(
     state: State<'_, AppState>,
+    app: AppHandle,
     bind: String,
     port: u16,
     token: Option<String>,
@@ -67,11 +70,13 @@ pub async fn mcp_server_start_http(
     };
 
     // 复用 GUI 已在用的实例：界面上新增的连接会立刻对 MCP 调用可见
+    // （`app` 一并传入：外部调用从此能把命令与输出实时推到界面）。
     let server = McpServer::from_app_state(
         Arc::new(state.ssh_manager.clone()),
         state.connection_store.clone(),
         Arc::new(state.command_exec.clone()),
         state.config_dir.clone(),
+        Some(app),
     );
 
     runtime::start(
@@ -83,6 +88,25 @@ pub async fn mcp_server_start_http(
         },
     )
     .await
+}
+
+/// 用户在「外部调用」会话里输入命令：在同一连接的持久会话上执行，
+/// 命令与输出照常实时推送到界面（与外部 AI 走同一管道，来源标注为 user）。
+///
+/// MCP 服务未启动时直接报错——没有服务就没有执行器，输入无从落地。
+#[tauri::command]
+pub async fn mcp_external_input(
+    connection_id: String,
+    command: String,
+) -> Result<CommandOutput, AppError> {
+    let server = runtime::server()
+        .ok_or_else(|| AppError::Config("MCP 服务未启动，无法在外部会话输入命令。".into()))?;
+    let registry = server.registry()?;
+
+    registry
+        .executor()
+        .execute_command_visible(&connection_id, &command, None, CommandSource::User)
+        .await
 }
 
 /// 停止 HTTP 服务。返回「之前是否在跑」——幂等，重复点不报错。

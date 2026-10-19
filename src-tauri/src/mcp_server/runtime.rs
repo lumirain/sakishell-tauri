@@ -11,6 +11,7 @@
 // 单例本身也简单：一个端口一份配置，状态就只有「在跑（哪个端口 / 令牌）」和
 // 「没跑」两种。
 
+use std::sync::Arc;
 use std::sync::OnceLock;
 
 use parking_lot::Mutex;
@@ -20,14 +21,32 @@ use super::McpServer;
 use crate::error::AppError;
 
 static RUNTIME: OnceLock<Mutex<Option<HttpServerHandle>>> = OnceLock::new();
+/// 当前在跑的 MCP Server 实例（HTTP 启动时存入）。
+///
+/// `HttpServerHandle` 只持有生命周期控制（info / stop / join），不含 server
+/// 本体；GUI 命令（如「用户在外部会话输入命令」）需要访问同一个 server /
+/// 注册表 / 执行器才能复用持久会话，所以单独留一个槽。
+static SERVER: OnceLock<Mutex<Option<Arc<McpServer>>>> = OnceLock::new();
 
 fn slot() -> &'static Mutex<Option<HttpServerHandle>> {
     RUNTIME.get_or_init(|| Mutex::new(None))
 }
 
+fn server_slot() -> &'static Mutex<Option<Arc<McpServer>>> {
+    SERVER.get_or_init(|| Mutex::new(None))
+}
+
 /// 当前状态：在跑则给出绑定地址 / 端口 / 令牌 / URL，没跑则 `None`。
 pub fn status() -> Option<HttpRuntimeInfo> {
     slot().lock().as_ref().map(HttpServerHandle::info)
+}
+
+/// 当前在跑的 MCP Server 实例（没有则为 `None`）。
+///
+/// GUI 命令经它访问工具注册表与执行器（用户输入、状态查询等），
+/// 与 HTTP transport 共用同一份持久会话缓存。
+pub fn server() -> Option<Arc<McpServer>> {
+    server_slot().lock().clone()
 }
 
 /// 启动服务。
@@ -44,6 +63,7 @@ pub async fn start(server: &McpServer, cfg: HttpConfig) -> Result<HttpRuntimeInf
     let handle = super::http_transport::start_http_server(server, cfg).await?;
     let info = handle.info();
     *slot().lock() = Some(handle);
+    *server_slot().lock() = Some(Arc::new(server.clone()));
     Ok(info)
 }
 
@@ -56,6 +76,7 @@ pub async fn stop() -> bool {
     match previous {
         Some(handle) => {
             handle.stop().await;
+            *server_slot().lock() = None;
             true
         }
         None => false,

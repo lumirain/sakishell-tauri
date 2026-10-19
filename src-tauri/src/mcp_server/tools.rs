@@ -440,7 +440,12 @@ impl ToolRegistry {
 
         let output = self
             .executor
-            .execute_command(connection_id, command, timeout_ms)
+            .execute_command_visible(
+                connection_id,
+                command,
+                timeout_ms,
+                crate::command_exec::CommandSource::ExternalMcp,
+            )
             .await
             .map_err(|e| map_app_error(e))?;
 
@@ -750,7 +755,7 @@ mod tests {
             .await,
         );
         let store = Arc::new(tokio::sync::RwLock::new(ConnectionStore::new()));
-        let executor = Arc::new(ExternalExecutor::new(store, exec, Arc::new(ssh)));
+        let executor = Arc::new(ExternalExecutor::new(store, exec, Arc::new(ssh), None));
         ToolRegistry::new(executor)
     }
 
@@ -977,7 +982,7 @@ mod tests {
             .await,
         );
         let store = Arc::new(tokio::sync::RwLock::new(ConnectionStore::new()));
-        let executor = Arc::new(ExternalExecutor::new(store, exec, Arc::new(ssh)));
+        let executor = Arc::new(ExternalExecutor::new(store, exec, Arc::new(ssh), None));
         ToolRegistry::new_with_agent_tasks(executor, dir)
     }
 

@@ -19,8 +19,9 @@ pub mod stdio_transport;
 pub mod tools;
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
+use tauri::AppHandle;
 use tokio::sync::RwLock;
 
 use crate::command_exec::CommandExecutionManager;
@@ -66,6 +67,16 @@ pub struct McpServer {
     /// 配置目录：无头 agent 任务要从这里读 `settings.json` 并解析模型
     /// （见 [`agent_task::build_headless_llm`]）。缺了它就没有 `agent_task` 能力。
     pub config_dir: Option<PathBuf>,
+    /// GUI 内启动的 MCP 服务持有 AppHandle：外部调用能把命令与输出实时
+    /// 推到界面（`ExternalExecutor` 的可见执行路径）。CLI 无头模式为 `None`。
+    app_handle: Option<AppHandle>,
+    /// 工具注册表缓存：**同一进程内只建一次**。
+    ///
+    /// `ExternalExecutor` 的持久会话缓存挂在注册表持有的执行器上——若每次
+    /// `build_registry` 都新建执行器，「一个连接只握手一次」的复用承诺就
+    /// 会被悄悄打破（每条命令都重新握手）。HTTP transport 启动时建一次，
+    /// 用户输入等 GUI 命令也走同一份，绝不另起炉灶。
+    registry: OnceLock<Arc<tools::ToolRegistry>>,
 }
 
 impl McpServer {
@@ -80,6 +91,8 @@ impl McpServer {
             connection_store,
             command_exec: None,
             config_dir: None,
+            app_handle: None,
+            registry: OnceLock::new(),
         }
     }
 
@@ -90,11 +103,15 @@ impl McpServer {
     /// 配置文件。所以「用户在界面上新增一条连接」会立刻对 MCP 调用生效，
     /// 不需要重启服务。`connection_store` 必须是**同一个 Arc**（锁类型也已统一
     /// 为 tokio 的，见 `ExternalExecutor` 的字段注释）。
+    ///
+    /// `app` 传 GUI 的 AppHandle：外部调用随即获得向界面实时推送命令与输出的
+    /// 能力（CLI 无头模式没有这个参数，传 `None` 即保持纯无头行为）。
     pub fn from_app_state(
         ssh_manager: Arc<SshManager>,
         connection_store: Arc<RwLock<ConnectionStore>>,
         command_exec: Arc<CommandExecutionManager>,
         config_dir: std::path::PathBuf,
+        app: Option<AppHandle>,
     ) -> Self {
         Self {
             config: McpServerConfig::default(),
@@ -102,6 +119,8 @@ impl McpServer {
             connection_store,
             command_exec: Some(command_exec),
             config_dir: Some(config_dir),
+            app_handle: app,
+            registry: OnceLock::new(),
         }
     }
 
@@ -125,16 +144,20 @@ impl McpServer {
         })
     }
 
-    /// 构造工具注册表。
+    /// 构造工具注册表（**进程内只建一次**，见 `registry` 字段注释）。
     ///
-    /// **所有 transport 共用这一条构造路径**（stdio / HTTP）：
+    /// 所有 transport 共用这一条构造路径（stdio / HTTP）：
     /// 执行器需要 `command_exec`，而它由进程启动时注入（见 `cli.rs`）——
     /// 缺了它就没法执行任何命令，所以这里如实报错而不是静默给个空注册表。
     ///
     /// 有 `config_dir` 时一并接上无头 agent 任务（`agent_task` 工具）；
-    /// 没有则只有 9 个基础工具——工具清单与实际能力保持一致，
+    /// 没有则只有基础工具——工具清单与实际能力保持一致，
     /// 不会给客户端一个必然失败的入口。
     pub fn build_registry(&self) -> Result<Arc<tools::ToolRegistry>, AppError> {
+        if let Some(registry) = self.registry.get() {
+            return Ok(registry.clone());
+        }
+
         let command_exec = self.command_exec.clone().ok_or_else(|| {
             AppError::Agent("MCP Server 未注入 command_exec，无法执行命令".into())
         })?;
@@ -143,12 +166,21 @@ impl McpServer {
             self.connection_store.clone(),
             command_exec,
             self.ssh_manager.clone(),
+            self.app_handle.clone(),
         ));
 
-        Ok(match &self.config_dir {
+        let registry = match &self.config_dir {
             Some(dir) => tools::ToolRegistry::new_with_agent_tasks(executor, dir.clone()),
             None => Arc::new(tools::ToolRegistry::new(executor)),
-        })
+        };
+        let _ = self.registry.set(registry.clone());
+        Ok(registry)
+    }
+
+    /// 取（必要时构建）工具注册表。GUI 命令（如用户输入）用它拿执行器，
+    /// 与 HTTP transport 共用同一实例——持久会话缓存因此跨入口共享。
+    pub fn registry(&self) -> Result<Arc<tools::ToolRegistry>, AppError> {
+        self.build_registry()
     }
 
     /// 运行 Stdio transport server

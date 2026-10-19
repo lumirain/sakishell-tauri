@@ -25,6 +25,7 @@ import type {
   McpTool,
   McpHttpRuntimeInfo,
   McpClientConfig,
+  McpExecOutput,
   McpServerDefaults,
   UpdateCheckResult,
   UpdateState,
@@ -745,6 +746,14 @@ export async function mcpServerRegenerateToken(): Promise<string> {
 
 export async function mcpServerClientConfig(): Promise<McpClientConfig> {
   return invoke<McpClientConfig>("mcp_server_client_config");
+}
+
+/** 用户在「外部调用」会话里输入命令（同一连接的持久会话上执行）。 */
+export async function mcpExternalInput(
+  connectionId: string,
+  command: string,
+): Promise<McpExecOutput> {
+  return invoke<McpExecOutput>("mcp_external_input", { connectionId, command });
 }
 
 export async function mcpServerDefaults(): Promise<McpServerDefaults> {

@@ -407,6 +407,39 @@ export interface McpClientConfig {
   http: string | null;
 }
 
+/** 外部 MCP 会话执行命令的输出（tauri camelCase 转换后）。 */
+export interface McpExecOutput {
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+}
+
+/** 外部 MCP 会话的生命周期事件载荷（`mcp://external-exec`）。 */
+export interface McpExternalExecEvent {
+  phase: "started" | "finished";
+  connectionId: string;
+  connectionName: string;
+  host: string;
+  sessionId: string;
+  command: string;
+  seq: number;
+  /** serde snake_case：`external_mcp`（外部 AI）/ `user`（界面输入） */
+  source: "external_mcp" | "user";
+  startedAt: number;
+  finishedAt?: number;
+  status?: "completed" | "timed_out" | "cancelled" | "failed";
+  exitCode?: number | null;
+  error?: string | null;
+}
+
+/** 外部 MCP 会话输出 chunk 事件载荷（`mcp://exec-output`）。 */
+export interface McpExternalExecChunk {
+  type: "toolOutput";
+  /** `mcp:{connectionId}:{seq}` */
+  toolCallId: string;
+  chunk: string;
+}
+
 export interface McpServerDefaults {
   bind: string;
   port: number;
