@@ -1956,7 +1956,7 @@ mod tests {
             let dir = home.join(".ssh");
             if dir.exists() {
                 // 任取一个真实存在的文件
-                if let Ok(entries) = std::fs::read_dir(&dir) {
+                if let Ok(mut entries) = std::fs::read_dir(&dir) {
                     if let Some(Ok(e)) = entries.next() {
                         let p = e.path();
                         if p.is_file() {

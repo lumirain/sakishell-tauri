@@ -369,7 +369,7 @@ mod tests {
     fn structure_rejects_greeting_chit_chat() {
         // 模型跑偏输出打招呼/闲聊 → 拒绝
         assert!(!has_required_sections(
-            "你好！我是玛瑟尔 SSH，很高兴为你服务！"
+            "你好！我是 SakiShell，很高兴为你服务！"
         ));
         assert!(!has_required_sections(
             "好的，我来帮你总结一下：\n- 对话内容\n- 更多内容"

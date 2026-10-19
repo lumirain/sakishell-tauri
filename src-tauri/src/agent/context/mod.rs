@@ -740,7 +740,7 @@ async fn compact_region(
     );
 
     // 摘要调用**不**复用会话 system 提示：msl 的会话 system 是中文人格设定
-    // （"你是玛瑟尔 SSH…中文优先"），与英文压缩指令冲突，会把摘要模型带偏成
+    // （"你是SakiShell…中文优先"），与英文压缩指令冲突，会把摘要模型带偏成
     // 以助手身份闲聊/打招呼（DSH 的 system 是英文 coding-assistant 设定才安全）。
     // 不传 system 会让 KV 前缀缓存失效，但正确性优先，压缩频率低可接受。
     // 工具 schema 反而要传：与常规请求的 tools 段对齐，模型据此理解历史里的
