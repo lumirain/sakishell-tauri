@@ -1,0 +1,742 @@
+import { useRef, useState } from 'react';
+import { Trash2, ChevronDown } from 'lucide-react';
+import type { CommandCheckResult, CommandListMode } from '@/lib/types';
+import * as tauri from '@/lib/tauri';
+import { getErrorMessage } from '@/lib/errors';
+import {
+  AGENT_MAX_TOOL_ROUNDS_MAX,
+  AGENT_MAX_TOOL_ROUNDS_MIN,
+  DISPOSITION_LABELS,
+  SYSTEM_PROMPT_MAX_CHARS,
+} from '@/lib/constants';
+import Toggle from '@/components/ui/Toggle';
+import SegmentedControl from '@/components/ui/SegmentedControl';
+import { useSettingsActions } from '@/components/settings/SettingsActionsContext';
+import {
+  DEFAULT_APPROVAL_PROMPT_FALLBACK,
+  needsUrlScheme,
+  preCheckCustomPath,
+} from '@/components/settings/AgentPolicySection';
+import { useDefaultApprovalPrompt } from '@/hooks/useDefaultApprovalPrompt';
+import { emptyRegistry, modelFullLabel, modelLabel } from '@/lib/llmRegistry';
+import MobileSheet from '../ui/MobileSheet';
+import { MobileSettingRow } from './MobileSettingRow';
+import { useSettingsStore } from '@/stores/settingsStore';
+
+const BUILT_IN_PROTECTED: ReadonlyArray<{ path: string; reason: string }> = [
+  { path: '/etc', reason: '系统配置' },
+  { path: '/boot', reason: '启动分区' },
+  { path: '/sys', reason: 'sysfs 设备' },
+  { path: '/proc', reason: '进程信息' },
+  { path: '/dev', reason: '设备文件' },
+];
+
+const inputClass =
+  'w-full rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2.5 font-mono text-sm text-zinc-100 outline-none placeholder:text-zinc-500 focus:border-indigo-500 disabled:opacity-40';
+
+/** Full agent command policy for mobile — same settings surface as desktop. */
+export function MobileAgentPolicySection() {
+  const { settings, update } = useSettingsActions();
+  const agent = settings.agentModeSettings;
+
+  const updateAgent = (patch: Partial<typeof agent>) => {
+    update({ agentModeSettings: { ...agent, ...patch } });
+  };
+
+  const defaultApprovalPrompt = useDefaultApprovalPrompt();
+
+  const [newCommand, setNewCommand] = useState('');
+  const [testCommand, setTestCommand] = useState('');
+  const [testResult, setTestResult] = useState<CommandCheckResult | null>(null);
+  const [testing, setTesting] = useState(false);
+  const [approvalModelPickerOpen, setApprovalModelPickerOpen] = useState(false);
+
+  // Jev 引擎的 API Key（原始 Key 只进密钥链，永不回传前端）。
+  const hasJevApiKey = useSettingsStore((s) => s.hasJevApiKey);
+  const [jevKeyDraft, setJevKeyDraft] = useState('');
+  const persistJevKey = async (value: string) => {
+    const trimmed = value.trim();
+    if (!trimmed || trimmed.includes('******') || trimmed === '********') return;
+    try {
+      await tauri.saveJevApiKey(trimmed);
+      useSettingsStore.setState({ hasJevApiKey: true });
+      setJevKeyDraft('');
+    } catch (err) {
+      console.error('保存 TypeSafe API Key 失败:', err);
+    }
+  };
+  const clearJevKey = async () => {
+    try {
+      await tauri.deleteJevApiKey();
+      useSettingsStore.setState({ hasJevApiKey: false });
+      setJevKeyDraft('');
+    } catch (err) {
+      console.error('清除 TypeSafe API Key 失败:', err);
+    }
+  };
+
+  const customPaths = settings.customProtectedPaths ?? [];
+  const [draftPath, setDraftPath] = useState('');
+  const [pathError, setPathError] = useState<string | null>(null);
+  const pathInputRef = useRef<HTMLInputElement>(null);
+
+  const listDisabled = agent.confirmEachCommand;
+
+  const handleAddCommand = () => {
+    const v = newCommand.trim();
+    if (!v) return;
+    if (!agent.commandList.includes(v)) {
+      updateAgent({ commandList: [...agent.commandList, v] });
+    }
+    setNewCommand('');
+  };
+
+  const handleAddProtectedPath = async () => {
+    const trimmed = draftPath.trim();
+    if (!trimmed) return;
+    const localErr = preCheckCustomPath(trimmed, customPaths);
+    if (localErr) {
+      setPathError(localErr);
+      return;
+    }
+    const err = await tauri.validateCustomProtectedPaths([trimmed]);
+    if (err) {
+      setPathError(err);
+      return;
+    }
+    setPathError(null);
+    setDraftPath('');
+    update({ customProtectedPaths: [...customPaths, trimmed] });
+    pathInputRef.current?.focus();
+  };
+
+  const runTest = async () => {
+    const cmd = testCommand.trim();
+    if (!cmd) return;
+    setTesting(true);
+    try {
+      setTestResult(await tauri.agentCheckCommand(cmd, 'agent'));
+    } catch (err) {
+      setTestResult({
+        allowed: false,
+        requiresConfirmation: false,
+        disposition: 'Approval',
+        reason: `测试失败：${getErrorMessage(err)}`,
+      });
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-2">
+      {/* Command timeout */}
+      <MobileSettingRow
+        label="命令超时时间"
+        description="Agent 执行单条命令的最大等待时间"
+        trailing={
+          <span className="w-14 text-right font-mono text-sm text-indigo-300">
+            {settings.commandTimeoutSecs ?? 120}s
+          </span>
+        }
+      >
+        <input
+          type="range"
+          min={10}
+          max={300}
+          step={10}
+          value={settings.commandTimeoutSecs ?? 120}
+          onChange={(e) =>
+            update({ commandTimeoutSecs: Number(e.target.value) })
+          }
+          className="mt-1 h-2 w-full cursor-pointer appearance-none rounded-full bg-zinc-700 accent-indigo-500"
+        />
+      </MobileSettingRow>
+
+      {/* Key toggles */}
+      <MobileSettingRow
+        label="每条都手动确认"
+        description="即使通过列表过滤，仍要求确认每条命令"
+        trailing={
+          <Toggle
+            checked={agent.confirmEachCommand}
+            onChange={(checked) => updateAgent({ confirmEachCommand: checked })}
+          />
+        }
+      />
+      <MobileSettingRow
+        label="Plan 模式也需要审批"
+        description="默认关闭，与 AUTO 一致；开启后走命令名单与逐条确认"
+        trailing={
+          <Toggle
+            checked={agent.planModeRequiresApproval ?? false}
+            onChange={(checked) =>
+              updateAgent({ planModeRequiresApproval: checked })
+            }
+          />
+        }
+      />
+      <MobileSettingRow
+        label="编辑文件审批"
+        description="edit_file 执行前需要确认"
+        trailing={
+          <Toggle
+            checked={agent.confirmEditFile ?? true}
+            onChange={(checked) => updateAgent({ confirmEditFile: checked })}
+          />
+        }
+      />
+
+      {/* Model approval */}
+      <MobileSettingRow
+        label="执行前模型审批"
+        description="执行命令前让模型判定放行/转人工/阻止"
+        trailing={
+          <Toggle
+            checked={agent.enableModelCommandApproval ?? false}
+            onChange={(checked) =>
+              updateAgent({ enableModelCommandApproval: checked })
+            }
+          />
+        }
+      >
+        {agent.enableModelCommandApproval && (
+          <div className="mt-2 space-y-1.5">
+            <span className="text-xs text-zinc-400">审批引擎</span>
+            <SegmentedControl
+              ariaLabel="命令审批引擎"
+              value={agent.commandApprovalEngine ?? 'model'}
+              onChange={(v) => updateAgent({ commandApprovalEngine: v })}
+              options={[
+                {
+                  value: 'model',
+                  label: '跟随会话模型',
+                  title: '用本会话的模型做审批判定（旧行为）',
+                },
+                {
+                  value: 'jev',
+                  label: 'Jev',
+                  title: 'TypeSafe 的决策模型：更快、更便宜，需要单独配 API Key',
+                },
+              ]}
+            />
+            {agent.commandApprovalEngine === 'jev' ? (
+              <>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="password"
+                    value={jevKeyDraft || (hasJevApiKey ? '********' : '')}
+                    onChange={(e) => setJevKeyDraft(e.target.value)}
+                    onBlur={() => void persistJevKey(jevKeyDraft)}
+                    placeholder={
+                      hasJevApiKey
+                        ? '已保存，输入新 Key 可覆盖'
+                        : '输入 Jev 的 API Key（官方或你的网关）'
+                    }
+                    autoComplete="off"
+                    className={inputClass}
+                  />
+                  {hasJevApiKey && (
+                    <button
+                      type="button"
+                      onClick={() => void clearJevKey()}
+                      className="flex-shrink-0 rounded-lg border border-zinc-700 px-3 py-2.5 text-xs text-zinc-400 active:bg-zinc-700"
+                    >
+                      清除
+                    </button>
+                  )}
+                </div>
+                {!hasJevApiKey && (
+                  <p className="text-xs text-amber-400/90">
+                    还没配 Key。没配之前每条 bash 都会被明确拦下并提示，不会静默回退到会话模型。
+                  </p>
+                )}
+                <span className="text-xs text-zinc-400">模型 ID</span>
+                <input
+                  type="text"
+                  value={agent.jevModelId ?? ''}
+                  onChange={(e) => updateAgent({ jevModelId: e.target.value })}
+                  placeholder="留空使用内置默认（钉版本号）"
+                  className={inputClass}
+                />
+                <p className="text-xs text-zinc-500">
+                  内置默认已经钉住版本号，不建议改用 jev-latest 别名——别名会随官方发布前移。走中转或网关时，模型名往往是它自己的一套（例如 Command Code 的 typesafe/jev），照对方文档填。
+                </p>
+                <span className="text-xs text-zinc-400">API 地址</span>
+                <input
+                  type="text"
+                  value={agent.jevBaseUrl ?? ''}
+                  onChange={(e) => updateAgent({ jevBaseUrl: e.target.value })}
+                  placeholder="留空使用官方地址 api.typesafe.ai"
+                  className={inputClass}
+                />
+                <p className="text-xs text-zinc-500">
+                  只在走代理、私有网关或本地 mock 时填。路径 /v1/systemone 是固定拼上去的——对方文档给的基址若末尾带 /v1（如 https://api.commandcode.ai/provider/v1），要把那段去掉，否则会拼成 …/v1/v1/systemone 而 404。留空 = 保持官方地址。
+                </p>
+                {needsUrlScheme(agent.jevBaseUrl) && (
+                  <p className="text-xs text-amber-400/90">
+                    地址看起来缺了 http:// 或 https://，照这样请求会失败并把每条 bash 拦下。
+                  </p>
+                )}
+                <div className="flex items-center justify-between pt-1">
+                  <span className="text-xs text-zinc-400">Jev 判据</span>
+                  <button
+                    type="button"
+                    onClick={() => updateAgent({ jevApprovalPrompt: '' })}
+                    className="text-xs text-zinc-500 active:text-zinc-300"
+                  >
+                    恢复默认
+                  </button>
+                </div>
+                <textarea
+                  value={agent.jevApprovalPrompt || ''}
+                  onChange={(e) =>
+                    updateAgent({ jevApprovalPrompt: e.target.value })
+                  }
+                  rows={6}
+                  placeholder="留空使用内置判据。这里填的是「要判断什么」，不要写输出格式——Jev 返回的是类型化选项，不生成文本。"
+                  className="w-full resize-none rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2 font-mono text-xs text-zinc-100 outline-none focus:border-indigo-500"
+                />
+                <p className="text-xs text-zinc-500">
+                  {agent.jevBaseUrl?.trim()
+                    ? `判定结果与理由会连同对话上下文和这条命令一起发送到你上面填的地址（${agent.jevBaseUrl.trim().replace(/\/+$/, '')}）。那要是一个第三方中转，命令里若带 token 或密码请注意。`
+                    : '判定结果与理由会连同对话上下文和这条命令一起发送到 TypeSafe（api.typesafe.ai）——这是一台第三方服务器，命令里若带 token 或密码请注意。'}
+                </p>
+                <MobileSettingRow
+                  label="人审时追问原因"
+                  description="第一轮探针可能一个都没命中，用户看不到解释。打开后这类命令多打一次请求专门问「为什么」；追问失败不影响判定。"
+                  trailing={
+                    <Toggle
+                      checked={agent.jevReasonFollowup ?? false}
+                      onChange={(checked) =>
+                        updateAgent({ jevReasonFollowup: checked })
+                      }
+                    />
+                  }
+                />
+              </>
+            ) : (
+              <>
+            <button
+              type="button"
+              onClick={() => setApprovalModelPickerOpen(true)}
+              className="flex w-full items-center justify-between gap-2 rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2.5 text-sm text-zinc-100 outline-none active:bg-zinc-700"
+            >
+              <span className="truncate">
+                {settings.llmRegistry?.slots?.modelApprovalModelId
+                  ? modelFullLabel(
+                      settings.llmRegistry,
+                      settings.llmRegistry.slots.modelApprovalModelId,
+                    )
+                  : '跟随会话模型'}
+              </span>
+              <ChevronDown className="h-4 w-4 flex-shrink-0 text-zinc-500" />
+            </button>
+            <p className="text-xs text-zinc-500">
+              选择轻量模型可降低审批延迟和成本，留空跟随本会话正在使用的模型
+            </p>
+            <div className="flex items-center justify-between pt-1">
+              <span className="text-xs text-zinc-400">审批提示词</span>
+              <button
+                type="button"
+                onClick={() => updateAgent({ modelApprovalPrompt: '' })}
+                className="text-xs text-zinc-500 active:text-zinc-300"
+              >
+                恢复默认
+              </button>
+            </div>
+            <textarea
+              value={agent.modelApprovalPrompt || defaultApprovalPrompt}
+              onChange={(e) => {
+                const v = e.target.value;
+                updateAgent({
+                  modelApprovalPrompt: v === defaultApprovalPrompt ? '' : v,
+                });
+              }}
+              rows={6}
+              placeholder={DEFAULT_APPROVAL_PROMPT_FALLBACK}
+              className="w-full resize-none rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2 font-mono text-xs text-zinc-100 outline-none focus:border-indigo-500"
+            />
+              </>
+            )}
+          </div>
+        )}
+      </MobileSettingRow>
+
+      {/* List mode + command list */}
+      <MobileSettingRow
+        label="命令列表过滤"
+        description={
+          listDisabled
+            ? '已开启「每条都手动确认」，列表过滤不生效'
+            : '按基础命令名匹配（不含路径或参数）'
+        }
+      >
+        <div className={listDisabled ? 'pointer-events-none opacity-40' : ''}>
+          <div className="mt-2 grid grid-cols-2 gap-2">
+            {(
+              [
+                {
+                  value: 'denylist',
+                  label: '黑名单',
+                  desc: '只阻止列表中的命令',
+                },
+                {
+                  value: 'allowlist',
+                  label: '白名单',
+                  desc: '只允许列表中的命令',
+                },
+              ] as { value: CommandListMode; label: string; desc: string }[]
+            ).map((m) => {
+              const active = agent.listMode === m.value;
+              return (
+                <button
+                  key={m.value}
+                  type="button"
+                  onClick={() => updateAgent({ listMode: m.value })}
+                  className={`rounded-xl border px-3 py-2.5 text-left transition-colors duration-100 active:scale-[0.99] ${
+                    active
+                      ? 'border-indigo-500 bg-indigo-500/10'
+                      : 'border-zinc-700 bg-zinc-800/60'
+                  }`}
+                >
+                  <div
+                    className={`text-sm font-medium ${
+                      active ? 'text-indigo-200' : 'text-zinc-300'
+                    }`}
+                  >
+                    {m.label}
+                  </div>
+                  <div className="mt-0.5 text-[11px] text-zinc-500">
+                    {m.desc}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+
+          <div className="mt-2 flex gap-2">
+            <input
+              type="text"
+              value={newCommand}
+              onChange={(e) => setNewCommand(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  handleAddCommand();
+                }
+              }}
+              placeholder="例如：rm 或 sudo"
+              autoCapitalize="off"
+              autoCorrect="off"
+              spellCheck={false}
+              disabled={listDisabled}
+              className={inputClass}
+            />
+            <button
+              type="button"
+              onClick={handleAddCommand}
+              disabled={!newCommand.trim() || listDisabled}
+              className="flex-shrink-0 rounded-lg bg-zinc-800 px-4 py-2.5 text-sm text-zinc-200 active:bg-zinc-700 disabled:opacity-40"
+            >
+              添加
+            </button>
+          </div>
+
+          {agent.commandList.length === 0 ? (
+            <p className="mt-2 px-1 text-xs italic text-zinc-500">列表为空</p>
+          ) : (
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              {agent.commandList.map((cmd) => (
+                <span
+                  key={cmd}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-700 bg-zinc-800 px-2.5 py-1.5 font-mono text-xs text-zinc-200"
+                >
+                  {cmd}
+                  <button
+                    type="button"
+                    onClick={() =>
+                      updateAgent({
+                        commandList: agent.commandList.filter((c) => c !== cmd),
+                      })
+                    }
+                    disabled={listDisabled}
+                    className="-mr-0.5 px-0.5 text-zinc-500 active:text-red-400"
+                    aria-label={`移除 ${cmd}`}
+                  >
+                    ×
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+      </MobileSettingRow>
+
+      {/* Command test */}
+      <MobileSettingRow
+        label="测试命令"
+        description="输入一条命令，查看在 AGENT 模式下是否会被允许"
+      >
+        <div className="mt-2 flex gap-2">
+          <input
+            type="text"
+            value={testCommand}
+            onChange={(e) => setTestCommand(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault();
+                void runTest();
+              }
+            }}
+            placeholder="例如：rm -rf /tmp/test"
+            autoCapitalize="off"
+            autoCorrect="off"
+            spellCheck={false}
+            className={inputClass}
+          />
+          <button
+            type="button"
+            onClick={() => void runTest()}
+            disabled={!testCommand.trim() || testing}
+            className="flex-shrink-0 rounded-lg bg-zinc-800 px-4 py-2.5 text-sm text-zinc-200 active:bg-zinc-700 disabled:opacity-40"
+          >
+            {testing ? '测试中' : '测试'}
+          </button>
+        </div>
+        {testResult && (
+          <div
+            className={`mt-2 rounded-xl border px-3 py-2 text-sm ${
+              testResult.allowed
+                ? 'border-emerald-800 bg-emerald-950/40 text-emerald-200'
+                : 'border-red-800 bg-red-950/40 text-red-200'
+            }`}
+          >
+            <div className="font-medium">
+              {testResult.allowed ? '允许' : '阻止'}
+              {testResult.allowed && testResult.requiresConfirmation && (
+                <span className="ml-2 text-xs text-amber-300">
+                  （需要用户确认）
+                </span>
+              )}
+            </div>
+            <div className="mt-0.5 text-xs opacity-80">
+              处置：{DISPOSITION_LABELS[testResult.disposition]} ·{' '}
+              {testResult.reason}
+            </div>
+          </div>
+        )}
+      </MobileSettingRow>
+
+      {/* Protected paths */}
+      <MobileSettingRow
+        label="受保护路径"
+        description="Agent 在这些路径下的写操作会触发用户审批"
+      >
+        <div className="mt-2 space-y-2">
+          <div>
+            <p className="mb-1 text-xs text-zinc-500">内置保护路径（只读）</p>
+            <div className="flex flex-wrap gap-x-4 gap-y-0.5 text-xs text-zinc-400">
+              {BUILT_IN_PROTECTED.map((p) => (
+                <span key={p.path} className="whitespace-nowrap">
+                  <code className="text-indigo-300">{p.path}</code>
+                  <span className="text-zinc-500"> {p.reason}</span>
+                </span>
+              ))}
+            </div>
+          </div>
+          <div className="flex gap-2">
+            <input
+              ref={pathInputRef}
+              type="text"
+              value={draftPath}
+              onChange={(e) => {
+                if (pathError) setPathError(null);
+                setDraftPath(e.target.value);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  void handleAddProtectedPath();
+                }
+              }}
+              placeholder="/home/user/.ssh"
+              autoCapitalize="off"
+              autoCorrect="off"
+              spellCheck={false}
+              className={inputClass}
+            />
+            <button
+              type="button"
+              onClick={() => void handleAddProtectedPath()}
+              disabled={!draftPath.trim()}
+              className="flex-shrink-0 rounded-lg bg-zinc-800 px-4 py-2.5 text-sm text-zinc-200 active:bg-zinc-700 disabled:opacity-40"
+            >
+              添加
+            </button>
+          </div>
+          {pathError && <p className="text-xs text-red-400">{pathError}</p>}
+          {customPaths.length === 0 ? (
+            <p className="px-1 text-xs italic text-zinc-500">无自定义路径</p>
+          ) : (
+            <ul className="space-y-1">
+              {customPaths.map((p) => (
+                <li
+                  key={p}
+                  className="flex items-center justify-between gap-2 rounded-lg bg-zinc-800 px-3 py-2"
+                >
+                  <code className="truncate text-xs text-indigo-300">{p}</code>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      update({
+                        customProtectedPaths: customPaths.filter(
+                          (x) => x !== p,
+                        ),
+                      })
+                    }
+                    className="flex-shrink-0 p-1 text-zinc-500 active:text-red-400"
+                    aria-label={`移除 ${p}`}
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </MobileSettingRow>
+
+      {/* Max rounds */}
+      <MobileSettingRow
+        label="最大执行轮数"
+        description="单次任务最多执行的工具调用轮数，超限自动停止"
+        trailing={
+          <span className="w-14 text-right font-mono text-sm text-indigo-300">
+            {agent.maxToolRounds ?? 500}
+          </span>
+        }
+      >
+        <input
+          type="range"
+          min={AGENT_MAX_TOOL_ROUNDS_MIN}
+          max={AGENT_MAX_TOOL_ROUNDS_MAX}
+          step={1}
+          value={agent.maxToolRounds ?? 500}
+          onChange={(e) =>
+            updateAgent({ maxToolRounds: Number(e.target.value) })
+          }
+          className="mt-1 h-2 w-full cursor-pointer appearance-none rounded-full bg-zinc-700 accent-indigo-500"
+        />
+      </MobileSettingRow>
+
+      {/* User system prompt — appended to the agent system prompt (desktop parity) */}
+      <MobileSettingRow
+        label="用户附加指令"
+        description="Agent 调用 LLM 时追加到系统提示词末尾，留空则不注入"
+      >
+        <textarea
+          value={agent.systemPrompt ?? ''}
+          onChange={(e) => updateAgent({ systemPrompt: e.target.value })}
+          rows={5}
+          maxLength={SYSTEM_PROMPT_MAX_CHARS}
+          placeholder="在此输入需要附加到系统提示词中的内容，将在每次 Agent 任务调用 LLM 时生效"
+          autoCapitalize="off"
+          autoCorrect="off"
+          spellCheck={false}
+          className="mt-2 w-full resize-none rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2.5 text-sm text-zinc-100 outline-none placeholder:text-zinc-500 focus:border-indigo-500"
+        />
+        <div className="mt-1 text-right text-xs text-zinc-500">
+          {(agent.systemPrompt ?? '').length} / {SYSTEM_PROMPT_MAX_CHARS}
+        </div>
+      </MobileSettingRow>
+
+      {/* 审批模型选择 */}
+      <MobileSheet
+        open={approvalModelPickerOpen}
+        onClose={() => setApprovalModelPickerOpen(false)}
+        title="选择审批模型"
+      >
+        <div className="px-4 pb-4">
+          <button
+            type="button"
+            onClick={() => {
+              update({
+                llmRegistry: {
+                  ...(settings.llmRegistry ?? emptyRegistry()),
+                  slots: {
+                    ...(settings.llmRegistry?.slots ?? emptyRegistry().slots),
+                    modelApprovalModelId: '',
+                  },
+                },
+              });
+              setApprovalModelPickerOpen(false);
+            }}
+            className="flex w-full items-center justify-between rounded-lg px-3 py-3 text-left text-sm active:bg-zinc-800"
+          >
+            <span className="text-zinc-200">跟随会话模型</span>
+            {!settings.llmRegistry?.slots?.modelApprovalModelId && (
+              <span className="text-indigo-400 text-xs">当前</span>
+            )}
+          </button>
+          {/* 按提供商（渠道）分组 */}
+          {(settings.llmRegistry?.channels ?? []).map((ch) => {
+            const reg = settings.llmRegistry ?? emptyRegistry();
+            const channelModels = reg.models.filter((m) => m.channelId === ch.id);
+            if (channelModels.length === 0) return null;
+            const channelDisabled = !ch.enabled;
+            return (
+              <div key={ch.id} className="mt-1">
+                <div className="flex items-center gap-2 px-3 pb-1 pt-2">
+                  <span className="truncate text-[11px] font-medium uppercase tracking-wide text-zinc-500">
+                    {ch.name}
+                  </span>
+                  {channelDisabled && (
+                    <span className="flex-shrink-0 rounded bg-zinc-700 px-1 py-0.5 text-[10px] text-zinc-400">
+                      已禁用
+                    </span>
+                  )}
+                </div>
+                <div className="divide-y divide-zinc-800/70">
+                  {channelModels.map((m) => {
+                    const selected = settings.llmRegistry?.slots?.modelApprovalModelId === m.id;
+                    return (
+                      <button
+                        key={m.id}
+                        type="button"
+                        disabled={channelDisabled}
+                        onClick={() => {
+                          const registry = settings.llmRegistry ?? emptyRegistry();
+                          update({
+                            llmRegistry: {
+                              ...registry,
+                              slots: { ...registry.slots, modelApprovalModelId: m.id },
+                            },
+                          });
+                          setApprovalModelPickerOpen(false);
+                        }}
+                        className={`flex w-full items-center justify-between gap-2 px-3 py-3 text-left active:bg-zinc-800 ${
+                          channelDisabled ? "opacity-40" : ""
+                        }`}
+                      >
+                        <span className="min-w-0 truncate text-sm text-zinc-200">
+                          {modelLabel(m)}
+                        </span>
+                        {selected && <span className="flex-shrink-0 text-xs text-indigo-400">当前</span>}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })}
+          {(settings.llmRegistry?.models ?? []).length === 0 && (
+            <p className="py-6 text-center text-sm text-zinc-500">
+              还没有可用的模型，请先在「模型服务」中添加
+            </p>
+          )}
+        </div>
+      </MobileSheet>
+    </div>
+  );
+}

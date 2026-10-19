@@ -1,0 +1,127 @@
+/**
+ * Plugin capability authorization — frontend mirror of the Rust
+ * `plugins::auth::authorize` three-layer policy.
+ *
+ *   1. plugin is enabled (not in `disabledPlugins`)
+ *   2. manifest declares the capability
+ *   3. user has authorized the capability for this plugin
+ *      (plugin absent from `authorizedCapabilities` → all declared ok)
+ *
+ * Note: `pluginStore.manifests` intentionally includes disabled plugins
+ * (settings UI needs them). Disable is enforced here at layer 1, not by
+ * manifest absence.
+ *
+ * The `COMMAND_TO_CAPABILITY` map is populated at init time from the Rust
+ * single source of truth by `pluginIpc.ts`. A static fallback is used only
+ * if the IPC fetch fails.
+ */
+
+import { usePluginStore } from '@/stores/pluginStore';
+import { useSettingsStore } from '@/stores/settingsStore';
+import {
+  ALL_COMMANDS,
+  CAPABILITY_TO_COMMAND,
+  PLUGIN_SCOPED_COMMANDS,
+} from './commandRegistry';
+
+export interface AuthResult {
+  ok: boolean;
+  reason?: string;
+}
+
+/** Static fallback mapping; replaced at init by the Rust source of truth. */
+const FALLBACK_COMMAND_TO_CAPABILITY: Record<string, string> = {
+  ...Object.fromEntries(Object.keys(CAPABILITY_TO_COMMAND).map((cap) => [cap, cap])),
+  ...Object.fromEntries(Object.keys(PLUGIN_SCOPED_COMMANDS).map((cmd) => [cmd, cmd])),
+  'session.active': 'ssh.list',
+  'session.info': 'ssh.list',
+  'connection.info': 'ssh.list',
+  'connection.list': 'ssh.list',
+  'events.subscribe': 'events',
+  'events.unsubscribe': 'events',
+  'config.read': 'fs.read',
+  'config.write': 'fs.write',
+  'config.saved': 'fs.write',
+  // ── window.create family: multiple cmds share capabilities ──
+  'window.create': 'window.create',
+  'window.show': 'window.create',
+  'window.hide': 'window.create',
+  'window.close': 'window.create',
+  'window.focus': 'window.create',
+  'window.set_position': 'window.create',
+  'window.set_size': 'window.create',
+  'window.set_ignore_cursor_events': 'window.create',
+  'window.set_always_on_top': 'window.always_on_top',
+  // ── context_menu ──
+  'menu.register': 'context_menu',
+  'menu.update': 'context_menu',
+  'menu.unregister': 'context_menu',
+  'menu.popup': 'context_menu',
+};
+
+/** Live map, populated at init by `pluginIpc.ts`. */
+let COMMAND_TO_CAPABILITY: Record<string, string> = { ...FALLBACK_COMMAND_TO_CAPABILITY };
+
+/** Replace the capability map with the Rust-provided one. Called once at init. */
+export function setCapabilityMap(map: Record<string, string>): void {
+  if (map && Object.keys(map).length > 0) {
+    COMMAND_TO_CAPABILITY = map;
+  }
+}
+
+/**
+ * Check whether `pluginId` may invoke `cmd`. Carries a diagnostic reason on
+ * denial so plugin DevTools can surface it without opening the main window.
+ */
+export function isAuthorized(pluginId: string, cmd: string): AuthResult {
+  const settings = useSettingsStore.getState().settings;
+
+  // Layer 1: plugin enabled (mirror Rust `auth.rs`)
+  const disabled = settings.disabledPlugins ?? [];
+  if (disabled.includes(pluginId)) {
+    return { ok: false, reason: `plugin "${pluginId}" is disabled` };
+  }
+
+  const manifests = usePluginStore.getState().manifests;
+  const manifest = manifests.find((m) => m.id === pluginId);
+  if (!manifest) {
+    return {
+      ok: false,
+      reason: `manifest not found for pluginId="${pluginId}" (loaded manifests: ${JSON.stringify(manifests.map(m => m.id))})`,
+    };
+  }
+
+  if (!ALL_COMMANDS.has(cmd)) {
+    return { ok: false, reason: `unknown command "${cmd}"` };
+  }
+
+  const required = COMMAND_TO_CAPABILITY[cmd];
+  if (!required) {
+    return { ok: false, reason: `no capability mapping for "${cmd}"` };
+  }
+
+  const authorizedMap = settings.authorizedCapabilities ?? {};
+
+  // Plugin not in map → all declared capabilities are authorized (backward compatible)
+  if (!(pluginId in authorizedMap)) {
+    const ok = manifest.capabilities.includes(required);
+    if (!ok) {
+      return {
+        ok: false,
+        reason: `capability "${required}" not declared by "${pluginId}" (declared: ${JSON.stringify(manifest.capabilities)})`,
+      };
+    }
+    return { ok: true };
+  }
+
+  // Plugin in map → only listed capabilities are authorized
+  const authorizedList = authorizedMap[pluginId] ?? [];
+  const ok = authorizedList.includes(required);
+  if (!ok) {
+    return {
+      ok: false,
+      reason: `capability "${required}" not in authorizedList for "${pluginId}" (authorized: ${JSON.stringify(authorizedList)})`,
+    };
+  }
+  return { ok: true };
+}

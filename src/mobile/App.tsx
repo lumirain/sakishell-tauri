@@ -1,0 +1,230 @@
+import { useCallback, useEffect, useLayoutEffect, useState } from 'react';
+import { useSettingsStore } from '@/stores/settingsStore';
+import MobileTabBar from './MobileTabBar';
+import MobileTerminalHost from './MobileTerminalHost';
+import MobileAgentHost from './MobileAgentHost';
+import MobileFilesHost from './MobileFilesHost';
+import MobileOnboarding from './MobileOnboarding';
+import MobileSettings from './MobileSettings';
+import MobileUpdateToast from './MobileUpdateToast';
+import MobileStarPromptSheet from './MobileStarPromptSheet';
+import MobileGlobalInteractionOverlay from './MobileGlobalInteractionOverlay';
+import { initInteractionListener } from '@/stores/interactionStore';
+import { initJobWake } from '@/stores/jobWake';
+import {
+  attachTransferListeners,
+  detachTransferListeners,
+} from '@/stores/sftpTransferManager';
+import { useJobStore } from '@/stores/jobStore';
+import { useUpdateStore } from '@/stores/updateStore';
+import { mobileSetAppForeground } from '@/lib/tauri';
+import { bootstrapMobileApp } from './bootstrap';
+import { registerBackHandler } from './backHandler';
+import { panelVisibilityClass } from './sessionUi';
+import { DEFAULT_MOBILE_TAB, type MobileTabId } from './tabs';
+import type { MobileSettingsCategoryId } from './mobileSettingsModel';
+import { isMobileSettingsCategoryId } from './mobileSettingsModel';
+
+export default function MobileApp() {
+  const [activeTab, setActiveTab] = useState<MobileTabId>(DEFAULT_MOBILE_TAB);
+  // Dismissed-this-session guard so finishing onboarding hides it immediately
+  // even before the settings write lands.
+  const [onboardingDone, setOnboardingDone] = useState(false);
+  const [pendingSettingsCategory, setPendingSettingsCategory] =
+    useState<MobileSettingsCategoryId | null>(null);
+  const settingsLoaded = useSettingsStore((s) => s.loaded);
+  const hasCompletedOnboarding = useSettingsStore(
+    (s) => s.settings.hasCompletedOnboarding,
+  );
+  const showOnboarding =
+    settingsLoaded && !hasCompletedOnboarding && !onboardingDone;
+
+  useEffect(() => {
+    void bootstrapMobileApp().catch(() => {});
+    // 更新状态：订阅后端 update://state + 拉取本机能力（与桌面 AppHeader 同一入口，
+    // 幂等）。移动端的更新浮层/进度条都由这份状态驱动，不再各自做一次性检查。
+    void useUpdateStore.getState().init().catch(() => {});
+    const detachInteractions = initInteractionListener();
+    const detachJobs = useJobStore.getState().initEventListener();
+    // 作业跑完自动继续：作业结算 → 给那条会话开一轮把结局交给模型。
+    // 移动端切后台时 WebView 的 JS 会被冻结，恢复前台后由 jobWake 内部的
+    // `mobile:foreground` 监听补一次检查（事件在恢复后才送达）。
+    const detachJobWake = initJobWake();
+    // 传输监听器：**在这里 attach 而不是只依赖 bootstrap**。
+    // bootstrap 里仍会调一次（幂等，保留启动序列的完整性），但它是
+    // `bootstrapStarted` 一次性守卫的，一旦本组件真的卸载再挂载就没法再 attach。
+    // attach/detach 写在同一个 effect 里，两者才对称。
+    attachTransferListeners();
+    // 启动恢复：拉取全部会话的后台作业（事件不会重放，重启前已存在的
+    // 作业靠这次全量拉取回到 UI；只 upsert 合并，不覆盖事件实时状态）
+    void useJobStore.getState().fetchJobs();
+    return () => {
+      detachInteractions();
+      detachJobs();
+      detachJobWake();
+      detachTransferListeners();
+    };
+  }, []);
+
+  // Android WebView may still pan the document when an input focuses (despite
+  // overflow:hidden). Snap scroll back so users cannot drag into the blank
+  // strip under the IME and reveal the pinned tab bar.
+  useEffect(() => {
+    const snap = () => {
+      if (window.scrollX !== 0 || window.scrollY !== 0) {
+        window.scrollTo(0, 0);
+      }
+      if (document.documentElement.scrollTop !== 0) {
+        document.documentElement.scrollTop = 0;
+      }
+      if (document.body.scrollTop !== 0) {
+        document.body.scrollTop = 0;
+      }
+    };
+    const onFocusIn = () => {
+      requestAnimationFrame(snap);
+      window.setTimeout(snap, 50);
+      window.setTimeout(snap, 300);
+    };
+    window.addEventListener('scroll', snap, { passive: true });
+    document.addEventListener('focusin', onFocusIn);
+    const vv = window.visualViewport;
+    vv?.addEventListener('scroll', snap);
+    vv?.addEventListener('resize', snap);
+    return () => {
+      window.removeEventListener('scroll', snap);
+      document.removeEventListener('focusin', onFocusIn);
+      vv?.removeEventListener('scroll', snap);
+      vv?.removeEventListener('resize', snap);
+    };
+  }, []);
+
+  // Android back gesture returns to the home tab before the system gets a
+  // chance to finish the activity (sheets/overlays register on top of this).
+  //
+  // 必须用 useLayoutEffect：backHandler 是 LIFO 栈，而同一个 commit 里
+  // **子组件的 useEffect 先于父组件的 useEffect** 执行。若这里也用 useEffect，
+  // 切回文件页的那一次提交会把本层的「切回终端页」压在该页的「回上一级」之上，
+  // 于是第一次返回跳去终端页（要再切一次才恢复正常）；文件页的 handler 反而
+  // 在文件页内导航一次后才排到上面。layout 阶段先于整棵树的 passive 阶段提交，
+  // 这样本层（兜底）永远在新出现的页面级 handler 之下。
+  useLayoutEffect(() => {
+    if (activeTab === DEFAULT_MOBILE_TAB) return;
+    return registerBackHandler(() => setActiveTab(DEFAULT_MOBILE_TAB));
+  }, [activeTab]);
+
+  // 连接列表的后台保活卡片 → 跳转到设置/通知与后台
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent<{ category?: string }>).detail;
+      const cat = detail?.category;
+      if (cat && isMobileSettingsCategoryId(cat)) {
+        setPendingSettingsCategory(cat);
+        setActiveTab('settings');
+      }
+    };
+    window.addEventListener('mobile:open-settings', handler as EventListener);
+    return () =>
+      window.removeEventListener('mobile:open-settings', handler as EventListener);
+  }, []);
+
+  // 切前台时触发刷新信号。Rust 侧 RunEvent::Resumed 也会 emit mobile://lifecycle，
+  // 但 visibilitychange 更贴近 WebView 实际恢复时机（JS 引擎解冻）。
+  // 切后台时 SSH/Agent 在 Rust 内存里持续运行（前台服务保活），事件可能积压，
+  // 切前台后批量触发；本信号让需要刷新的组件（如 xterm）有机会主动重绘。
+  // 同时把前后台同步给 Rust：前台不发 Agent 系统通知，后台才发。
+  useEffect(() => {
+    const reportForeground = (inForeground: boolean) => {
+      mobileSetAppForeground(inForeground).catch(() => {});
+    };
+    reportForeground(document.visibilityState === 'visible');
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        reportForeground(true);
+        window.dispatchEvent(new CustomEvent('mobile:foreground'));
+      } else {
+        reportForeground(false);
+        window.dispatchEvent(new CustomEvent('mobile:background'));
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
+  }, []);
+
+  const handleOnboardingComplete = useCallback(() => {
+    setOnboardingDone(true);
+  }, []);
+
+  // Fill the window. Layout is absolute so the bottom tab bar can stay pinned
+  // under the soft keyboard while only the content area is lifted by
+  // --ime-bottom (injected from MainActivity when the IME opens).
+  return (
+    <div
+      className="relative h-full min-h-0 w-full overflow-hidden overscroll-none bg-zinc-950 text-zinc-100"
+      data-mobile-shell="1"
+      style={{
+        paddingLeft: 'env(safe-area-inset-left, 0px)',
+        paddingRight: 'env(safe-area-inset-right, 0px)',
+        // Tab buttons: min-h-12. Content bottom = max(tab, IME) so the
+        // keyboard covers the tab bar instead of lifting it. The navigation
+        // bar (3-button nav) is injected as --nav-bar-bottom from MainActivity
+        // (env(safe-area-inset-bottom) ignores it on Android WebView).
+        ['--tab-bar-height' as string]:
+          'calc(3rem + max(env(safe-area-inset-bottom, 0px), var(--nav-bar-bottom, 0px)))',
+      }}
+    >
+      <main
+        className="absolute inset-x-0 top-0 overflow-hidden"
+        style={{
+          bottom:
+            'max(var(--tab-bar-height), var(--ime-bottom, 0px))',
+        }}
+      >
+        <div
+          className={`absolute inset-0 ${panelVisibilityClass(activeTab === 'terminal')}`}
+        >
+          <MobileTerminalHost visible={activeTab === 'terminal'} />
+        </div>
+        <div
+          className={`absolute inset-0 ${panelVisibilityClass(activeTab === 'agent')}`}
+        >
+          <MobileAgentHost visible={activeTab === 'agent'} />
+        </div>
+        <div
+          className={`absolute inset-0 ${panelVisibilityClass(activeTab === 'files')}`}
+        >
+          <MobileFilesHost visible={activeTab === 'files'} />
+        </div>
+        <div
+          className={`absolute inset-0 ${panelVisibilityClass(activeTab === 'settings')}`}
+        >
+          <MobileSettings
+            visible={activeTab === 'settings'}
+            initialCategory={pendingSettingsCategory}
+            onCategoryConsumed={() => setPendingSettingsCategory(null)}
+            onShowServers={() => {
+              setActiveTab('terminal');
+              window.dispatchEvent(new Event('mobile:show-connections'));
+            }}
+          />
+        </div>
+
+      </main>
+      <div className="absolute inset-x-0 bottom-0">
+        <MobileTabBar activeTab={activeTab} onTabChange={setActiveTab} />
+      </div>
+
+      {!showOnboarding && <MobileUpdateToast />}
+
+      {showOnboarding && (
+        <MobileOnboarding onComplete={handleOnboardingComplete} />
+      )}
+
+      <MobileStarPromptSheet />
+      <MobileGlobalInteractionOverlay />
+    </div>
+  );
+}

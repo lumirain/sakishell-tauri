@@ -1,0 +1,363 @@
+import { create } from 'zustand';
+import * as tauri from '@/lib/tauri';
+import type { AppSettings, AgentModeSettings, ExperimentalSettings, NotificationSettings, MobileNotificationSettings, MobileBackgroundSettings, LlmRegistry, ChannelKeyStatus } from '@/lib/types';
+import { DEFAULT_TERMINAL_COLORS } from '@/lib/constants';
+import { DEFAULT_WORKSPACE_LAYOUT, normalizeWorkspaceLayout } from '@/lib/workspaceLayout';
+import { setNotificationVolume } from '@/lib/notificationSound';
+import { emptyRegistry, emptySlots, defaultNetPolicy, dedupeModelEntries } from '@/lib/llmRegistry';
+import { normalizeUpdateMode } from '@/lib/updateMode';
+
+const DEFAULT_AGENT_MODE_SETTINGS: AgentModeSettings = {
+  listMode: 'denylist',
+  commandList: ['rm', 'mkfs', 'dd', 'shutdown', 'reboot'],
+  confirmEachCommand: true,
+  planModeRequiresApproval: false,
+  enableModelCommandApproval: false,
+  commandApprovalEngine: 'model',
+  jevModelId: '',
+  jevBaseUrl: '',
+  jevApprovalPrompt: '',
+  // 默认关：开着会让每条需要人审的命令多打一次请求（延迟与花费都翻倍），
+  // 这种成本不能由一次升级替用户决定。
+  jevReasonFollowup: false,
+  modelApprovalPrompt: '',
+  systemPrompt: '',
+  maxToolRounds: 500,
+  contextWindow: 0,
+  confirmEditFile: true,
+};
+
+const DEFAULT_LLM_REGISTRY: LlmRegistry = emptyRegistry();
+
+/** 归一化注册表：缺字段补默认（兼容旧数据 / 字段缺失 = 保持原样 + 默认填充）。
+ *  模型列表按 id 去重（保留最后出现者）：历史「保存渠道」合并 bug 会写出同
+ *  id 重复条目，这里在 hydrate/load 时兜底自愈，避免模型选择器出现同模型两次。
+ *  全局最近使用（lastUsedModelId）一并保留；指向已删模型的失效值清空
+ *  （与后端 resolve 的"失效回落第一个模型"语义一致，也避免 save 被后端
+ *  validate 拦下）。 */
+function normalizeRegistry(r: Partial<LlmRegistry> | null | undefined): LlmRegistry {
+  if (!r) return DEFAULT_LLM_REGISTRY;
+  const models = Array.isArray(r.models) ? dedupeModelEntries(r.models) : [];
+  // 全局最近使用：须指向真实存在的模型才保留（以 dedupe 后的 models 为准），
+  // 否则视为失效清空（undefined = 回落第一个模型，语义与 emptyRegistry 一致）
+  const lastUsedModelId =
+    typeof r.lastUsedModelId === 'string' &&
+    r.lastUsedModelId.trim() !== '' &&
+    models.some((m) => m.id === r.lastUsedModelId)
+      ? r.lastUsedModelId
+      : undefined;
+  return {
+    channels: Array.isArray(r.channels) ? r.channels : [],
+    models,
+    slots: r.slots ? { ...emptySlots(), ...r.slots } : emptySlots(),
+    // 子agent 候选清单：缺字段补空数组（兼容旧数据），丢掉非对象/无 id 的脏
+    // 条目；description 归一为字符串（手改配置缺该键时受控 input 不吃 undefined）
+    subagentModels: Array.isArray(r.subagentModels)
+      ? r.subagentModels
+          .filter((c) => c && typeof c.modelId === 'string')
+          .map((c) => ({
+            modelId: c.modelId,
+            description: typeof c.description === 'string' ? c.description : '',
+          }))
+      : [],
+    netPolicy: r.netPolicy ? { ...defaultNetPolicy(), ...r.netPolicy } : defaultNetPolicy(),
+    // 只在有有效值时设键：undefined 时与 emptyRegistry（无此键）形态一致
+    ...(lastUsedModelId ? { lastUsedModelId } : {}),
+  };
+}
+
+export const DEFAULT_EXPERIMENTAL_SETTINGS: ExperimentalSettings = {
+  enableWebSearch: true,
+  enableHttpFetch: true,
+  enableCloudPage: false,
+  webSearchMode: 'browser',
+  webSearchApiProvider: 'brave',
+  webSearchCustom: { url: '', protocol: 'brave' },
+  webSearchEndpoint: 'cn',
+  httpFetchMode: 'browser',
+  httpFetchCustom: { url: '', protocol: 'deepseek', sendPrivate: false },
+  enableHtmlRender: true,
+  multiHostConnectionIds: [],
+};
+
+
+
+export const DEFAULT_NOTIFICATION_SETTINGS: NotificationSettings = {
+  agentApproval: true,
+  agentQuestion: true,
+  agentTaskDone: true,
+  agentTaskFailed: true,
+  notificationVolume: 70,
+};
+
+export const DEFAULT_MOBILE_NOTIFICATION_SETTINGS: MobileNotificationSettings = {
+  agentApproval: true,
+  agentQuestion: true,
+  agentTaskDone: true,
+  agentTaskFailed: true,
+};
+
+export const DEFAULT_MOBILE_BACKGROUND_SETTINGS: MobileBackgroundSettings = {
+  keepAliveEnabled: false,
+};
+
+const DEFAULT_SETTINGS: AppSettings = {
+  terminalColors: DEFAULT_TERMINAL_COLORS,
+  fontSize: 14,
+  fontFamily: 'JetBrains Mono, Fira Code, Consolas, "Microsoft YaHei", monospace',
+  defaultAgentMode: 'agent',
+  llmRegistry: DEFAULT_LLM_REGISTRY,
+  agentModeSettings: DEFAULT_AGENT_MODE_SETTINGS,
+  experimentalSettings: DEFAULT_EXPERIMENTAL_SETTINGS,
+  updateMode: 'auto',
+  autoUpdate: true,
+  fileManagerShowHidden: false,
+  fileManagerPath: '/',
+  fileManagerPaths: {},
+  fileManagerTreeWidth: 200,
+  fileManagerTreeUserHidden: false,
+  folderUploadCompressionLevel: 6,
+  panelHeight: 256,
+  hideThinkingDisplay: false,
+  /** 默认开启：只折叠「已完成且过程较长的回合」。 */
+  foldCompletedTurns: true,
+  privacyMode: false,
+  notificationSettings: DEFAULT_NOTIFICATION_SETTINGS,
+  mobileNotificationSettings: DEFAULT_MOBILE_NOTIFICATION_SETTINGS,
+  mobileBackgroundSettings: DEFAULT_MOBILE_BACKGROUND_SETTINGS,
+  workspaceLayout: DEFAULT_WORKSPACE_LAYOUT,
+  customProtectedPaths: [],
+  commandTimeoutSecs: 180,
+  hasCompletedOnboarding: false,
+  disabledPlugins: [],
+  authorizedCapabilities: {},
+  disableAllInjections: false,
+};
+
+interface SettingsState {
+  settings: AppSettings;
+  loaded: boolean;
+  /** True if a key is currently stored in the system keychain. */
+  hasApiKey: boolean;
+  /** True if a web search API key is stored in the system keychain. */
+  hasWebSearchApiKey: boolean;
+  /** True if the DeepSeek tools API key (web search + web fetch) is stored in the system keychain. */
+  hasDeepseekToolsApiKey: boolean;
+  /** True if the custom search API key is stored in the system keychain (it is optional to have one). */
+  hasCustomSearchApiKey: boolean;
+  /** True if the custom page-fetch service key is stored in the system keychain (optional to have one). */
+  hasCustomFetchApiKey: boolean;
+  /** True if the Tavily page-fetch key is stored in the system keychain (empty = reuse the Tavily search key). */
+  hasTavilyFetchApiKey: boolean;
+  /** True if a TypeSafe（Jev）API Key is stored in the system keychain. */
+  hasJevApiKey: boolean;
+  /** 各渠道密钥是否存在（多渠道模型服务）。key = channelId。 */
+  channelKeyStatus: Record<string, boolean>;
+  /** Non-fatal warning from the backend (e.g. settings.json was backed up). */
+  warning: string | null;
+
+  /** Load settings from disk on app startup. Idempotent unless forced. */
+  load: (force?: boolean) => Promise<void>;
+  /** 从启动快照批量 Hydrate 设置 */
+  hydrateFromBootstrap: (data: {
+    settings: AppSettings;
+    hasApiKey: boolean;
+    hasWebSearchApiKey: boolean;
+    /** 必填，理由同 `hasJevApiKey`：漏发会让设置页把已配的 DeepSeek Key 显示成没配。 */
+    hasDeepseekToolsApiKey: boolean;
+    /** 必填，理由同上：启动快照是唯一读取路径。 */
+    hasCustomSearchApiKey: boolean;
+    /** 必填，理由同上。 */
+    hasCustomFetchApiKey: boolean;
+    /** 必填，理由同上。 */
+    hasTavilyFetchApiKey: boolean;
+    /**
+     * 必填：启动快照是读取该真值的**唯一**路径（`hydrateFromBootstrap` 会把
+     * `loaded` 置真，随后的 `load()` 直接短路）。声明成可选会让后端漏发字段时
+     * 静默退化成「没配 Key」，并藏起清除按钮。
+     */
+    hasJevApiKey: boolean;
+    channelKeyStatus?: ChannelKeyStatus[];
+    warning?: string | null;
+  }) => void;
+  /** Persist a full settings object and update local state. */
+  save: (settings: AppSettings) => Promise<void>;
+  /** Patch a subset of fields, persist, and update local state. */
+  update: (patch: Partial<AppSettings>) => Promise<void>;
+  /** Acknowledge / dismiss a backend warning. */
+  clearWarning: () => void;
+  /** Preview settings for live updates (not persisted until save) */
+  preview: Partial<AppSettings> | null;
+  /** Update preview settings for live preview */
+  setPreview: (preview: Partial<AppSettings>) => void;
+  /** Clear preview settings */
+  clearPreview: () => void;
+}
+
+/** 把后端 channelKeyStatus 数组转为 id → bool 映射。 */
+function toKeyStatusMap(list: ChannelKeyStatus[] | undefined): Record<string, boolean> {
+  const map: Record<string, boolean> = {};
+  for (const s of list ?? []) map[s.channelId] = s.hasKey;
+  return map;
+}
+
+/** 剥掉已删除/废弃的 experimental 字段（旧配置残留不落盘）。
+ *  显式 delete 而非解构：enableMultiHost 已从类型删除，解构会让未用变量
+ *  触发 lint；delete 对类型外键也安全（运行时旧配置可能仍带着它）。 */
+function stripLegacyExperimental(
+  es: Partial<ExperimentalSettings> | undefined,
+): Partial<ExperimentalSettings> {
+  if (!es) return {};
+  const copy = { ...es };
+  delete (copy as Record<string, unknown>).enableMultiHost;
+  return copy;
+}
+
+function hydrateExperimental(
+  es: Partial<ExperimentalSettings> | undefined,
+): ExperimentalSettings {
+  return {
+    ...DEFAULT_EXPERIMENTAL_SETTINGS,
+    ...stripLegacyExperimental(es),
+  };
+}
+
+export const useSettingsStore = create<SettingsState>((set, get) => ({
+  settings: DEFAULT_SETTINGS,
+  loaded: false,
+  hasApiKey: false,
+  hasWebSearchApiKey: false,
+  hasDeepseekToolsApiKey: false,
+  hasCustomSearchApiKey: false,
+  hasCustomFetchApiKey: false,
+  hasTavilyFetchApiKey: false,
+  hasJevApiKey: false,
+  channelKeyStatus: {},
+  warning: null,
+  preview: null,
+
+  hydrateFromBootstrap: (data) => {
+    const fromDisk = data.settings;
+    const merged: AppSettings = {
+      ...DEFAULT_SETTINGS,
+      ...fromDisk,
+      terminalColors: fromDisk.terminalColors ?? DEFAULT_TERMINAL_COLORS,
+      // 审批引擎等新字段：旧数据缺字段时用默认值兜底。
+      // 「兼容旧数据 = 保持原样 + 默认值填充」——`commandApprovalEngine` 缺省
+      // 走 `model`，行为与引入 Jev 之前一致，不改变任何用户现状。
+      agentModeSettings: {
+        ...DEFAULT_AGENT_MODE_SETTINGS,
+        ...(fromDisk.agentModeSettings ?? {}),
+      },
+      llmRegistry: normalizeRegistry(fromDisk.llmRegistry),
+      experimentalSettings: hydrateExperimental(fromDisk.experimentalSettings),
+      fileManagerPaths: fromDisk.fileManagerPaths ?? {},
+      workspaceLayout: normalizeWorkspaceLayout(fromDisk.workspaceLayout),
+      mobileNotificationSettings: {
+        ...DEFAULT_MOBILE_NOTIFICATION_SETTINGS,
+        ...(fromDisk.mobileNotificationSettings ?? {}),
+      },
+      mobileBackgroundSettings: {
+        ...DEFAULT_MOBILE_BACKGROUND_SETTINGS,
+        ...(fromDisk.mobileBackgroundSettings ?? {}),
+      },
+      // 更新方式三态：旧后端/旧配置没有该字段时按旧的 autoUpdate 推导，
+      // 保持用户现状（旧语义下 autoUpdate=false = 仅提醒），不清空也不报错。
+      updateMode: normalizeUpdateMode(fromDisk),
+    };
+    set({
+      settings: merged,
+      loaded: true,
+      hasApiKey: data.hasApiKey,
+      hasWebSearchApiKey: data.hasWebSearchApiKey ?? false,
+      hasDeepseekToolsApiKey: data.hasDeepseekToolsApiKey ?? false,
+      hasCustomSearchApiKey: data.hasCustomSearchApiKey ?? false,
+      hasCustomFetchApiKey: data.hasCustomFetchApiKey ?? false,
+      hasTavilyFetchApiKey: data.hasTavilyFetchApiKey ?? false,
+      hasJevApiKey: data.hasJevApiKey ?? false,
+      channelKeyStatus: toKeyStatusMap(data.channelKeyStatus),
+      warning: data.warning ?? null,
+    });
+    setNotificationVolume(merged.notificationSettings?.notificationVolume ?? 70);
+  },
+
+  load: async (force = false) => {
+    if (get().loaded && !force) return;
+    try {
+      const resp = await tauri.getSettings();
+      const fromDisk = resp.settings;
+      const merged: AppSettings = {
+        ...DEFAULT_SETTINGS,
+        ...fromDisk,
+        terminalColors: fromDisk.terminalColors ?? DEFAULT_TERMINAL_COLORS,
+        agentModeSettings: {
+          ...DEFAULT_AGENT_MODE_SETTINGS,
+          ...(fromDisk.agentModeSettings ?? {}),
+        },
+        llmRegistry: normalizeRegistry(fromDisk.llmRegistry),
+        experimentalSettings: hydrateExperimental(fromDisk.experimentalSettings),
+        fileManagerPaths: fromDisk.fileManagerPaths ?? {},
+        workspaceLayout: normalizeWorkspaceLayout(fromDisk.workspaceLayout),
+        // 移动端独立设置：旧数据无此字段时用默认值兜底（兼容旧数据 = 保持原样 + 默认值填充）
+        mobileNotificationSettings: {
+          ...DEFAULT_MOBILE_NOTIFICATION_SETTINGS,
+          ...(fromDisk.mobileNotificationSettings ?? {}),
+        },
+        mobileBackgroundSettings: {
+          ...DEFAULT_MOBILE_BACKGROUND_SETTINGS,
+          ...(fromDisk.mobileBackgroundSettings ?? {}),
+        },
+        updateMode: normalizeUpdateMode(fromDisk),
+      };
+      set({
+        settings: merged,
+        loaded: true,
+        hasApiKey: resp.hasApiKey,
+        hasWebSearchApiKey: resp.hasWebSearchApiKey ?? false,
+        hasDeepseekToolsApiKey: resp.hasDeepseekToolsApiKey ?? false,
+        hasCustomSearchApiKey: resp.hasCustomSearchApiKey ?? false,
+        hasCustomFetchApiKey: resp.hasCustomFetchApiKey ?? false,
+        hasTavilyFetchApiKey: resp.hasTavilyFetchApiKey ?? false,
+        hasJevApiKey: resp.hasJevApiKey ?? false,
+        channelKeyStatus: toKeyStatusMap(resp.channelKeyStatus),
+        warning: resp.warning ?? null,
+      });
+      setNotificationVolume(merged.notificationSettings?.notificationVolume ?? 70);
+    } catch (err) {
+      console.error('加载设置失败:', err);
+      set({ loaded: false });
+      throw err;
+    }
+  },
+
+  save: async (settings: AppSettings) => {
+    if (!get().loaded) {
+      console.warn('[settingsStore] save() blocked — settings not loaded yet');
+      return;
+    }
+    await tauri.saveSettings(settings);
+    set({ settings, preview: null });
+  },
+
+  update: async (patch: Partial<AppSettings>) => {
+    if (!get().loaded) {
+      console.warn('[settingsStore] update() blocked — settings not loaded yet');
+      return;
+    }
+    const next = { ...get().settings, ...patch };
+    await tauri.saveSettings(next);
+    set({ settings: next, preview: null });
+  },
+
+  setPreview: (preview: Partial<AppSettings>) => {
+    set({ preview });
+  },
+
+  clearWarning: () => {
+    set({ warning: null });
+  },
+
+  clearPreview: () => {
+    set({ preview: null });
+  },
+}));

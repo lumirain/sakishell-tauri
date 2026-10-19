@@ -1,0 +1,60 @@
+{
+  "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-cli/schema.json",
+  "productName": "SakiShell",
+  "identifier": "com.sakishell.app",
+  "version": "1.0.0",
+  "build": {
+    "beforeDevCommand": "node node_modules/vite/bin/vite.js --mode development",
+    "beforeBuildCommand": "node node_modules/vite/bin/vite.js build",
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "SakiShell",
+        "width": 1200,
+        "height": 800,
+        "minWidth": 800,
+        "minHeight": 600,
+        "decorations": false,
+        "transparent": false,
+        "visible": false
+      }
+    ],
+    "withGlobalTauri": true,
+    "security": {
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": [
+          "$APPDATA/marcel-previews/**/*",
+          "$APPCONFIG/images/**/*"
+        ]
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": [
+      "icons/icon.ico",
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.png"
+    ],
+    "windows": {
+      "wix": {
+        "language": "zh-CN",
+        "bannerPath": "icons/wix-banner.png",
+        "dialogImagePath": "icons/wix-dialog.png"
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "installerIcon": "icons/icon.ico",
+        "headerImage": "icons/nsis-header.bmp"
+      }
+    }
+  }
+}

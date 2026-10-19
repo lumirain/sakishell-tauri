@@ -1,0 +1,2130 @@
+//! AgentManager — 统一 agent 的组装与生命周期管理。
+//!
+//! 职责边界（manager 而非纯功能）：
+//! - **组装**：从 [`AgentSpec`]（声明式描述）派生出 provider / registry /
+//!   messages，收敛 Plan / Agent / Auto 三种模式在工具集、system prompt、
+//!   插件段上的差异。
+//! - **生命周期**：注册 [`AgentTask`]、spawn [`run_agent_loop`]、统一终态
+//!   更新、取消信号清理与 panic 兜底。
+//!
+//! 主任务与子任务（`subagent` 工具派发）共用同一个 [`AgentManager::spawn`]
+//! 入口，子代理只是 [`AgentSpec`] 叠加了角色约束，不再复制组装逻辑。
+//!
+//! 调用方（`commands/agent_lifecycle`、`agent/tools/subagent`）负责「决定要
+//! 跑什么」（spec）与前后的事件/对话准备，不各自实现组装与 spawn。
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::OnceLock;
+use std::time::Instant;
+
+use futures::FutureExt;
+use parking_lot::RwLock as PlRwLock;
+use tauri::AppHandle;
+
+use crate::agent::agent_loop::{run_agent_loop, LoopContext};
+use crate::agent::conversation_persister::{ConversationPersister, PromptOrigin};
+use crate::agent::system_prompt::build_system_prompt;
+use crate::agent::task::{AgentMode, AgentStatus, AgentTask, AgentTaskPlan, TurnState};
+use crate::agent::templates::TemplateManager;
+use crate::agent::tools::subagent::{resolve_subagent_candidates, SubagentModelCandidate};
+use crate::agent::tools::{
+    mcp::register_mcp_tools, plugin_tool::register_plugin_tools, subagent, ToolRegistry,
+};
+use crate::config::keychain;
+use crate::config::settings::{CommandApprovalEngine, ExperimentalSettings};
+use crate::error::AppError;
+use crate::llm::jev::JevConfig;
+use crate::llm::manager::LlmManager;
+use crate::llm::provider::{LlmConfig, LlmMessage, LlmRole, ToolDefinition};
+use crate::llm::registry::LlmRegistry;
+use crate::mcp::manager::StartupTools;
+use crate::mcp::store::McpServerConfig;
+use crate::plugins::context::{apply_to_string, SessionContext};
+use crate::plugins::manifest::PluginManifest;
+use crate::plugins::registry::PluginRegistry;
+use crate::ssh::connection::SessionInfo;
+use crate::AppState;
+
+/// 任务启动时，对"从没发现过工具"的 MCP 服务器最多等多久。已有缓存（成功或失败）
+/// 的服务器一律不等。
+const MCP_STARTUP_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// 单个插件贡献的 system prompt 段的最大字符数。
+const PLUGIN_SECTION_MAX_CHARS: usize = 2000;
+
+/// 一个 agent 实例的角色。
+#[derive(Debug, Clone, PartialEq)]
+pub enum AgentRole {
+    /// 主任务：由用户直接发起。
+    Main,
+    /// 子任务：由 `subagent` 工具派发的调研子 agent。
+    Sub { parent_task_id: String },
+    /// **本机子 agent**：由 `local_subagent` 工具派发、在**用户自己这台电脑**上
+    /// 干活的子 agent（桌面专属）。
+    ///
+    /// 与 `Sub` 的差别只有执行侧（工具集、ctx、目标机器），见 [`audience_of`] 与
+    /// `agent_loop` 的本机 ctx 分支；生命周期、级联取消、`read_history(scope=parent)`
+    /// 的窗口冻结与 `Sub` 完全一致 —— 它同样有 `parent_task_id`。
+    LocalSub { parent_task_id: String },
+}
+
+impl AgentRole {
+    /// 是不是子 agent（`Sub` 与 `LocalSub` 都是：跳过完成通知、不进对话列表的
+    /// 「主任务」语义、插件 / MCP / 多机一律不加载）。
+    fn is_subtask(&self) -> bool {
+        matches!(self, AgentRole::Sub { .. } | AgentRole::LocalSub { .. })
+    }
+
+    fn parent_task_id(&self) -> Option<&str> {
+        match self {
+            AgentRole::Sub { parent_task_id } | AgentRole::LocalSub { parent_task_id } => {
+                Some(parent_task_id)
+            }
+            AgentRole::Main => None,
+        }
+    }
+
+    /// 这个角色的 ctx 是否指向**用户自己这台电脑**（而不是 SSH 会话那台服务器）。
+    /// 由 `spawn` 写进 [`LoopContext::local_side`]，agent loop 据此把 ctx 挂上
+    /// `AppState.local_command_exec` 并置 `local_side = true`。
+    fn is_local_side(&self) -> bool {
+        matches!(self, AgentRole::LocalSub { .. })
+    }
+}
+
+/// 声明式描述一次 agent 组装与运行。
+pub struct AgentSpec {
+    /// 任务实例标识，由调用方生成：主任务要返回给前端，子任务要在 spawn
+    /// 前 emit `SubTaskStart` 注册子对话流监听。
+    pub task_id: String,
+    pub mode: AgentMode,
+    pub role: AgentRole,
+    pub session_id: String,
+    pub conversation_id: String,
+    pub prompt: String,
+    /// 前端传入的历史消息（子任务通常为空）。
+    pub history: Vec<LlmMessage>,
+    /// 覆盖主模型的 model 名（子任务可选）。
+    pub model_override: Option<String>,
+    /// 追加到 system prompt 的角色约束段（子任务的调研约束）。
+    /// 作为拼装组件传入，与基础段一样由模板拼装器统一拼接。
+    pub prompt_extra: Vec<String>,
+    /// 本轮 prompt 的来源（用户输入 / 作业结算告知）。决定它在会话里的身份
+    /// （落库 role，见 [`PromptOrigin`]）与「算不算用户输入」（自动继续的预算
+    /// 只由用户输入重置）。主任务由 IPC 给，子任务恒为用户输入。
+    pub prompt_origin: PromptOrigin,
+    /// 用户输入与文本附件的展示快照，仅保存到本轮 user 行，不参与模型消息拼装。
+    pub user_input: Option<serde_json::Value>,
+    /// 审批语义覆盖：`None` = 跟随自身 `mode`（Plan 模式默认与 Auto 一样不弹
+    /// 人审，除非设置了 `plan_mode_requires_approval`）；`Some(Auto)` = 命令执行
+    /// 静默放行不弹人审（模型审批的 route_to_human 也不转人审），仅保留 风险
+    /// 评估的「直接拒绝」硬拦截。Auto 父任务派发的只读调研子 agent 用它，避免主
+    /// 任务在 Auto 全自主时子 agent 的只读命令仍弹审批窗 —— 这条覆盖**优先于**上面
+    /// 的设置，用户把「Plan 模式也需要审批」打开后 Auto 父任务的子 agent 依然静默。
+    pub approval_mode: Option<AgentMode>,
+}
+
+/// [`AgentManager::spawn`] 返回的任务句柄。
+///
+/// 主任务通常 fire-and-forget（drop 句柄即可，spawn 内部已保证终态与取消
+/// 清理）；子任务需要 [`AgentTaskHandle::join`] 拿回调研结果文本。
+pub struct AgentTaskHandle {
+    pub task_id: String,
+    join: tokio::task::JoinHandle<Option<String>>,
+}
+
+impl AgentTaskHandle {
+    pub async fn join(self) -> Option<String> {
+        let task_id = self.task_id.clone();
+        match self.join.await {
+            Ok(result) => result,
+            Err(e) => {
+                log::error!("agent task {} join error: {}", task_id, e);
+                None
+            }
+        }
+    }
+}
+
+// ── 「组装期间收到的停止」墓碑 ──
+
+/// 墓碑有效期（安全网）。
+///
+/// 正常路径下墓碑活不过一次 `spawn`：`spawn` 开头就把它取走、注册取消表后再认领，
+/// 所以只有「任务根本没起来 / 前端发了停止却没有对应的启动」才会留下它。留个上限
+/// 免得这类请求永久堆积，也避免 task_id 复用（极端情况下前端可能重发同一个 id）
+/// 在很久之后被一枚旧墓碑误伤。
+const PENDING_CANCEL_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+/// 墓碑条数上限：组装窗口是秒级、来源只有用户点击；超量丢最旧的，
+/// 保证这张表不会无限增长（真被塞满也只是退化回「组装期停止可能丢」）。
+const PENDING_CANCEL_MAX: usize = 64;
+
+/// `task_id → 请求停止的时间点`。进程级表：`AppState` 里没有这一类槽位，
+/// 而墓碑只服务于「同一次 spawn 的组装窗口」这一瞬间。
+fn pending_cancels() -> &'static std::sync::Mutex<std::collections::VecDeque<(String, Instant)>> {
+    static TABLE: OnceLock<std::sync::Mutex<std::collections::VecDeque<(String, Instant)>>> =
+        OnceLock::new();
+    TABLE.get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()))
+}
+
+/// 记下一枚「还没出生就被要求停止」的墓碑（同 id 去重、顺带清理过期条目）。
+fn record_pending_cancel(task_id: &str) {
+    let now = Instant::now();
+    let mut table = pending_cancels().lock().unwrap_or_else(|e| e.into_inner());
+    table.retain(|(id, at)| id != task_id && now.duration_since(*at) < PENDING_CANCEL_TTL);
+    table.push_back((task_id.to_string(), now));
+    while table.len() > PENDING_CANCEL_MAX {
+        table.pop_front();
+    }
+}
+
+/// 认领（一次性消费）某任务的停止请求。
+///
+/// **过期的墓碑不算命中**：它是一条陈旧的请求（上一次运行留下的），认领会把
+/// 这一次才起来的同名任务开场就收掉。命中与清理在同一次遍历里完成。
+fn take_pending_cancel(task_id: &str) -> bool {
+    let now = Instant::now();
+    let mut table = pending_cancels().lock().unwrap_or_else(|e| e.into_inner());
+    let mut hit = false;
+    table.retain(|(id, at)| {
+        let fresh = now.duration_since(*at) < PENDING_CANCEL_TTL;
+        if id == task_id {
+            if fresh {
+                hit = true;
+            }
+            return false; // 认领即消费（过期的也一并摘掉）
+        }
+        fresh
+    });
+    hit
+}
+
+/// 记录一次「停止这个任务」的请求——**无论任务在不在册都不丢**。
+///
+/// 为什么需要它：`spawn` 在把任务写进 `agent_tasks` 之前要读设置、解析模型
+/// （密钥链）、构建工具注册表（对从没发现过工具的 MCP server 最多等几秒，见
+/// `MCP_STARTUP_WAIT`）、拼 system prompt——这段窗口不是零，哪怕现在已经不会
+/// 被慢 MCP 拖到几十秒。前端点「停止」时任务可能**还没在册**，若那时只回一句 `Task not
+/// found`，这次停止就被整个丢掉：任务随后照常启动、照常跑完，远端命令、审批
+/// 弹窗、消息落库一样不少，用户以为自己已经停下了它。
+///
+/// 所以：
+/// - 任务在册 → 置取消态（`transition_to`，Cancelled 是吸收态、重复写幂等）
+///   并置位取消信号；级联（子 agent / 后台作业 / 待审批交互）仍由调用方负责 ——
+///   完整的停止语义见 [`stop_task_cascade`]，这里只落实「在册 / 不在册」两条最小分支。
+/// - 任务不在册 → 记一枚墓碑，等 `spawn` 注册完取消表后认领。
+///
+/// **不要在持有 `agent_tasks` 写锁时调用**：本函数要读写同一把锁
+/// （`parking_lot::RwLock` 不可重入，同线程再取读锁会死锁）。调用点先
+/// `drop(tasks)` 再调。
+pub(crate) fn request_cancel(state: &AppState, task_id: &str) {
+    if state.agent_tasks.read().contains_key(task_id) {
+        apply_pending_cancel(&state.agent_tasks, &state.task_cancel, task_id);
+        return;
+    }
+    record_pending_cancel(task_id);
+}
+
+/// 应用一次停止：任务收成 `Cancelled` 并发出取消信号。
+///
+/// 抽成自由函数（只依赖任务表与取消表，不依赖整个 `AppState`）是为了让「取消
+/// 表已有接收端」这条顺序约束可测——顺序错就退化成「用户以为停了，任务照常在
+/// 后台跑完」。任务记录已被剪掉时不写状态（无从写起），但信号照发。
+fn apply_pending_cancel(
+    tasks: &std::sync::Arc<PlRwLock<HashMap<String, AgentTask>>>,
+    cancel: &crate::cancel::CancellationRegistry,
+    task_id: &str,
+) {
+    if let Some(task) = tasks.write().get_mut(task_id) {
+        // Cancelled 是吸收态：重复置位是幂等空操作。
+        task.transition_to(AgentStatus::Cancelled);
+    }
+    // 必须在取消表注册**之后**调用：表里没有接收端时 send 会丢，而 agent loop
+    // 只在取消信号上中断正在进行的 LLM 调用（任务状态是每轮开头才查）。
+    cancel.cancel(task_id);
+}
+
+/// 收集 task_id 及其全部后代子任务（`subagent` / `local_subagent` 工具派发的
+/// 子 agent）。
+///
+/// 子agent不能再派发子agent（plan 工具集无 subagent 工具 + 工具内嵌套防御），
+/// 一层即可覆盖全部后代；这里仍用 BFS，防御任何残留的多层结构。
+pub(crate) fn collect_descendant_tasks(
+    tasks: &HashMap<String, AgentTask>,
+    task_id: &str,
+) -> Vec<String> {
+    let mut to_cancel: Vec<String> = vec![task_id.to_string()];
+    let mut idx = 0;
+    while idx < to_cancel.len() {
+        let parent = to_cancel[idx].clone();
+        for (tid, t) in tasks.iter() {
+            if t.parent_task_id.as_deref() == Some(parent.as_str()) && !to_cancel.contains(tid) {
+                to_cancel.push(tid.clone());
+            }
+        }
+        idx += 1;
+    }
+    to_cancel
+}
+
+/// 停止一个任务及其全部后代 —— **「点停止」的唯一实现**。
+///
+/// 两个触发入口共用它，保证两条路径上的停止语义逐项一致：
+/// - `agent_stop_task` 命令（用户点停止按钮）；
+/// - SSH 会话断开观察者（见 [`stop_tasks_for_disconnected_session`]）。
+///
+/// 一次停止含四件事：任务收成 `Cancelled`（吸收态、幂等）、解除挂起的审批 /
+/// 提问、置位取消信号（中断在飞的 LLM 调用），以及连带停掉该任务名下的远端与
+/// 本机命令及后台作业。
+///
+/// 返回本次涉及的 task id 个数（含后代，以及「不在册」时那枚墓碑），供调用方记日志。
+pub(crate) async fn stop_task_cascade(app: &AppHandle, state: &AppState, task_id: &str) -> usize {
+    // 级联取消：停掉该任务及其全部子agent。子任务与主任务一样要置
+    // Cancelled——子agent loop 的退出检查（is_task_cancelled）只看 status，
+    // 不置状态的话取消场景会被 subagent 工具误报为「执行失败」。
+    let tasks_to_cancel = {
+        let tasks = state.agent_tasks.read();
+        collect_descendant_tasks(&tasks, task_id)
+    };
+
+    let requested_while_absent = {
+        let mut tasks = state.agent_tasks.write();
+        let mut found = false;
+        for tid in &tasks_to_cancel {
+            if let Some(task) = tasks.get_mut(tid) {
+                // 经 `transition_to` 而非直接赋值：写状态的规则只有一处
+                // （重复写 Cancelled 是幂等的空操作）。
+                task.transition_to(AgentStatus::Cancelled);
+                found = true;
+            }
+        }
+        !found
+    };
+
+    // 任务还没在册：组装期间点停止（`spawn` 要先做设置/MCP/skill 读取与模型解析
+    // 才把任务写进表，首次发现 MCP 工具时这个窗口可达数秒）。这里必须把取消
+    // 请求**记下来**并当成功返回，而不是回一句 Task not found——那会变成前端看不见
+    // 的 rejection，任务随后照常启动、照常跑完。
+    // 注意：必须在释放上面的写锁之后再调用（本函数要再取同一把锁）。
+    if requested_while_absent {
+        request_cancel(state, task_id);
+        log::info!(
+            "Stop requested before task {} was registered; recording it",
+            task_id
+        );
+        return tasks_to_cancel.len();
+    }
+
+    // 解除挂起交互：经 AgentInteractionManager 取消并在队列中淘汰，通知前端更新
+    for tid in &tasks_to_cancel {
+        state.agent_interaction.cancel_task_interactions(app, tid);
+    }
+
+    for tid in &tasks_to_cancel {
+        state.task_cancel.cancel(tid);
+        // bash 以 Agent task_id 注册到统一命令 manager；任务停止属级联
+        // 取消 → Task，与界面直接取消（User）、Agent job_kill（Agent）
+        // 区分，job_output 的终止来源文案据此渲染。
+        // 前台执行走 cancel_with_reason（注册表最后一条 exec）；
+        // 后台作业可能多条并存，cancel_task_jobs 逐个 kill + 释放
+        // 结算通知通道（让挂起的 agent loop 立即醒来以取消收场）。
+        let _ = state
+            .command_exec
+            .cancel_with_reason(tid, crate::command_exec::CancelReason::Task)
+            .await;
+        let _ = state.command_exec.cancel_task_jobs(tid).await;
+        // 本机执行是另一套 manager（没有 SSH 会话可断连级联，见 AppState 的
+        // `local_command_exec` 注释），停止任务同样要停它名下的本机作业与前台
+        // 执行——否则用户点了停止，本机上跑的构建 / 脚本还在继续。两类调用的
+        // 分工与上面完全一致（前台走注册表，后台作业逐个终止）。
+        let _ = state
+            .local_command_exec
+            .cancel_with_reason(tid, crate::command_exec::CancelReason::Task)
+            .await;
+        let _ = state.local_command_exec.cancel_task_jobs(tid).await;
+    }
+    if tasks_to_cancel.len() > 1 {
+        log::info!(
+            "Cancelled task {} and {} sub-agent(s)",
+            task_id,
+            tasks_to_cancel.len() - 1
+        );
+    }
+    tasks_to_cancel.len()
+}
+
+/// 会话 → 绑在它上面、**仍在运行**的任务 id 列表（纯函数，便于测试）。
+///
+/// 只取运行中的：终态任务不收停止——`transition_to` 只把 `Cancelled` 当吸收态，
+/// 对一个刚 `Completed` 的任务写 `Cancelled` 是实打实地改写状态。
+fn running_task_ids_in(tasks: &HashMap<String, AgentTask>, session_id: &str) -> Vec<String> {
+    tasks
+        .values()
+        .filter(|t| t.session_id == session_id && t.status.is_running())
+        .map(|t| t.id.clone())
+        .collect()
+}
+
+/// [`running_task_ids_in`] 的 `AppState` 版本。
+pub(crate) fn running_task_ids_for_session(state: &AppState, session_id: &str) -> Vec<String> {
+    running_task_ids_in(&state.agent_tasks.read(), session_id)
+}
+
+/// SSH 会话断开：把绑在该会话上的在跑任务逐个按「点停止」收场（各带子 agent 级联）。
+///
+/// 为什么要停：会话没了，这些任务依赖的工具一个也做不成；而前端在断连路径上会
+/// 把任务就地收成「已取消」并拆掉事件通道，之后它们在界面上既看不见、也没有入口
+/// 再停（停止按钮只对运行中的任务亮）。不停的话就是白烧 token 往会话里写消息。
+///
+/// 为什么走「点停止」这套：它已是四层（任务状态 / 落库 turn_state / 前端 store /
+/// UI）验证过的一致性收尾，另起一套只会分叉。
+///
+/// 停的范围是**这一棵棵任务树**：同一棵树上的子 agent 可能跑在别的机器上
+/// （multi_host），它们照样在级联里被停掉 —— 会话断了，这次行动已经没有意义。
+pub(crate) async fn stop_tasks_for_disconnected_session(
+    app: &AppHandle,
+    state: &AppState,
+    session_id: &str,
+) {
+    let task_ids = running_task_ids_for_session(state, session_id);
+    if task_ids.is_empty() {
+        return;
+    }
+    log::info!(
+        "SSH 会话 {} 断开：级联停止 {} 个 agent 任务（含其子 agent）",
+        session_id,
+        task_ids.len()
+    );
+    for tid in &task_ids {
+        // 同一棵树可能有多个任务都绑在这个会话上（子 agent 不传 host 时继承父
+        // 会话），逐个调是幂等的。
+        stop_task_cascade(app, state, tid).await;
+    }
+}
+
+/// 统一管理 agent 的组装与生命周期。
+pub struct AgentManager {
+    state: AppState,
+}
+
+impl AgentManager {
+    pub fn new(state: AppState) -> Self {
+        Self { state }
+    }
+
+    /// 按当前设置解析「工具集输入」：启用技能、启用的 MCP server、实验开关。
+    ///
+    /// `spawn` 与 [`Self::current_tool_definitions`] 共用同一来源——两处各写一份
+    /// 必然分叉，而工具清单一分叉，摘要调用与常规请求的 tools 段就不再一致
+    /// （上下文压缩把"与常规请求对齐"当作减少信息丢失的手段）。
+    async fn resolve_tool_inputs(
+        &self,
+    ) -> (
+        Vec<crate::skills::store::Skill>,
+        Vec<McpServerConfig>,
+        ExperimentalSettings,
+    ) {
+        let settings = self.state.settings.read().await;
+        let skills = self.state.skill_store.read().await;
+        let mcp_store = self.state.mcp_store.read().await;
+        let experimental_settings = settings.experimental_settings.clone();
+        let mut enabled_skills = skills
+            .list()
+            .iter()
+            .filter(|s| s.enabled)
+            .cloned()
+            .collect::<Vec<_>>();
+        let enabled_mcp_servers = mcp_store
+            .list()
+            .iter()
+            .filter(|s| s.enabled)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        if !crate::agent::tools::html_render_enabled(&experimental_settings) {
+            enabled_skills
+                .retain(|skill| skill.id != crate::skills::builtin::VISUALIZE_SKILL_ID);
+        }
+        (enabled_skills, enabled_mcp_servers, experimental_settings)
+    }
+
+    /// 「该会话下一次常规请求」会下发的工具 schema（角色 Main，模式取设置里持久化的
+    /// 当前模式）：供手动压缩（无运行中任务）复用，让摘要调用与常规请求的 tools 段
+    /// 一致。走 `spawn` 同一个 `build_registry`，工具集将来怎么变都自动跟上。
+    ///
+    /// 与常规请求同样过一遍状态门控（见 `apply_state_gate`）。这里问的是**压缩前**
+    /// 那一刻的状态——摘要要解释的是压缩之前那段历史里的工具调用；首次压缩时那段
+    /// 历史里不可能有 `read_history` 调用（工具当时还没出现），所以不会因此失配。
+    ///
+    /// 模式来源：前端切换模式时经 `taskStore.setMode` 写入 `defaultAgentMode`，
+    /// 即下一次请求实际会用的模式；未知值回落 `Agent`，只影响工具清单不影响安全边界。
+    pub async fn current_tool_definitions(&self, conversation_id: &str) -> Vec<ToolDefinition> {
+        let (enabled_skills, enabled_mcp_servers, experimental_settings) =
+            self.resolve_tool_inputs().await;
+        // 与 spawn 同源：手动压缩的摘要请求要拿到和常规请求一致的 tools 段
+        // （含配置了候选清单时的 subagent model 参数）。
+        let (mode, llm_registry) = {
+            let settings = self.state.settings.read().await;
+            (
+                AgentMode::from_settings_str(&settings.default_agent_mode),
+                settings.llm_registry.clone(),
+            )
+        };
+        let plugin_manifests = self.state.plugin_registry.read().await.enabled_manifests();
+        let registry = self
+            .build_registry(
+                &AgentRole::Main,
+                &mode,
+                &enabled_skills,
+                &enabled_mcp_servers,
+                &experimental_settings,
+                &plugin_manifests,
+                &llm_registry,
+            )
+            .await;
+        let expose = self
+            .state
+            .conversation_db
+            .has_readable_history(conversation_id)
+            .unwrap_or(true);
+        apply_state_gate(build_definitions(&registry, &mode), expose)
+    }
+
+    /// 组装并启动一个 agent 实例。负责：
+    /// 1. 注册 [`AgentTask`]（主任务额外恢复最近一次 plan）；
+    /// 2. 从 spec 派生 provider / registry / messages；
+    /// 3. spawn [`run_agent_loop`] 并统一终态更新、取消清理与 panic 兜底。
+    pub async fn spawn(
+        &self,
+        app: &AppHandle,
+        spec: AgentSpec,
+    ) -> Result<AgentTaskHandle, AppError> {
+        let task_id = spec.task_id.clone();
+
+        // 组装开始前就存在的停止请求：**当场消费掉**。它落在这里的两种情形都是
+        // 「任务还没起来就被要求停止」——记下来，注册完取消表后立刻收场。消费（而
+        // 不是留给后面再取）还保证墓碑不会陪着一路组装的失败路径长期残留。
+        let cancel_requested_before_spawn = take_pending_cancel(&task_id);
+
+        // ── 1. 读取设置 ──
+        let (llm_registry, mut agent_settings) = {
+            let settings = self.state.settings.read().await;
+            (
+                settings.llm_registry.clone(),
+                settings.agent_mode_settings.clone(),
+            )
+        };
+        let (enabled_skills, enabled_mcp_servers, experimental_settings) =
+            self.resolve_tool_inputs().await;
+
+        // ── 2. 模型路由（主模型语义 = 会话级 → 全局最近使用 → 第一个） ──
+        // - 主任务：`spec.model_override` 为空时，先查本会话内存模型记忆；
+        //   无记忆 → 全局最近使用（resolve_default = last_used/首个）。
+        // - 子任务：`subagent`/`local_subagent` 工具默认传父任务 model_id
+        //   （继承会话模型）；用户配置了候选清单时，主 agent 可经工具的
+        //   model 参数传候选的 ModelEntry id 覆盖。两者皆空时走
+        //   resolve_default（最近使用/首个；会话记忆仅主任务查询）。
+        // registry 解析会兜底补读 keychain（渠道密钥），无需再手动预取。
+        let session_override = if spec.model_override.is_none() && spec.role == AgentRole::Main {
+            self.state
+                .session_models
+                .read()
+                .get(&spec.conversation_id)
+                .filter(|s| !s.is_empty())
+                .cloned()
+        } else {
+            None
+        };
+        let resolved = match spec
+            .model_override
+            .as_deref()
+            .or(session_override.as_deref())
+        {
+            Some(id_or_name) => llm_registry.resolve_override(id_or_name)?,
+            None => llm_registry.resolve_default()?,
+        };
+        // 模型级上下文窗口（>0）优先于全局设置；0 表示「用全局」。
+        if resolved.context_window > 0 {
+            agent_settings.context_window = resolved.context_window;
+        }
+
+        // ── 2.5 会话级思考强度（`reasoning_effort`，**仅主任务**）──
+        // 档位字符串（low/medium/high/max 等）由用户在会话内选择，按
+        // 「会话 × 模型」双维存于 `session_efforts`（内存）；任务启动时取
+        // **该会话当前生效模型**的记忆（实时生效语义：正在运行的任务不受
+        // 后续切换影响，只影响之后发起/继续的任务；切到别的模型用那个
+        // 模型自己的记忆，切回原模型原档位仍在）。
+        // - 主任务：查 (会话, 生效模型) 记忆；子任务**不继承**（调研子
+        //   agent 只跟随自身模型默认，语义干净）。档位须在模型声明内才注入。
+        let mut llm_config = resolved.config.clone();
+        if spec.role == AgentRole::Main {
+            let effort = self
+                .state
+                .session_efforts
+                .read()
+                .get(&spec.conversation_id)
+                .and_then(|m| m.get(&resolved.model_id))
+                .filter(|s| !s.is_empty())
+                .cloned();
+            if let Some(e) = effort {
+                llm_config = apply_reasoning_effort(
+                    llm_config,
+                    &resolved.display_label,
+                    &resolved.reasoning_efforts,
+                    &e,
+                );
+                if let Some(v) = llm_config
+                    .extra_body
+                    .as_ref()
+                    .and_then(|b| b.get("reasoning_effort"))
+                    .and_then(|v| v.as_str())
+                {
+                    log::info!(
+                        "Agent task {} 会话 {} 模型 {} 思考强度: {}",
+                        spec.task_id,
+                        spec.conversation_id,
+                        resolved.model_id,
+                        v
+                    );
+                }
+            }
+        }
+        let llm_manager = LlmManager::new(llm_config)?;
+        log::info!(
+            "Agent task {} 使用模型: {} ({:?})",
+            spec.task_id,
+            resolved.display_label,
+            spec.mode
+        );
+
+        // ── 3. 命令审核模型：显式审核槽位 > 本任务主模型（会话/最近使用）。
+        //    旧实现 `resolve_slot("")` 会把空槽位解析成"全局默认模型"——与
+        //    主任务模型可能不同（会话内选了 A、审核却走全局 B）。现在空槽位
+        //    直接回落主模型 manager（tool_dispatcher 无独立配置时本就复用
+        //    主模型），只有显式选了审核模型才切换。
+        //    失败不炸任务：审核是辅助能力，回落主模型即可（与旧行为一致）。
+        let approval_cfg = if agent_settings.enable_model_command_approval
+            && !llm_registry.slots.model_approval_model_id.is_empty()
+        {
+            match llm_registry.resolve_model(&llm_registry.slots.model_approval_model_id) {
+                Ok(mut r) => {
+                    // 审批调用不带自由参数（extra_body 针对主对话模型调参）。
+                    r.config.extra_body = None;
+                    Some(r.config)
+                }
+                Err(e) => {
+                    log::warn!("命令审核专用模型解析失败，回落主模型: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // ── 3.5 Jev 审批引擎配置：只在「审批开启 + 引擎 = Jev」时读密钥链。
+        //    读不到 Key **不炸任务**，也不静默回退成会话模型——`None` 交给
+        //    `ToolDispatcher::build_jev_approver`，它照常构造审批者，
+        //    每次 bash 都返回一句明确的「去设置填 Key」错误。静默回退会让用户
+        //    以为自己受 Jev 保护，其实没有，比直接失败糟。
+        //    重试/超时参数取全局 `NetPolicy` **本身**（不是抄一份字段），
+        //    与 `build_resolved` 灌进 `LlmConfig` 的是同一份数据。
+        let jev_cfg = if agent_settings.enable_model_command_approval
+            && agent_settings.command_approval_engine == CommandApprovalEngine::Jev
+        {
+            match keychain::get_jev_api_key() {
+                Ok(Some(key)) if !key.trim().is_empty() => Some(
+                    JevConfig::new(
+                        key,
+                        agent_settings.jev_model_id.clone(),
+                        llm_registry.net_policy.clone(),
+                    )
+                    // 空 = 保持官方地址（`with_base_url` 的语义是「空即不动」，
+                    // 不是「空即清空」）。
+                    .with_base_url(&agent_settings.jev_base_url),
+                ),
+                Ok(_) => {
+                    log::warn!(
+                        "命令审批引擎为 Jev，但密钥链里没有 TypeSafe API Key——审批调用会明确报错"
+                    );
+                    None
+                }
+                Err(e) => {
+                    log::warn!("读取 TypeSafe API Key 失败: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        // 插件注册表的读锁只覆盖"取快照"这一小段：下面组装工具集要等 MCP 服务器，
+        // 那是网络往返，不能拿着锁等（异步读写锁里，排队的写者会把后来的读者也
+        // 一并挡住，插件安装 / 启停会跟着卡）。
+        let (plugin_manifests, plugin_sections) = {
+            let guard = self.state.plugin_registry.read().await;
+            let sections = collect_plugin_sections(
+                &guard,
+                &self.state.ssh_manager,
+                &spec.session_id,
+                &spec.mode,
+            )
+            .await;
+            (guard.enabled_manifests(), sections)
+        };
+        let registry = self
+            .build_registry(
+                &spec.role,
+                &spec.mode,
+                &enabled_skills,
+                &enabled_mcp_servers,
+                &experimental_settings,
+                &plugin_manifests,
+                &llm_registry,
+            )
+            .await;
+        let tools = build_definitions(&registry, &spec.mode);
+
+        // ── 4.5 多机操控：主任务注入机器清单段（子任务不注入——它们的
+        //     目标机器由父任务经 subagent(host=...) 显式指定，系统提示已含约束）──
+        let mut prompt_extra = spec.prompt_extra.clone();
+        if spec.role == AgentRole::Main {
+            if let Some(section) =
+                crate::multi_host::build_prompt_section(&self.state, &spec.session_id).await
+            {
+                prompt_extra.push(section);
+            }
+        }
+
+        // ── 5. 组装 messages（含角色约束段统一拼装） ──
+        let messages = build_agent_messages(
+            &TemplateManager,
+            &spec.session_id,
+            &tools,
+            &spec.history,
+            &spec.prompt,
+            &agent_settings.system_prompt,
+            &plugin_sections,
+            matches!(spec.mode, AgentMode::Plan),
+            audience_of(&spec.role),
+            &prompt_extra,
+            // 手机端的 Browser 会在搜索时降级成 Html，同样属于噪音档，所以只认「不是 Api」。
+            experimental_settings.web_search_mode != crate::config::settings::WebSearchMode::Api,
+        )?;
+
+        // 子任务：冻结"父会话回读窗口"的上界 —— 派发这一刻父会话最后一条已落库
+        // 消息（主 agent 此刻的上下文末尾）。子代理 `read_history(scope=parent)`
+        // 靠它把可读范围钉死在"派发我之前"。记不下来就留 None：工具会明确报错，
+        // 而不是把窗口放开成"不限上界"。
+        let parent_history_upto: Option<String> = spec
+            .role
+            .parent_task_id()
+            .and_then(|pid| {
+                let tasks = self.state.agent_tasks.read();
+                tasks.get(pid).map(|t| t.conversation_id.clone())
+            })
+            .and_then(|parent_conversation_id| {
+                self.state
+                    .conversation_db
+                    .history_tail_anchor(&parent_conversation_id)
+                    .ok()
+                    .flatten()
+            });
+
+        // 所有可能失败的组装步骤完成后再提交运行态。spawn 返回 Err 时，
+        // 不会留下前端拿不到 task_id、后端却永久视为 running 的幽灵任务。
+        self.state.agent_tasks.write().insert(
+            task_id.clone(),
+            AgentTask {
+                id: task_id.clone(),
+                session_id: spec.session_id.clone(),
+                conversation_id: spec.conversation_id.clone(),
+                prompt: spec.prompt.clone(),
+                mode: spec.mode.clone(),
+                status: AgentStatus::Planning,
+                has_plan: false,
+                created_at: chrono::Utc::now(),
+                parent_task_id: spec.role.parent_task_id().map(String::from),
+                // 本任务实际使用的模型 id：子 agent 派发时据此继承父模型
+                model_id: Some(resolved.model_id.clone()),
+                // 回合锚点由 agent loop 开头 `begin_turn` 回填（那里才落库
+                // user 消息）；此处先置空。
+                turn_anchor_id: None,
+                parent_history_upto,
+            },
+        );
+        if spec.role == AgentRole::Main {
+            self.restore_latest_plan(&task_id, &spec.conversation_id);
+        }
+
+        // ── 6. spawn + 生命周期 ──
+        // 取消通道注册进统一表。guard 必须**活到任务结束**，所以它随下面
+        // `tokio::spawn` 的 future 一起被捕获：在外面建、在外面 drop 的话，表里
+        // 唯一的 sender 立刻消失，而 agent loop 把「通道关闭」也当成取消
+        // （`llm/manager.rs` 的 `select!` 里 `rx.changed()` 的 Err 同样命中取消
+        // 分支）—— 任务会在开跑前把自己取消掉。
+        let cancel_registration = self.state.task_cancel.register(&task_id);
+
+        // 组装期间用户点过停止（见 `request_cancel`）？认领这枚墓碑：任务收成
+        // `Cancelled` 并置位取消信号，agent loop 第一轮开头就按取消退出——不发
+        // 请求、不执行任何工具，收尾走 `TurnState::Cancelled`。
+        //
+        // 位置很讲究：必须在 `register` **之后**（信号要发给在册的那条通道，
+        // 注册前 send 会因为表里没有接收端而丢），又不能靠把 `agent_tasks.insert`
+        // 提前来实现（提交放最后是为了不留「前端拿不到 task_id、后端却永久
+        // running」的幽灵任务，见上面的注释）。
+        //
+        // 两次取用分开写（不用 `||` 短路）：组装**期间**记下的那枚墓碑也必须
+        // 被消费掉，否则它会留在表里，之后被同一 id 的另一次启动误领。
+        let cancel_requested_during_spawn = take_pending_cancel(&task_id);
+        if cancel_requested_before_spawn || cancel_requested_during_spawn {
+            log::info!(
+                "Agent task {} 在组装期间已被要求停止，注册取消表后立即收场",
+                task_id
+            );
+            // 任务记录此刻已提交 → 走「在册」那条路（置取消态 + 发信号）。
+            request_cancel(&self.state, &task_id);
+        }
+
+        // 出生即孤儿：组装期间这个 SSH 会话已经断开了。
+        //
+        // 断连观察者按会话查 `agent_tasks`（见 `stop_tasks_for_disconnected_session`），
+        // 而任务要到最后才登记进去 —— 组装窗口里生出来的任务于是会带着一个死会话
+        // 开跑：每一轮工具都注定失败，只有 token 在烧。这里与「组装期间用户点了
+        // 停止」同样处理：收取消态 + 发信号，loop 第一轮开头就退出、收尾走
+        // `TurnState::Cancelled`。
+        //
+        // 退出条件是「会话不在册」而不是「刚断过」：会话 id 只会因真正断开而从
+        // `connections` 消失（重连复用同一 id 会重新登记），所以这里不会误伤
+        // 重连后的新任务。
+        //
+        // 本机子 agent 不适用：它的会话是哨兵 `"local"`，压根没有 SSH 会话
+        // （`is_connected` 对它恒为 false，不特判会把每个本机子 agent 当场收掉）。
+        if !spec.role.is_local_side()
+            && !self.state.ssh_manager.is_connected(&spec.session_id).await
+        {
+            log::info!(
+                "Agent task {} 的 SSH 会话 {} 已不存在（组装期间断开），开局即按停止收场",
+                task_id,
+                spec.session_id
+            );
+            request_cancel(&self.state, &task_id);
+        }
+
+        let loop_ctx = LoopContext {
+            ssh: self.state.ssh_manager.clone(),
+            session_id: spec.session_id.clone(),
+            app: app.clone(),
+            state: self.state.clone(),
+            registry,
+            conversation_id: spec.conversation_id.clone(),
+            conv_db: self.state.conversation_db.clone(),
+            cancel_rx: cancel_registration.receiver(),
+            config_dir: self.state.config_dir.clone(),
+            is_subtask: spec.role.is_subtask(),
+            // 本机子 agent：目标机器是用户自己这台电脑 —— agent loop 据此把
+            // `ToolContext` 挂上 `AppState.local_command_exec` 并置 `local_side`。
+            local_side: spec.role.is_local_side(),
+            prompt_origin: spec.prompt_origin,
+            user_input: spec.user_input,
+        };
+
+        let state_cleanup = self.state.clone();
+        let task_id_owned = task_id.clone();
+        let mode_owned = spec.mode.clone();
+        let approval_mode_owned = spec.approval_mode.clone();
+        let join = tokio::spawn(async move {
+            // 持有注册凭据 = 任务尚未结束；Drop 即从取消表注销（原先由
+            // `finalize_task` 手写 `cancel_senders.remove`，现在由类型保证）。
+            let _cancel_registration = cancel_registration;
+            // catch_unwind：无论 run_agent_loop 内部是否 panic，终态更新与
+            // 取消清理都保证执行（此前主任务丢弃 JoinHandle，panic 时泄漏）。
+            let result = std::panic::AssertUnwindSafe(run_agent_loop(
+                task_id_owned.clone(),
+                llm_manager,
+                messages,
+                tools,
+                mode_owned,
+                approval_mode_owned,
+                agent_settings,
+                approval_cfg,
+                jev_cfg,
+                loop_ctx,
+            ))
+            .catch_unwind()
+            .await;
+            let result = match result {
+                Ok(r) => r,
+                Err(e) => {
+                    log::error!("agent task {} panicked: {:?}", task_id_owned, e);
+                    None
+                }
+            };
+            if let Some(turn_state) = finalize_task(&state_cleanup, &task_id_owned, &result) {
+                log::info!(
+                    "Agent task {} 收尾状态: {}",
+                    task_id_owned,
+                    turn_state.as_str()
+                );
+            }
+            prune_terminal_tasks(&state_cleanup, 200);
+            result
+        });
+
+        log::info!("Agent task started: {} ({:?})", task_id, spec.mode);
+        Ok(AgentTaskHandle { task_id, join })
+    }
+
+    /// 按模式派生工具集（含插件/MCP 注册）。
+    ///
+    /// 「谁能拿到哪些内置工具」的收敛发生在 [`build_role_registry`]（角色 × 模式 +
+    /// 本机收窄）；这里只负责**主任务的生态**：插件工具与 MCP 工具。
+    async fn build_registry(
+        &self,
+        role: &AgentRole,
+        mode: &AgentMode,
+        enabled_skills: &[crate::skills::store::Skill],
+        enabled_mcp_servers: &[McpServerConfig],
+        experimental_settings: &ExperimentalSettings,
+        plugin_manifests: &[PluginManifest],
+        llm_registry: &LlmRegistry,
+    ) -> Arc<ToolRegistry> {
+        let mut registry = build_role_registry(
+            role,
+            mode,
+            enabled_skills,
+            experimental_settings,
+            &resolve_subagent_candidates(llm_registry),
+        );
+        // 子 agent 只携带核心读写工具，不加载插件生态，也不去刷新 MCP
+        // server（省一次无谓连接）—— 与只读 Plan 子 agent 一致，提示词里
+        // 的工具列表不会说谎。主任务（role=Main）插件/MCP 全套保留。
+        //
+        // 本机子 agent 是 `is_subtask()`：这条门控天然把它挡在外面（它拿不到插件
+        // 与 MCP 工具，也就没有任何绕过本机工具集的路径）。
+        //
+        // 「子 agent 没有 subagent / plan 三件套」这一条不在本处删减：
+        // 它由工具声明表的 `ToolRoles::MainOnly` 表达，见
+        // `tools/mod.rs` 的 `BUILTIN_TOOLS_COMMON`。
+        if !role.is_subtask() {
+            for m in plugin_manifests {
+                register_plugin_tools(&mut registry, &m.id, &m.agent_tools);
+            }
+            // MCP 工具：用上次发现的缓存，不为慢 / 连不上的服务器拖住任务启动
+            // （详见 `McpManager::tools_for_startup`）。各服务器并行问，互不拖累。
+            let mut set = tokio::task::JoinSet::new();
+            for server in enabled_mcp_servers {
+                let mgr = self.state.mcp_manager.clone();
+                let server = server.clone();
+                set.spawn(async move {
+                    let tools = mgr.tools_for_startup(&server, MCP_STARTUP_WAIT).await;
+                    (server, tools)
+                });
+            }
+            while let Some(result) = set.join_next().await {
+                match result {
+                    Ok((server, StartupTools::Unavailable(reason))) => {
+                        log::warn!("MCP [{}] 本次任务未带上其工具: {}", server.name, reason)
+                    }
+                    Ok((server, found)) => {
+                        register_mcp_tools(&mut registry, &server, found.into_tools())
+                    }
+                    Err(join_err) => log::warn!("MCP 刷新任务 panic: {}", join_err),
+                }
+            }
+        }
+        Arc::new(registry)
+    }
+
+    /// 主任务：从 SQLite 恢复该 conversation 最近一条 plan 挂到新 task。
+    fn restore_latest_plan(&self, task_id: &str, conversation_id: &str) {
+        if self.state.plans.read().get(task_id).is_some() {
+            return;
+        }
+        match self
+            .state
+            .conversation_db
+            .load_latest_plan_by_conversation(conversation_id)
+        {
+            Ok(Some(plan_json)) => match serde_json::from_str::<AgentTaskPlan>(&plan_json) {
+                Ok(mut plan) => {
+                    plan.task_id = task_id.to_string();
+                    self.state.plans.write().insert(task_id.to_string(), plan);
+                    if let Some(task) = self.state.agent_tasks.write().get_mut(task_id) {
+                        task.has_plan = true;
+                    }
+                    log::info!(
+                        "Restored plan for new task {} from conversation {}",
+                        task_id,
+                        conversation_id
+                    );
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Failed to deserialize plan for conversation {}: {}",
+                        conversation_id,
+                        e
+                    );
+                }
+            },
+            Ok(None) => {}
+            Err(e) => {
+                log::warn!(
+                    "Failed to load latest plan for conversation {}: {}",
+                    conversation_id,
+                    e
+                );
+            }
+        }
+    }
+}
+
+// ── 私有组装辅助 ──
+
+/// 按角色构建 Plan 模式工具集。
+///
+/// `AgentRole` 是 manager 的概念，`ToolAudience` 是工具层的概念；这里做一次映射，
+/// 免得 `tools` 反向依赖 manager（子 agent 的工具收敛规则本身写在声明表的
+/// `ToolRoles` 里，不在这里删减）。
+///
+/// 抽成自由函数便于单测，避免为 `build_registry` 私有方法构造整个 `AppState`。
+fn build_plan_registry(
+    role: &AgentRole,
+    enabled_skills: &[crate::skills::store::Skill],
+    experimental_settings: &ExperimentalSettings,
+) -> ToolRegistry {
+    ToolRegistry::build_for_plan_mode(audience_of(role), enabled_skills, experimental_settings)
+}
+
+/// `AgentRole` → 工具层可见性角色。
+///
+/// 穷尽 `match` 是刻意的：新增角色时这里必须显式回答「它的工具集面向谁」，
+/// 不会被 `_ =>` 悄悄继承成 Main。
+fn audience_of(role: &AgentRole) -> crate::agent::tools::ToolAudience {
+    match role {
+        AgentRole::Main => crate::agent::tools::ToolAudience::Main,
+        AgentRole::Sub { .. } => crate::agent::tools::ToolAudience::Sub,
+        AgentRole::LocalSub { .. } => crate::agent::tools::ToolAudience::LocalSub,
+    }
+}
+
+/// 按「角色 × 模式」派生 registry（含本机子 agent 的收窄）。
+///
+/// 抽成自由函数便于单测：`build_registry` 还要注册插件 / MCP 工具，那种依赖整个
+/// `AppState` 与真实的 PluginRegistry，测不了；而「本机子 agent 的工具集必须没有
+/// 远端语义工具」正是最需要钉住的那条。
+///
+/// 收窄只对本机角色发生：`ToolRegistry::remove` 按名字剔（清单与理由见
+/// [`crate::agent::tools::LOCAL_SUB_EXCLUDED_TOOLS`]）——`roles` 这一维表达不了
+/// 「`Both` 里哪些是远端语义」，`side` 声明也没法在这里按角色过滤。
+///
+/// **Plan 模式同样收窄**：Plan 的 `build_for_plan_mode` 会放进 `read_file` /
+/// `list_directory` / `search_files` / `system_info` 这些远端只读工具，对本机子
+/// agent 全是错的机器。
+fn build_role_registry(
+    role: &AgentRole,
+    mode: &AgentMode,
+    enabled_skills: &[crate::skills::store::Skill],
+    experimental_settings: &ExperimentalSettings,
+    subagent_choices: &[SubagentModelCandidate],
+) -> ToolRegistry {
+    let mut registry = match mode {
+        AgentMode::Plan => build_plan_registry(role, enabled_skills, experimental_settings),
+        AgentMode::Agent | AgentMode::Auto => ToolRegistry::build_mut_for_mode(
+            audience_of(role),
+            enabled_skills,
+            experimental_settings,
+        ),
+    };
+    if role.is_local_side() {
+        for name in crate::agent::tools::LOCAL_SUB_EXCLUDED_TOOLS {
+            registry.remove(name);
+        }
+    }
+    inject_subagent_model_choices(&mut registry, role, subagent_choices);
+    registry
+}
+
+/// 把用户配置的子agent 候选模型注入 `subagent` / `local_subagent` 工具实例。
+///
+/// 仅主任务 registry 做注入：这两个工具都是 `ToolRoles::MainOnly`，角色收敛已在
+/// 上面完成；用 `get()` 探测而不是按名字盲插，声明表将来怎么变都不会注错对象。
+/// `register` 同名后者胜，直接覆盖声明表建出的无候选实例。候选为空时不注入，
+/// 工具定义与未配置前逐字节一致。
+fn inject_subagent_model_choices(
+    registry: &mut ToolRegistry,
+    role: &AgentRole,
+    choices: &[SubagentModelCandidate],
+) {
+    if *role != AgentRole::Main || choices.is_empty() {
+        return;
+    }
+    // 探测不中且候选非空 = 候选功能静默失效（典型：声明表移除/改名了工具），
+    // 必须留痕——静默失效会让用户以为配置了却不生效是别处的问题。
+    if registry.get("subagent").is_some() {
+        registry.register(Arc::new(subagent::SubagentTool::with_choices(
+            choices.to_vec(),
+        )));
+    } else {
+        log::warn!("子agent 候选清单已配置，但主任务工具集没有 subagent 工具，候选未生效");
+    }
+    #[cfg(desktop)]
+    if registry.get("local_subagent").is_some() {
+        registry.register(Arc::new(
+            crate::agent::tools::local_subagent::LocalSubagentTool::with_choices(choices.to_vec()),
+        ));
+    } else {
+        log::warn!("子agent 候选清单已配置，但主任务工具集没有 local_subagent 工具，候选未生效");
+    }
+}
+
+fn build_definitions(registry: &Arc<ToolRegistry>, mode: &AgentMode) -> Vec<ToolDefinition> {
+    match mode {
+        AgentMode::Plan | AgentMode::Agent | AgentMode::Auto => registry
+            .definitions()
+            .into_iter()
+            .map(|d| ToolDefinition {
+                name: d.name,
+                description: d.description,
+                parameters: d.parameters,
+            })
+            .collect(),
+    }
+}
+
+/// 按会话状态过滤「该下发的工具清单」：`has_readable_history` 为假时去掉
+/// [`crate::agent::tools::STATE_GATED_TOOLS`] 里的工具。
+///
+/// 为什么是过滤而不是在注册表里不注册：注册表在任务启动时全量构建、整任务共用，
+/// 而"这个会话有没有读不到的东西"会随压缩**在任务中途翻转**。所以
+/// - `spawn` 交给循环的必须是**未过滤**的清单（循环每轮自己再过滤一次，
+///   否则第 0 轮就少了那个工具、之后再也加不回来——过滤只能删不能加）；
+/// - 循环在**每次发请求前**问一次状态；压缩这一步本身用的仍是压缩前那一刻的
+///   清单（摘要要解释的是压缩**之前**那段历史里的工具调用）。
+///
+/// "只增不减"由判据的单调性保证（见 `ConversationDb::has_readable_history`）。
+/// 判据算不出来时调用方按"宁可早给"传 `true`：少给一次工具会让模型失去一个它
+/// 需要的能力，比多付一份说明严重得多。
+pub(crate) fn apply_state_gate(
+    mut defs: Vec<ToolDefinition>,
+    has_readable_history: bool,
+) -> Vec<ToolDefinition> {
+    if has_readable_history {
+        return defs;
+    }
+    defs.retain(|d| !crate::agent::tools::STATE_GATED_TOOLS.contains(&d.name.as_str()));
+    defs
+}
+
+/// 某一轮请求该下发的工具清单：在未门控的 `base` 上按会话当前状态过一遍门控。
+///
+/// 这是循环每轮实际调用的那一步，单独抽出来是为了能直接用真实的会话库测它——
+/// 判据、过滤、以及"子代理恒有"这三件事的**组合**只有在同一个函数里才可测。
+///
+/// `is_subtask` 恒为 `true`：子代理读主 agent 派发时刻的上下文，跟父会话压不压缩
+/// 无关，这个能力对它有用于第一轮。
+pub(crate) fn tools_for_round(
+    base: &[ToolDefinition],
+    is_subtask: bool,
+    conv_db: &crate::agent::conversation::ConversationDb,
+    conversation_id: &str,
+) -> Vec<ToolDefinition> {
+    let expose = is_subtask
+        || conv_db
+            .has_readable_history(conversation_id)
+            .unwrap_or(true);
+    apply_state_gate(base.to_vec(), expose)
+}
+
+/// 把会话级思考强度注入 LLM 配置（纯函数，便于单测）。
+///
+/// 语义：
+/// - `session_effort` 须在模型声明的 `declared` 内才注入；否则**原样返回**
+///   config（不注入、不改动已有 extra_body），只记 warn。
+/// - 注入方式：把 `reasoning_effort` 键写入 `config.extra_body` 顶层对象
+///   （openai.rs 构建请求体时把 extra_body 合并进请求体顶层，等效顶层字段）。
+///   若模型已有非对象 extra_body（异常数据）则保留原样返回，不污染。
+pub(crate) fn apply_reasoning_effort(
+    config: LlmConfig,
+    model_label: &str,
+    declared: &[String],
+    session_effort: &str,
+) -> LlmConfig {
+    let effort = session_effort.trim();
+    if effort.is_empty() {
+        return config;
+    }
+    if !declared.iter().any(|x| x == effort) {
+        log::warn!(
+            "会话思考强度档位 \"{}\" 不在模型 \"{}\" 声明内（{:?}），已忽略",
+            effort,
+            model_label,
+            declared
+        );
+        return config;
+    }
+    let Some(mut extra) = config.extra_body.clone() else {
+        let mut obj = serde_json::Map::new();
+        obj.insert(
+            "reasoning_effort".to_string(),
+            serde_json::Value::String(effort.to_string()),
+        );
+        let mut next = config;
+        next.extra_body = Some(serde_json::Value::Object(obj));
+        return next;
+    };
+    match extra.as_object_mut() {
+        Some(obj) => {
+            obj.insert(
+                "reasoning_effort".to_string(),
+                serde_json::Value::String(effort.to_string()),
+            );
+            let mut next = config;
+            next.extra_body = Some(extra);
+            next
+        }
+        None => {
+            log::warn!(
+                "模型 {} 的 extra_body 非 JSON 对象，无法注入 reasoning_effort={}",
+                model_label,
+                effort
+            );
+            config
+        }
+    }
+}
+
+fn apply_section_context_variables(
+    s: &str,
+    info: Option<&SessionInfo>,
+    session_id: &str,
+) -> String {
+    match info {
+        Some(i) => apply_to_string(s, &SessionContext::from_session(i, session_id)),
+        None => {
+            log::warn!("无法获取会话上下文，systemPromptSection 中的上下文变量替换为空字符串");
+            apply_to_string(s, &SessionContext::empty(session_id))
+        }
+    }
+}
+
+async fn collect_plugin_sections(
+    registry: &PluginRegistry,
+    ssh: &crate::ssh::connection::SshManager,
+    session_id: &str,
+    mode: &AgentMode,
+) -> Vec<String> {
+    if matches!(mode, AgentMode::Plan) {
+        return Vec::new();
+    }
+    let session_info = ssh.get_session_info(session_id).await;
+    let mut sections = Vec::new();
+    for entry in registry.enabled_manifests() {
+        if entry.system_prompt_section.is_none() {
+            continue;
+        }
+        let content = match registry.section_for(&entry.id) {
+            Some(c) => c.to_string(),
+            None => continue,
+        };
+        let substituted =
+            apply_section_context_variables(&content, session_info.as_ref(), session_id);
+        let char_count = substituted.chars().count();
+        let truncated: String = if char_count > PLUGIN_SECTION_MAX_CHARS {
+            log::warn!(
+                "插件 {} systemPromptSection 超过 {} 字符（{}），已截断",
+                entry.id,
+                PLUGIN_SECTION_MAX_CHARS,
+                char_count
+            );
+            substituted.chars().take(PLUGIN_SECTION_MAX_CHARS).collect()
+        } else {
+            substituted
+        };
+        sections.push(truncated);
+    }
+    sections
+}
+
+fn build_agent_messages(
+    template_manager: &TemplateManager,
+    session_id: &str,
+    tools: &[ToolDefinition],
+    history: &[LlmMessage],
+    prompt: &str,
+    agent_system_prompt: &str,
+    plugin_sections: &[String],
+    plan_mode: bool,
+    audience: crate::agent::tools::ToolAudience,
+    extra_sections: &[String],
+    web_search_noisy: bool,
+) -> Result<Vec<LlmMessage>, AppError> {
+    // 提示词段由「已注册工具的声明」推导，不按工具名 hardcode：
+    // 声明表里给工具写了 `prompt_section`，它出现在本次注册里就会带上对应段落。
+    let mut tool_sections: std::collections::BTreeSet<crate::agent::tools::PromptSection> = tools
+        .iter()
+        .filter_map(|t| crate::agent::tools::prompt_section_of(&t.name))
+        .collect();
+    if web_search_noisy {
+        tool_sections.insert(crate::agent::tools::PromptSection::WebSearchNoisy);
+    }
+    // skills 是动态注册的工具（`skill_<id>`），不在声明表里，只能按前缀判断。
+    let has_skills = tools.iter().any(|t| {
+        t.name
+            .starts_with(crate::agent::tools::skill::SKILL_TOOL_PREFIX)
+    });
+    let system_prompt = build_system_prompt(
+        template_manager,
+        session_id,
+        has_skills,
+        &tool_sections,
+        agent_system_prompt,
+        plugin_sections,
+        plan_mode,
+        audience,
+        extra_sections,
+    )?;
+    let mut messages: Vec<LlmMessage> = Vec::with_capacity(history.len() + 2);
+    messages.push(LlmMessage::system(system_prompt));
+    for msg in history {
+        if msg.role == LlmRole::System {
+            continue;
+        }
+        messages.push(msg.clone());
+    }
+    if !messages
+        .last()
+        .map_or(false, |m| m.role == LlmRole::User && m.content == prompt)
+    {
+        messages.push(LlmMessage::user(prompt.to_string()));
+    }
+    Ok(messages)
+}
+
+/// 统一的任务收尾：更新终态 + **记录回合收尾状态** + 清理作业结算通道 +
+/// 级联清理子资源。
+/// （取消表的注销不在这里：由 spawned future 持有的 `Registration` 在 Drop 时
+/// 完成，见 `spawn` 里的注释。）
+/// 停止路径已置 Cancelled 则保留；自然结束=Completed，其余（LLM 失败 /
+/// 达最大轮数 / panic）=Failed。
+///
+/// 返回本回合的收尾状态（`TurnState`）——它是「这一轮到底怎么停的」的唯一
+/// 记录点：写在回合锚点行（agent loop 开头 `begin_turn` 标成 running 的那行）
+/// 上，回合折叠据此决定要不要把过程收起来（只有 `Completed` 才收）。
+/// 任务记录已被剪掉 / 锚点缺失 / 写库失败都不影响任务终态与界面：返回 None。
+fn finalize_task(state: &AppState, task_id: &str, result: &Option<String>) -> Option<TurnState> {
+    // 任务记录已被剪枝（只可能发生在本函数之外的清理竞态）时也要走完下面的
+    // 通道清理与级联回收 —— 所以这里只把「写库要用的三样东西」取出来，
+    // 不用 `?` 提前返回。
+    let resolved = {
+        let mut tasks = state.agent_tasks.write();
+        match tasks.get_mut(task_id) {
+            Some(task) => {
+                // 吸收规则在 `AgentTask::transition_to` 里（Cancelled 不接受后续写入）。
+                task.transition_to(if result.is_some() {
+                    AgentStatus::Completed
+                } else {
+                    AgentStatus::Failed
+                });
+                // 写入之后**按真实状态**定档：停止命令先置 Cancelled，上面那次
+                // 写入可能被吸收掉，问返回值会把「用户停止」误判成完成/失败。
+                Some((
+                    TurnState::from_status(&task.status),
+                    task.conversation_id.clone(),
+                    task.turn_anchor_id.clone(),
+                ))
+            }
+            None => None,
+        }
+    };
+
+    let turn_state = match resolved {
+        Some((turn, conversation_id, anchor_id)) => {
+            match anchor_id {
+                Some(anchor_id) => {
+                    ConversationPersister::new(state.conversation_db.clone(), conversation_id)
+                        .end_turn(&anchor_id, turn)
+                }
+                None => log::debug!(
+                    "任务 {} 没有回合锚点（未落库 user 消息），跳过收尾状态写入",
+                    task_id
+                ),
+            }
+            Some(turn)
+        }
+        None => None,
+    };
+    // 多机操控：任务终态关闭该任务自动拉起的全部目标会话（只在任务记账
+    // 集合内，用户手动打开的会话绝不受影响）。异步 fire-and-forget——
+    // 清理不阻塞任务收尾，且 spawn 里 catch_unwind 之外安全。
+    //
+    // **还有作业在跑的会话先留着**（对齐「作业活得比回合久」）：关掉它会连坐
+    // 杀掉作业（断连观察者会取消该会话上所有执行，见 command_exec 的断连
+    // 级联），而那些作业本来就该跑到结算、再由唤醒把结果交回模型。留下的
+    // 会话仍在记账表里，由末条作业结算时的回收钩子取走
+    // （`command_exec::set_task_drain_hook`，lib.rs 接线）。
+    let mh_state = state.clone();
+    let mh_task = task_id.to_string();
+    tokio::spawn(async move {
+        let busy_sessions: std::collections::HashSet<String> = mh_state
+            .command_exec
+            .running_jobs_for_task(&mh_task)
+            .await
+            .into_iter()
+            .map(|job| job.session_id)
+            .collect();
+        crate::multi_host::cleanup_task_targets_except(&mh_state, &mh_task, &busy_sessions).await;
+        // Agent 传输级联取消：任务终态取消其名下仍进行的传输（只取消
+        // 传输本身；进行中的传输收到 cancel 后自行清理 .part/sidecar）。
+        crate::agent::transfer::cancel_task_transfers(&mh_state, &mh_task).await;
+    });
+    turn_state
+}
+
+fn prune_terminal_tasks(state: &AppState, max_terminal: usize) {
+    let mut tasks = state.agent_tasks.write();
+    let mut terminal: Vec<(String, chrono::DateTime<chrono::Utc>)> = tasks
+        .iter()
+        .filter(|(_, task)| task.status.is_terminal())
+        .map(|(id, task)| (id.clone(), task.created_at))
+        .collect();
+    if terminal.len() <= max_terminal {
+        return;
+    }
+    terminal.sort_by_key(|(_, created_at)| *created_at);
+    let remove_count = terminal.len() - max_terminal;
+    let remove_ids: Vec<String> = terminal
+        .into_iter()
+        .take(remove_count)
+        .map(|(task_id, _)| task_id)
+        .collect();
+    for task_id in &remove_ids {
+        tasks.remove(task_id);
+    }
+    drop(tasks);
+    let mut plans = state.plans.write();
+    for task_id in &remove_ids {
+        plans.remove(task_id);
+    }
+    drop(plans);
+    // 子资源记账的收尾标记与 owner 同生命周期：任务记录都剪掉了，标记留着只会
+    // 无限增长（而且 task_id 一旦被复用，旧标记会让新任务注册不上子资源）。
+    // 本函数是同步的，而记账表用的是 tokio 锁 —— 照 finalize_task 的做法
+    // fire-and-forget（剪枝不因这次清理而阻塞）。
+    //
+    // **顺序要紧：先清理、后遗忘**。`finalize_task` 的清理是另一次 fire-and-forget
+    // spawn，tokio 不保证两次 spawn 的先后；如果先遗忘，`forget_owner` 会把还没被
+    // 取走的子资源连同收尾标记一起删掉，随后晚到的 `take_all` 拿到空集 ——
+    // 自动拉起的会话再也不会被断开、在册传输再也不会被取消（实测复现率约 1/300）。
+    // 这里同一个 async 块内顺序 await 是有保证的，而对已清理过的 id 是幂等空操作。
+    let prune_state = state.clone();
+    tokio::spawn(async move {
+        for task_id in &remove_ids {
+            crate::multi_host::cleanup_task_targets(&prune_state, task_id).await;
+            crate::agent::transfer::cancel_task_transfers(&prune_state, task_id).await;
+            // 走到这里表项应当已空；非空 = 清理没跑到（或没取到），
+            // 那些子资源此刻无人回收 —— 不许静默。
+            let leftover_targets = prune_state.multi_host_targets.forget_owner(task_id).await;
+            let leftover_transfers = prune_state
+                .agent_transfer_by_task
+                .forget_owner(task_id)
+                .await;
+            if !leftover_targets.is_empty() || !leftover_transfers.is_empty() {
+                log::warn!(
+                    "任务 {} 记录剪枝时仍残留子资源（多机会话 {:?}／传输 {:?}）—— 清理未完成，这些资源已无人回收",
+                    task_id,
+                    leftover_targets,
+                    leftover_transfers
+                );
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::settings::ExperimentalSettings;
+
+    fn exp() -> ExperimentalSettings {
+        ExperimentalSettings::default()
+    }
+
+    fn make_task(id: &str) -> AgentTask {
+        AgentTask {
+            id: id.to_string(),
+            session_id: "s1".to_string(),
+            conversation_id: "c1".to_string(),
+            prompt: "p".to_string(),
+            mode: AgentMode::Agent,
+            status: AgentStatus::Planning,
+            has_plan: false,
+            created_at: chrono::Utc::now(),
+            parent_task_id: None,
+            model_id: None,
+            turn_anchor_id: None,
+            parent_history_upto: None,
+        }
+    }
+
+    /// 墓碑表是进程级的，测试各用唯一 id 互不干扰。
+    fn unique_id(tag: &str) -> String {
+        format!("test-{tag}-{}", uuid::Uuid::new_v4())
+    }
+
+    /// 指定会话 / 状态 / 父任务的测试任务（`make_task` 的完整版）。
+    fn task_with(id: &str, session: &str, status: AgentStatus, parent: Option<&str>) -> AgentTask {
+        let mut t = make_task(id);
+        t.session_id = session.to_string();
+        t.status = status;
+        t.parent_task_id = parent.map(String::from);
+        t
+    }
+
+    /// 会话 → 在跑任务：只认**这个会话**上**还没到终态**的任务。
+    /// 终态任务（Completed / Failed / Cancelled）不能收停止 —— `transition_to`
+    /// 只把 `Cancelled` 当吸收态，对刚完成的任务写 `Cancelled` 是改写状态。
+    #[test]
+    fn session_lookup_keeps_only_running_tasks_of_that_session() {
+        let tasks = HashMap::from([
+            (
+                "main".to_string(),
+                task_with("main", "sess-a", AgentStatus::Executing, None),
+            ),
+            (
+                "approval".to_string(),
+                task_with("approval", "sess-a", AgentStatus::WaitingApproval, None),
+            ),
+            (
+                "planning".to_string(),
+                task_with("planning", "sess-a", AgentStatus::Planning, None),
+            ),
+            (
+                "done".to_string(),
+                task_with("done", "sess-a", AgentStatus::Completed, None),
+            ),
+            (
+                "failed".to_string(),
+                task_with("failed", "sess-a", AgentStatus::Failed, None),
+            ),
+            (
+                "cancelled".to_string(),
+                task_with("cancelled", "sess-a", AgentStatus::Cancelled, None),
+            ),
+            (
+                "other".to_string(),
+                task_with("other", "sess-b", AgentStatus::Executing, None),
+            ),
+            (
+                "local-sub".to_string(),
+                task_with("local-sub", "local", AgentStatus::Executing, Some("main")),
+            ),
+        ]);
+
+        let mut got = running_task_ids_in(&tasks, "sess-a");
+        got.sort();
+        assert_eq!(got, vec!["approval", "main", "planning"]);
+
+        // 别的会话照旧在跑，本机子 agent 的哨兵会话不会被当成 SSH 会话。
+        assert_eq!(running_task_ids_in(&tasks, "sess-b"), vec!["other"]);
+        assert!(running_task_ids_in(&tasks, "nobody").is_empty());
+    }
+
+    /// 不传 host 的子 agent 继承父会话 —— 同一个会话上可能挂着同一棵树里的
+    /// 多个任务，逐个调 `stop_task_cascade` 必须都是幂等的（这里只锁筛选取全，
+    /// 幂等性由 `transition_to` 的吸收态保证）。
+    #[test]
+    fn session_lookup_covers_sub_agents_inheriting_the_parent_session() {
+        let tasks = HashMap::from([
+            (
+                "main".to_string(),
+                task_with("main", "sess-a", AgentStatus::Executing, None),
+            ),
+            (
+                "sub".to_string(),
+                task_with("sub", "sess-a", AgentStatus::Executing, Some("main")),
+            ),
+        ]);
+        let mut got = running_task_ids_in(&tasks, "sess-a");
+        got.sort();
+        assert_eq!(got, vec!["main", "sub"]);
+    }
+
+    #[test]
+    fn collect_descendant_tasks_includes_self_and_direct_subtasks() {
+        let tasks = HashMap::from([
+            (
+                "main".to_string(),
+                task_with("main", "s1", AgentStatus::Executing, None),
+            ),
+            (
+                "sub1".to_string(),
+                task_with("sub1", "s1", AgentStatus::Executing, Some("main")),
+            ),
+            (
+                "sub2".to_string(),
+                task_with("sub2", "s1", AgentStatus::Executing, Some("main")),
+            ),
+            (
+                "other".to_string(),
+                task_with("other", "s1", AgentStatus::Executing, None),
+            ),
+        ]);
+        let got = collect_descendant_tasks(&tasks, "main");
+        assert_eq!(got.len(), 3);
+        assert!(got.contains(&"main".to_string()));
+        assert!(got.contains(&"sub1".to_string()));
+        assert!(got.contains(&"sub2".to_string()));
+        assert!(!got.contains(&"other".to_string()));
+    }
+
+    #[test]
+    fn collect_descendant_tasks_bfs_covers_nested_layers() {
+        // 防御性 BFS：即使未来出现多层嵌套（当前嵌套被工具集与工具内检查双重拦截），
+        // 级联取消也能一次覆盖全部后代。
+        let tasks = HashMap::from([
+            (
+                "main".to_string(),
+                task_with("main", "s1", AgentStatus::Executing, None),
+            ),
+            (
+                "sub1".to_string(),
+                task_with("sub1", "s1", AgentStatus::Executing, Some("main")),
+            ),
+            (
+                "sub2".to_string(),
+                task_with("sub2", "s1", AgentStatus::Executing, Some("sub1")),
+            ),
+            (
+                "sub3".to_string(),
+                task_with("sub3", "s1", AgentStatus::Executing, Some("sub2")),
+            ),
+        ]);
+        let got = collect_descendant_tasks(&tasks, "main");
+        assert_eq!(got.len(), 4);
+        assert!(got.contains(&"sub3".to_string()));
+    }
+
+    #[test]
+    fn collect_descendant_tasks_missing_task_returns_only_self() {
+        let tasks = HashMap::from([(
+            "other".to_string(),
+            task_with("other", "s1", AgentStatus::Executing, None),
+        )]);
+        let got = collect_descendant_tasks(&tasks, "ghost");
+        assert_eq!(got, vec!["ghost".to_string()]);
+    }
+
+    #[test]
+    fn collect_descendant_tasks_child_of_other_task_not_collected() {
+        let tasks = HashMap::from([
+            (
+                "main".to_string(),
+                task_with("main", "s1", AgentStatus::Executing, None),
+            ),
+            (
+                "sub".to_string(),
+                task_with("sub", "s1", AgentStatus::Executing, Some("main")),
+            ),
+        ]);
+        let got = collect_descendant_tasks(&tasks, "sub");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0], "sub");
+    }
+
+    /// 「组装期间收到的停止」不能丢：记下之后必须能被 `spawn` 侧取走，且取走是
+    /// **一次性**的（同一个 id 被重复认领会把后来的任务莫名其妙地取消掉）。
+    #[test]
+    fn pending_cancel_is_recorded_and_claimed_once() {
+        let id = unique_id("tomb");
+        assert!(!take_pending_cancel(&id), "没请求过就不该命中");
+        record_pending_cancel(&id);
+        assert!(take_pending_cancel(&id), "组装期间收到的停止必须能被认领");
+        assert!(!take_pending_cancel(&id), "认领是一次性的");
+    }
+
+    #[test]
+    fn pending_cancel_dedupes_same_task_and_isolates_others() {
+        let (a, b) = (unique_id("a"), unique_id("b"));
+        record_pending_cancel(&a);
+        record_pending_cancel(&a); // 重复请求只是重复置位
+        record_pending_cancel(&b);
+        assert!(take_pending_cancel(&b));
+        assert!(take_pending_cancel(&a), "重复请求不应把墓碑自己顶掉");
+        assert!(!take_pending_cancel(&b), "不同 task 的请求互不干扰");
+    }
+
+    /// 过期墓碑（对应的启动再也没来）必须被清理，否则 task_id 一旦被复用，
+    /// 新任务会带着一枚旧墓碑起来，开场即被取消。
+    #[test]
+    fn expired_pending_cancel_is_dropped() {
+        let id = unique_id("expired");
+        // `Instant` 的起点是开机时刻（Windows 上尤其如此）：刚启动的机器（例如 CI 的
+        // 全新 runner）上 `Instant::now() - TTL` 会直接溢出 panic，所以只能 `checked_sub`。
+        // 减不动就说明此刻没法伪造出「已过期」的时间点，跳过并明说，不假装通过。
+        let Some(expired_at) =
+            Instant::now().checked_sub(PENDING_CANCEL_TTL + std::time::Duration::from_secs(1))
+        else {
+            eprintln!("skip: 本机 Instant 起点距今不足一个墓碑 TTL（刚开机），造不出过期时间点");
+            return;
+        };
+        {
+            let mut table = pending_cancels().lock().unwrap_or_else(|e| e.into_inner());
+            table.push_back((id.clone(), expired_at));
+        }
+        assert!(!take_pending_cancel(&id), "过期墓碑不该再被认领");
+        assert!(
+            !pending_cancels()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|(i, _)| i == &id),
+            "清理应把过期条目摘掉（不能无限堆积）"
+        );
+    }
+
+    /// 认领时该做两件事：把任务收成 `Cancelled`（最终显示「已停止」而不是
+    /// 完成/失败），并把取消信号发给**在册**的那条通道（agent loop 只在信号上
+    /// 中断进行中的 LLM 调用）。少做任何一件，用户点下的停止都会退化成
+    /// 「任务照常在后台跑完」。
+    #[test]
+    fn applying_pending_cancel_marks_cancelled_and_signals() {
+        let id = unique_id("apply");
+        let tasks =
+            std::sync::Arc::new(PlRwLock::new(HashMap::from([(id.clone(), make_task(&id))])));
+        let cancel = crate::cancel::CancellationRegistry::new();
+        // spawn 在认领之前已经注册：接收端必须拿得到这次信号
+        let registration = cancel.register(&id);
+        let rx = registration.receiver();
+        assert!(!*rx.borrow(), "认领之前不该有取消信号");
+
+        apply_pending_cancel(&tasks, &cancel, &id);
+        assert!(
+            tasks.read().get(&id).unwrap().status.is_cancelled(),
+            "任务必须收成 Cancelled（收尾据此把回合标成 cancelled、不再走 Completed）"
+        );
+        assert!(*rx.borrow(), "取消信号必须发给在册通道");
+    }
+
+    /// 任务记录已被剪掉（只可能发生在清理竞态里）时不炸：没有状态可写，
+    /// 但已有注册的取消信号仍要发出去。
+    #[test]
+    fn applying_pending_cancel_tolerates_missing_task_record() {
+        let id = unique_id("ghost");
+        let tasks = std::sync::Arc::new(PlRwLock::new(HashMap::new()));
+        let cancel = crate::cancel::CancellationRegistry::new();
+        let registration = cancel.register(&id);
+        let rx = registration.receiver();
+
+        apply_pending_cancel(&tasks, &cancel, &id);
+        assert!(tasks.read().get(&id).is_none());
+        assert!(*rx.borrow(), "记录没了也要把取消信号发出去");
+    }
+
+    /// 状态门控只做一件事：判据为假时摘掉 [`STATE_GATED_TOOLS`] 里的工具，别的
+    /// 一个都不动；判据为真时原样返回（这是"只增不减"能成立的一半）。
+    #[test]
+    fn state_gate_removes_only_gated_tools() {
+        let def = |name: &str| ToolDefinition {
+            name: name.to_string(),
+            description: "d".to_string(),
+            parameters: serde_json::json!({ "type": "object" }),
+        };
+        let all = vec![def("bash"), def("read_history"), def("read_file")];
+
+        let gated: Vec<String> = apply_state_gate(all.clone(), false)
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        assert_eq!(gated, vec!["bash", "read_file"], "只该摘掉被门控的那一个");
+
+        let open = apply_state_gate(all.clone(), true);
+        assert_eq!(open.len(), all.len(), "判据为真时不该动清单");
+    }
+
+    /// 循环每轮实际调用的那一步的组合行为：新会话不给、压缩过或派发过子对话才给、
+    /// 子代理恒给。这三件事只有放在同一个函数里才能这样一次测完。
+    #[test]
+    fn tools_for_round_gates_read_history_by_conversation_state() {
+        use crate::agent::conversation::ConversationDb;
+        use crate::agent::conversation_persister::COMPACTION_CARD_PREFIX;
+
+        let def = |name: &str| ToolDefinition {
+            name: name.to_string(),
+            description: "d".to_string(),
+            parameters: serde_json::json!({ "type": "object" }),
+        };
+        let base = vec![def("bash"), def("read_history")];
+        let names =
+            |v: Vec<ToolDefinition>| -> Vec<String> { v.into_iter().map(|d| d.name).collect() };
+
+        let db = ConversationDb::in_memory().expect("db");
+        let fresh = db.create_conversation("conn_1", "fresh").expect("fresh");
+
+        // 全新会话：没有任何读不到的东西 ⇒ 不给（这正是要治的那种会话）
+        assert_eq!(
+            names(tools_for_round(&base, false, &db, &fresh.id,)),
+            vec!["bash"]
+        );
+
+        // 子代理恒给：它读主 agent 派发时刻的上下文，与父会话压不压缩无关
+        assert_eq!(
+            names(tools_for_round(&base, true, &db, &fresh.id,)),
+            vec!["bash", "read_history"]
+        );
+
+        // 派发过子对话 ⇒ 给（主 agent 要能核对子代理的过程）
+        let child = db
+            .create_sub_conversation("conn_1", "查磁盘", &fresh.id)
+            .expect("child");
+        assert_eq!(
+            names(tools_for_round(&base, false, &db, &fresh.id,)),
+            vec!["bash", "read_history"]
+        );
+        db.delete_conversation(&child.id).expect("delete child");
+
+        // 压缩过 ⇒ 给。归档卡按内容前缀认，这里直接落一行卡验判据
+        db.save_message(
+            &fresh.id,
+            "system",
+            &format!("{COMPACTION_CARD_PREFIX}已整理 3 条历史消息（约 100 tokens）"),
+            "2026-01-02T00:00:00Z",
+            None,
+            None,
+        )
+        .expect("card");
+        assert_eq!(
+            names(tools_for_round(&base, false, &db, &fresh.id,)),
+            vec!["bash", "read_history"]
+        );
+    }
+
+    #[test]
+    fn plan_main_agent_gets_task_tool() {
+        let registry = build_plan_registry(&AgentRole::Main, &[], &exp());
+        assert!(
+            registry.get("subagent").is_some(),
+            "顶层 Plan agent 应注册 subagent 子agent 工具"
+        );
+    }
+
+    #[test]
+    fn plan_sub_agent_does_not_get_task_tool() {
+        let registry = build_plan_registry(
+            &AgentRole::Sub {
+                parent_task_id: "parent-1".to_string(),
+            },
+            &[],
+            &exp(),
+        );
+        assert!(
+            registry.get("subagent").is_none(),
+            "子agent（Plan 只读）不应注册 subagent 工具，保证子agent 不派发子agent"
+        );
+    }
+
+    /// 角色 → 工具层可见性角色的映射（新增角色必须显式回答「面向谁」）。
+    #[test]
+    fn audience_maps_every_role() {
+        use crate::agent::tools::ToolAudience;
+        assert_eq!(audience_of(&AgentRole::Main), ToolAudience::Main);
+        assert_eq!(
+            audience_of(&AgentRole::Sub {
+                parent_task_id: "p".into()
+            }),
+            ToolAudience::Sub
+        );
+        assert_eq!(
+            audience_of(&AgentRole::LocalSub {
+                parent_task_id: "p".into()
+            }),
+            ToolAudience::LocalSub
+        );
+    }
+
+    /// 子 agent 语义（看护站：完成通知 / 插件 / MCP / 多机一律按「子」处理）。
+    #[test]
+    fn local_sub_is_a_subtask_with_a_parent() {
+        let role = AgentRole::LocalSub {
+            parent_task_id: "parent-1".to_string(),
+        };
+        assert!(role.is_subtask(), "本机子 agent 同样是子 agent");
+        assert_eq!(role.parent_task_id(), Some("parent-1"));
+        assert!(role.is_local_side(), "本机子 agent 的 ctx 指向这台电脑");
+        assert!(!AgentRole::Main.is_local_side());
+        assert!(!AgentRole::Sub {
+            parent_task_id: "p".into()
+        }
+        .is_local_side());
+    }
+
+    /// 本机子 agent 的 registry 收窄（Plan 与 Execute 两条模式都要收）：
+    /// 远端语义工具与一切编排工具都不许出现；本机族、作业出口、回读历史、
+    /// 提问必须留下。
+    ///
+    /// 桌面专属：本机族工具（`local_*`）与传输工具在移动端连声明都没有，
+    /// 本机子 agent 本身也是桌面能力。
+    #[cfg(desktop)]
+    #[test]
+    fn local_sub_registry_is_narrowed_to_local_semantics() {
+        let parent = AgentRole::LocalSub {
+            parent_task_id: "parent-1".to_string(),
+        };
+        let mut narrowed = vec![];
+        for mode in [AgentMode::Plan, AgentMode::Agent, AgentMode::Auto] {
+            narrowed.push(build_role_registry(&parent, &mode, &[], &exp(), &[]));
+        }
+        for registry in &narrowed {
+            for absent in [
+                // 远端命令 / 文件 / 系统信息
+                "bash",
+                "read_file",
+                "write_file",
+                "edit_file",
+                "list_directory",
+                "search_files",
+                "system_info",
+                "connection_info",
+                // 本机 ↔ 远端搬运
+                "upload_file",
+                "download_file",
+                // 编排（含本机派发入口自己：禁止嵌套）
+                "subagent",
+                "local_subagent",
+                "create_plan",
+                "update_plan_item",
+                "edit_plan",
+            ] {
+                assert!(
+                    registry.get(absent).is_none(),
+                    "本机子 agent 不该拿到 {}",
+                    absent
+                );
+            }
+            for present in [
+                // 本机能力本体（Plan 模式下写 / 编辑本来就不在，逐模式另测）
+                "local_bash",
+                "local_read_file",
+                "local_list_directory",
+                // 作业出口：读的就是 ctx.command_exec（本机 ctx 上即本机管理器），
+                // `local_bash` 后台作业的唯一出口
+                "job_output",
+                "job_kill",
+                "job_list",
+                // 回读父会话派发它时的上下文 / 向用户提问
+                "read_history",
+                "ask_user",
+            ] {
+                assert!(
+                    registry.get(present).is_some(),
+                    "本机子 agent 应保留 {}",
+                    present
+                );
+            }
+        }
+        // 写 / 编辑：只在 Execute 侧出现（声明为 EXECUTE），与远端口径一致。
+        let exec = build_role_registry(&parent, &AgentMode::Agent, &[], &exp(), &[]);
+        for name in ["local_write_file", "local_edit_file"] {
+            assert!(exec.get(name).is_some(), "读写本机子 agent 应含 {}", name);
+        }
+        let plan = build_role_registry(&parent, &AgentMode::Plan, &[], &exp(), &[]);
+        for name in ["local_write_file", "local_edit_file"] {
+            assert!(plan.get(name).is_none(), "只读本机子 agent 不该有 {}", name);
+        }
+    }
+
+    /// 收窄**只**发生在本机角色上：远端主 / 子 agent 的工具集一个都不能少
+    /// （这条防的是「收窄顺手写成了对所有角色生效」）。
+    #[test]
+    fn narrowing_does_not_touch_remote_roles() {
+        for (role, mode) in [
+            (AgentRole::Main, AgentMode::Agent),
+            (
+                AgentRole::Sub {
+                    parent_task_id: "p".into(),
+                },
+                AgentMode::Agent,
+            ),
+            (AgentRole::Main, AgentMode::Plan),
+        ] {
+            let registry = build_role_registry(&role, &mode, &[], &exp(), &[]);
+            for name in ["bash", "read_file"] {
+                assert!(
+                    registry.get(name).is_some(),
+                    "{:?}/{:?} 应保留 {}",
+                    role,
+                    mode,
+                    name
+                );
+            }
+        }
+    }
+
+    /// 子agent 候选模型注入边界：仅 Main 注入（Plan/Agent 模式都算），子任务
+    /// 角色与空候选都不注入（后者 = 工具定义与未配置前一致）。
+    #[test]
+    fn subagent_model_choices_inject_only_for_main() {
+        let choices = vec![SubagentModelCandidate {
+            model_id: "m1".into(),
+            label: "小杯".into(),
+            description: "小模型".into(),
+        }];
+
+        for mode in [AgentMode::Plan, AgentMode::Agent] {
+            let main = build_role_registry(&AgentRole::Main, &mode, &[], &exp(), &choices);
+            let def = main
+                .get("subagent")
+                .expect("主任务应有 subagent")
+                .definition();
+            assert_eq!(
+                def.parameters["properties"]["model"]["enum"][0], "小杯",
+                "{mode:?} 模式的主任务都要拿到候选"
+            );
+            assert!(def.description.contains("MODEL SELECTION"));
+        }
+        // 本机子agent 派发入口同样注入（桌面专属工具）。
+        #[cfg(desktop)]
+        {
+            let main =
+                build_role_registry(&AgentRole::Main, &AgentMode::Agent, &[], &exp(), &choices);
+            let local_def = main
+                .get("local_subagent")
+                .expect("主任务应有 local_subagent")
+                .definition();
+            assert_eq!(
+                local_def.parameters["properties"]["model"]["enum"][0],
+                "小杯"
+            );
+        }
+
+        // 子任务（远端与本机）：工具集本来就没有派发入口，注入必须不发生。
+        for role in [
+            AgentRole::Sub {
+                parent_task_id: "p".into(),
+            },
+            AgentRole::LocalSub {
+                parent_task_id: "p".into(),
+            },
+        ] {
+            let registry = build_role_registry(&role, &AgentMode::Agent, &[], &exp(), &choices);
+            assert!(
+                registry.get("subagent").is_none(),
+                "{role:?} 不该有 subagent"
+            );
+            assert!(registry.get("local_subagent").is_none());
+        }
+
+        // 空候选：不注入，定义与未配置前一致。
+        let plain = build_role_registry(&AgentRole::Main, &AgentMode::Agent, &[], &exp(), &[]);
+        assert!(
+            plain.get("subagent").unwrap().definition().parameters["properties"]
+                .get("model")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn plan_registry_keeps_read_only_tools() {
+        let registry = build_plan_registry(&AgentRole::Main, &[], &exp());
+        assert!(registry.get("read_file").is_some());
+        assert!(registry.get("search_files").is_some());
+        assert!(registry.get("bash").is_some());
+        // Plan 模式仍不含写/改工具
+        assert!(registry.get("write_file").is_none());
+        assert!(registry.get("edit_file").is_none());
+    }
+
+    /// 读写执行子 agent（Agent/Auto + Sub）拿不到任何编排工具。
+    ///
+    /// 这条规则现在由工具声明表的 `ToolRoles::MainOnly` 表达（见
+    /// `tools/mod.rs` 的 `BUILTIN_TOOLS_COMMON`），不再「先注册全套、再按名字删」，
+    /// 所以这里直接断言「以 Sub 身份构建出来的 registry」。
+    #[test]
+    fn sub_agent_registry_lacks_orchestration_tools() {
+        use crate::agent::tools::{ToolAudience, ToolRegistry};
+        let registry = ToolRegistry::build_mut_for_mode(ToolAudience::Sub, &[], &exp());
+        for name in ["subagent", "create_plan", "update_plan_item", "edit_plan"] {
+            assert!(registry.get(name).is_none(), "读写子agent 不应有 {}", name);
+        }
+        // 读写核心工具保留
+        for name in ["bash", "write_file", "edit_file", "read_file"] {
+            assert!(registry.get(name).is_some(), "读写子agent 应保留 {}", name);
+        }
+        // 桌面专属的本机文件系统工具同样保留（子 agent 也在桌面跑）。
+        #[cfg(desktop)]
+        for name in ["upload_file", "download_file"] {
+            assert!(registry.get(name).is_some(), "读写子agent 应保留 {}", name);
+        }
+    }
+
+    #[test]
+    fn main_agent_registry_keeps_orchestration_tools() {
+        use crate::agent::tools::{ToolAudience, ToolRegistry};
+        let r = ToolRegistry::build_mut_for_mode(ToolAudience::Main, &[], &exp());
+        for name in ["subagent", "create_plan", "bash", "write_file"] {
+            assert!(r.get(name).is_some(), "主任务应保留 {}", name);
+        }
+    }
+
+    fn base_cfg() -> LlmConfig {
+        let mut c = LlmConfig::default();
+        c.extra_body = None;
+        c
+    }
+
+    fn declared(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn apply_effort_injects_top_level_when_declared() {
+        let cfg =
+            apply_reasoning_effort(base_cfg(), "ds", &declared(&["low", "high", "max"]), "high");
+        let extra = cfg.extra_body.expect("extra_body set");
+        assert_eq!(
+            extra.get("reasoning_effort").and_then(|v| v.as_str()),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn apply_effort_merges_into_existing_extra_body() {
+        let mut c = base_cfg();
+        c.extra_body = Some(serde_json::json!({ "thinking": { "type": "enabled" } }));
+        let cfg = apply_reasoning_effort(c, "ds", &declared(&["low", "high"]), "low");
+        let extra = cfg.extra_body.expect("extra_body set");
+        assert_eq!(
+            extra.get("reasoning_effort").and_then(|v| v.as_str()),
+            Some("low")
+        );
+        // 既有 thinking 键保留
+        assert_eq!(
+            extra
+                .get("thinking")
+                .and_then(|v| v.get("type"))
+                .and_then(|v| v.as_str()),
+            Some("enabled")
+        );
+    }
+
+    #[test]
+    fn apply_effort_ignores_undeclared_or_empty() {
+        // 未声明档位：原样返回（不注入、不 panic）
+        let cfg = apply_reasoning_effort(base_cfg(), "gpt", &declared(&[]), "high");
+        assert!(cfg.extra_body.is_none());
+        // 声明内不包含该档位
+        let cfg = apply_reasoning_effort(base_cfg(), "ds", &declared(&["low"]), "max");
+        assert!(cfg.extra_body.is_none());
+        // 空档位
+        let cfg = apply_reasoning_effort(base_cfg(), "ds", &declared(&["low"]), "  ");
+        assert!(cfg.extra_body.is_none());
+    }
+
+    #[test]
+    fn apply_effort_keeps_non_object_extra_body_untouched() {
+        let mut c = base_cfg();
+        c.extra_body = Some(serde_json::json!([1, 2, 3]));
+        let cfg = apply_reasoning_effort(c, "odd", &declared(&["low"]), "low");
+        // 异常数据不注入也不破坏
+        assert_eq!(cfg.extra_body, Some(serde_json::json!([1, 2, 3])));
+    }
+}

@@ -1,0 +1,68 @@
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
+import { resolve } from "path";
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
+
+// https://v2.tauri.app/start/frontend/vite/
+export default defineConfig({
+  plugins: [react(), tailwindcss()],
+
+  resolve: {
+    alias: {
+      "@": resolve(__dirname, "./src"),
+      // Its browser entry calls document.createElement, which cannot run in a Worker.
+      // The package's default entry uses the same entity table without a DOM.
+      "decode-named-character-reference": require.resolve("decode-named-character-reference"),
+      // KaTeX's HAST adapter also has a DOM-only browser entry (DOMParser).
+      "hast-util-from-html-isomorphic": require.resolve("hast-util-from-html-isomorphic"),
+    },
+  },
+
+  // Prevent Vite from clearing the terminal so Tauri logs remain visible
+  clearScreen: false,
+
+  server: {
+    port: 1420,
+    strictPort: true,
+    // Tauri dev server expects the frontend on localhost
+    host: false,
+    // Optimize dev server performance
+    hmr: {
+      overlay: false,
+    },
+    watch: {
+      // Reduce file watching overhead
+      ignored: ['**/node_modules/**', '**/src-tauri/**'],
+    },
+  },
+
+  // Default Vite is only VITE_; Tauri needs TAURI_* too. Both required —
+  // otherwise VITE_FORCE_PLATFORM from .env.mobile never reaches the client.
+  envPrefix: ["VITE_", "TAURI_"],
+
+  build: {
+    // Tauri uses Chromium on Windows/Linux and WebKit on macOS
+    target: process.env.TAURI_PLATFORM === "windows" ? "chrome105" : "safari14",
+    // Produce sourcemaps for debug builds
+    sourcemap: !!process.env.TAURI_DEBUG,
+    // Minify for production
+    minify: !process.env.TAURI_DEBUG ? "esbuild" : false,
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          // Split vendor chunks for caching
+          react: ["react", "react-dom"],
+          xterm: [
+            "@xterm/xterm",
+            "@xterm/addon-fit",
+            "@xterm/addon-web-links",
+            "@xterm/addon-webgl",
+          ],
+        },
+      },
+    },
+  },
+});

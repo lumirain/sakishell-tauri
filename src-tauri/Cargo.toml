@@ -1,0 +1,116 @@
+[package]
+name = "sakishell"
+version = "1.0.0"
+edition = "2021"
+description = "AI-Native SSH Client with Autonomous Agent Operations"
+rust-version = "1.77.2"
+
+[lib]
+# cdylib is required for the Android build (libsakishell.so); rlib keeps the
+# desktop binary and tests working; staticlib is for iOS.
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "^2", features = [] }
+
+
+
+[dependencies]
+tauri = { version = "^2", features = ["tray-icon", "unstable", "protocol-asset"] }
+tauri-plugin-shell = "^2"
+tauri-plugin-notification = "^2"
+tauri-plugin-clipboard-manager = "^2"
+tauri-plugin-dialog = "^2"
+tauri-plugin-fs = "^2"
+serde = { version = "^1", features = ["derive"] }
+serde_json = "^1"
+tokio = { version = "^1", features = ["full"] }
+thiserror = "^2"
+uuid = { version = "^1", features = ["v4", "serde"] }
+log = "^0.4"
+env_logger = "^0.11"
+chrono = { version = "^0.4", features = ["serde"] }
+async-trait = "^0.1"
+russh = { version = "0.60", default-features = false, features = ["flate2", "ring", "rsa"] }
+russh-sftp = "2.1"
+zeroize = { version = "^1", features = ["derive"] }
+futures = "^0.3"
+html2md = "^0.2"
+parking_lot = "^0.12"
+scraper = "^0.22"
+rusqlite = { version = "0.32", features = ["bundled"] }
+zip = "^2"
+serde_yaml = "^0.9"
+base64 = "^0.22"
+shell-words = "^1.1"
+url = "2"
+percent-encoding = "2"
+dirs = "^5"
+semver = "^1"
+handlebars = "6"
+# sysopen 文件监视（替代轮询）：保存即感知，低 CPU。纯 Rust + 平台 binding，桌面/Android 均可编译。
+notify = "6"
+# sysopen 用系统默认应用打开文件（tauri 官方插件，替代已 deprecated 的 shell().open）
+tauri-plugin-opener = "^2"
+# 无感更新器（updater/）：桌面 Windows 走 NSIS「退出即静默安装」，Android 走
+# APK「后台下载 + 一键拉起系统安装器」，两端都要 sha256 校验安装包完整性与
+# 磁盘剩余空间预检（minisign 验签仅 Windows 需要，见下方 target 段）。
+sha2 = "0.10"
+fs4 = "0.8"
+# 私钥库（ssh/key_store.rs）：导入的私钥用 AES-256-GCM 加密后再落盘。
+# 选 RustCrypto 而非 ring 是因为它纯 Rust，Android 交叉编译不会有构建脚本意外。
+aes-gcm = "0.10"
+
+
+
+
+# reqwest TLS 后端按平台拆分：桌面用系统原生 TLS；Android 交叉编译没有 OpenSSL，用 rustls。
+# 桌面额外启用 system-proxy：插件市场等 HTTP 请求自动走系统代理（加速工具/Clash 等），
+# 未配置代理时自动直连。Android 不启用（市场功能仅桌面）。
+[target.'cfg(not(target_os = "android"))'.dependencies]
+reqwest = { version = "^0.12", default-features = false, features = ["json", "stream", "native-tls", "system-proxy", "charset", "gzip", "brotli", "deflate"] }
+# MCP Server 的 HTTP transport（mcp_server/http_transport.rs，仅桌面）。
+# 纯 Rust 实现，Android 交叉编译不需要——移动端本就只做 MCP client，
+# 不做 server，所以放在 not-android 段里，不给 Android 构建增重。
+axum = { version = "^0.8", default-features = false, features = ["http1", "json", "tokio"] }
+# 桌面密钥链：Windows Credential Manager / macOS+iOS Keychain / Linux Secret Service
+keyring = { version = "^4", default-features = false, features = [
+    "v1",
+    "windows-native-keyring-store",
+    "apple-native-keyring-store",
+    "zbus-secret-service-keyring-store",
+] }
+# 仅 Windows 无感更新需要：NSIS 安装包在执行前用 minisign 验签（Android 的
+# APK 由系统安装器强制校验签名一致，故不引入该依赖）。
+[target.'cfg(windows)'.dependencies]
+minisign-verify = "0.2"
+# Windows 系统通知点击激活：tauri-plugin-notification 未暴露 Activated 钩子，
+# 直接用它的底层同版本 crate 挂 on_activated → 聚焦主窗口。
+tauri-winrt-notification = "0.7"
+
+[target.'cfg(target_os = "android")'.dependencies]
+reqwest = { version = "^0.12", default-features = false, features = ["json", "stream", "rustls-tls", "charset", "gzip", "brotli", "deflate"] }
+# Android 密钥链：SharedPreferences + Android Keystore（hardware-backed AES）
+# v3 时代 keyring 在 Android 静默降级为内存 mock，重启即丢；
+# v4 的 v1 便利模块仍不覆盖 Android，因此直接用官方 store + keyring-core 构建 Entry。
+keyring-core = { version = "^1", features = [] }
+android-native-keyring-store = { version = "^1", features = [] }
+# content:// URI 的 DISPLAY_NAME 查询走 JNI ContentResolver（tauri 依赖树已有同版本）
+jni = "0.21"
+ndk-context = "0.1"
+
+[dev-dependencies]
+tempfile = "^3"
+tauri = { version = "^2", features = ["test"] }
+# 测试用 tokio 暂停时钟（#[tokio::test(start_paused = true)]），
+# 让「首字超时」这类按秒计的兜底路径可以即时触发而不用真实等待。
+tokio = { version = "^1", features = ["test-util"] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

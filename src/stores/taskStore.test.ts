@@ -1,0 +1,693 @@
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { useTaskStore } from '@/stores/taskStore';
+import { useConversationStore } from '@/stores/conversationStore';
+import { cleanupTaskListeners } from '@/stores/agentStreamManager';
+import type { AgentTaskPlan, AgentMessage } from '@/lib/types';
+
+const { agentStopTask, cleanupTaskListenersMock } = vi.hoisted(() => ({
+  agentStopTask: vi.fn(),
+  cleanupTaskListenersMock: vi.fn(),
+}));
+
+vi.mock('@/lib/tauri', () => ({
+  agentStopTask,
+}));
+vi.mock('@/stores/agentStreamManager', () => ({
+  attachStreamListener: vi.fn(),
+  attachPlanListener: vi.fn(),
+  cleanupTaskListeners: cleanupTaskListenersMock,
+}));
+
+describe('taskStore', () => {
+  beforeEach(() => {
+    useTaskStore.setState({
+      tasks: {},
+      activeTaskId: null,
+      mode: 'agent',
+      plans: {},
+      plansDirty: false,
+    });
+    useConversationStore.setState({
+      conversations: {},
+      messages: {},
+      activeConversationId: null,
+    });
+    vi.clearAllMocks();
+  });
+
+  it('has correct initial state', () => {
+    const state = useTaskStore.getState();
+    expect(state.mode).toBe('agent');
+    expect(state.activeTaskId).toBeNull();
+    expect(Object.keys(state.tasks)).toHaveLength(0);
+  });
+
+  it('setMode changes agent mode', () => {
+    useTaskStore.getState().setMode('auto');
+    expect(useTaskStore.getState().mode).toBe('auto');
+
+    useTaskStore.getState().setMode('plan');
+    expect(useTaskStore.getState().mode).toBe('plan');
+  });
+
+  it('updateTaskStatus updates existing task', () => {
+    useTaskStore.setState({
+      tasks: {
+        'task-1': {
+          id: 'task-1',
+          sessionId: 's1',
+          conversationId: 'conv-1',
+          prompt: 'test',
+          mode: 'agent',
+          status: 'planning',
+          createdAt: new Date().toISOString(),
+        },
+      },
+    });
+
+    useTaskStore.getState().updateTaskStatus('task-1', 'executing');
+    expect(useTaskStore.getState().tasks['task-1'].status).toBe('executing');
+  });
+
+  it('updateTaskStatus does nothing for unknown task', () => {
+    useTaskStore.getState().updateTaskStatus('nonexistent', 'executing');
+    // No crash, no state change for non-existent
+    expect(useTaskStore.getState().tasks['nonexistent']).toBeUndefined();
+  });
+
+  it('setPlan stores plan', () => {
+    const plan: AgentTaskPlan = {
+      taskId: 'task-1',
+      currentIndex: 0,
+      items: [{ id: 'item-1', title: 'Do thing', status: 'pending' }],
+    };
+    useTaskStore.getState().setPlan('task-1', plan);
+    const stored = useTaskStore.getState().plans['task-1'];
+    expect(stored).toEqual(plan);
+    expect(stored.items[0].status).toBe('pending');
+  });
+
+  it('getActivePlan returns plan for active task', () => {
+    const plan: AgentTaskPlan = {
+      taskId: 'task-1',
+      currentIndex: 0,
+      items: [{ id: 'item-1', title: 'Step', status: 'pending' }],
+    };
+    useTaskStore.setState({ activeTaskId: 'task-1' });
+    useTaskStore.getState().setPlan('task-1', plan);
+
+    expect(useTaskStore.getState().getActivePlan()?.taskId).toBe('task-1');
+  });
+
+  it('getActivePlan returns null when no active task', () => {
+    expect(useTaskStore.getState().getActivePlan()).toBeNull();
+  });
+
+  describe('stopTask', () => {
+    it('marks executing tool messages as aborted before unlistening stream events', async () => {
+      agentStopTask.mockResolvedValue(undefined);
+      const runningTool: AgentMessage = {
+        id: 'tool-1',
+        role: 'tool',
+        content: 'executing',
+        timestamp: new Date().toISOString(),
+        isExecuting: true,
+        toolResult: {
+          toolName: 'execute_command',
+          summary: '',
+          result: 'partial output',
+          success: true,
+          blocked: false,
+        },
+      };
+      useConversationStore.setState({
+        activeConversationId: 'conv-1',
+        messages: { 'conv-1': [runningTool] },
+      });
+      useTaskStore.setState({
+        tasks: {
+          'task-1': {
+            id: 'task-1',
+            sessionId: 's1',
+            conversationId: 'conv-1',
+            prompt: 'p',
+            mode: 'agent',
+            status: 'executing',
+            createdAt: new Date().toISOString(),
+          },
+        },
+        activeTaskId: 'task-1',
+      });
+
+      await useTaskStore.getState().stopTask('task-1');
+
+      // Tool message was marked aborted: isExecuting cleared, wasAborted set,
+      // result appended with streaming interruption note.
+      const toolMsg = useConversationStore.getState().messages['conv-1'][0];
+      expect(toolMsg.isExecuting).toBe(false);
+      expect(toolMsg.toolResult?.wasAborted).toBe(true);
+      expect(toolMsg.toolResult?.success).toBe(false);
+      expect(toolMsg.toolResult?.result).toContain('用户中断');
+      expect(toolMsg.toolResult?.result).toContain('已停止等待输出并关闭 SSH 通道');
+
+      // The mark happened BEFORE cleanupTaskListeners
+      const clearOrder: string[] = [];
+      cleanupTaskListenersMock.mockImplementation(() => {
+        clearOrder.push('cleanup');
+      });
+      const origMark = useConversationStore.getState().markAbortedToolFlags;
+      useConversationStore.setState({
+        markAbortedToolFlags: () => {
+          clearOrder.push('mark');
+          origMark();
+        },
+      });
+
+      // 第一次 stopTask 已把 task-1 置 cancelled；新逻辑对已终态任务不再重复
+      // mark/cleanup，这里重置为运行中再验证顺序。
+      useTaskStore.setState({
+        tasks: {
+          'task-1': {
+            id: 'task-1',
+            sessionId: 's1',
+            conversationId: 'conv-1',
+            prompt: 'p',
+            mode: 'agent',
+            status: 'executing',
+            createdAt: new Date().toISOString(),
+          },
+        },
+        activeTaskId: 'task-1',
+      });
+
+      await useTaskStore.getState().stopTask('task-1');
+
+      expect(clearOrder.indexOf('mark')).toBeLessThan(clearOrder.indexOf('cleanup'));
+      expect(cleanupTaskListenersMock).toHaveBeenCalledWith('task-1');
+      // 恢复被覆盖的 action，避免污染后续测试（zustand setState 会覆盖 store action）
+      useConversationStore.setState({ markAbortedToolFlags: origMark });
+    });
+
+    it('本地收尾发在停止命令之前——后端取消路径的终态事件再也抢不到前面', async () => {
+      // 竞态回归：后端取消路径会发 StreamEvent::Cancelled。它若抢在拆通道之前
+      // 落地，就会被当成模型自然结束处理（删掉在飞卡片、把回合写成 completed
+      // → 折叠把过程卡片吞掉）。所以收尾必须发生在 agent_stop_task 之前。
+      let cleanedAtStopCall: boolean | undefined;
+      let cardExecutingAtStopCall: boolean | undefined;
+      let turnStateAtStopCall: string | undefined;
+      agentStopTask.mockImplementation(async () => {
+        const msgs = useConversationStore.getState().messages['conv-1'];
+        cleanedAtStopCall = cleanupTaskListenersMock.mock.calls.length > 0;
+        cardExecutingAtStopCall = msgs.find((m) => m.id === 'tool-in-flight')?.isExecuting;
+        turnStateAtStopCall = msgs[0]?.turnState;
+      });
+      useConversationStore.setState({
+        activeConversationId: 'conv-1',
+        messages: {
+          'conv-1': [
+            { id: 'u1', role: 'user', content: '改版本号', timestamp: '' },
+            {
+              id: 'tool-in-flight',
+              role: 'tool',
+              content: '',
+              timestamp: '',
+              isExecuting: true,
+              toolResult: {
+                toolName: 'bash',
+                summary: '$ ls',
+                result: '',
+                success: true,
+                blocked: false,
+                toolCallId: 'call-1',
+              },
+            },
+          ],
+        },
+      });
+      useTaskStore.setState({
+        tasks: {
+          'task-1': {
+            id: 'task-1',
+            sessionId: 's1',
+            conversationId: 'conv-1',
+            prompt: 'p',
+            mode: 'agent',
+            status: 'executing',
+            createdAt: new Date().toISOString(),
+          },
+        },
+        activeTaskId: 'task-1',
+      });
+
+      await useTaskStore.getState().stopTask('task-1');
+
+      expect(cleanedAtStopCall).toBe(true);
+      expect(cardExecutingAtStopCall).toBe(false);
+      expect(turnStateAtStopCall).toBe('cancelled');
+      expect(cleanupTaskListenersMock).toHaveBeenCalledWith('task-1');
+    });
+
+    it('marks non-streaming tool messages as aborted with non-streaming note', async () => {
+      agentStopTask.mockResolvedValue(undefined);
+      const runningTool: AgentMessage = {
+        id: 'tool-2',
+        role: 'tool',
+        content: '',
+        timestamp: new Date().toISOString(),
+        isExecuting: true,
+        toolResult: {
+          toolName: 'read_file',
+          summary: '',
+          result: '',
+          success: true,
+          blocked: false,
+        },
+      };
+      useConversationStore.setState({
+        activeConversationId: 'conv-1',
+        messages: { 'conv-1': [runningTool] },
+      });
+      useTaskStore.setState({
+        tasks: {
+          'task-1': {
+            id: 'task-1',
+            sessionId: 's1',
+            conversationId: 'conv-1',
+            prompt: 'p',
+            mode: 'agent',
+            status: 'executing',
+            createdAt: new Date().toISOString(),
+          },
+        },
+        activeTaskId: 'task-1',
+      });
+
+      await useTaskStore.getState().stopTask('task-1');
+
+      const toolMsg = useConversationStore.getState().messages['conv-1'][0];
+      expect(toolMsg.toolResult?.wasAborted).toBe(true);
+      expect(toolMsg.toolResult?.result).toContain('用户手动中断');
+      expect(toolMsg.toolResult?.result).toContain('工具可能已执行完成');
+      // Should NOT mention remote command phrasing
+      expect(toolMsg.toolResult?.result).not.toContain('远端命令');
+    });
+
+    it('marks the task as cancelled and clears active', async () => {
+      agentStopTask.mockResolvedValue(undefined);
+      useTaskStore.setState({
+        tasks: {
+          'task-1': {
+            id: 'task-1',
+            sessionId: 's1',
+            conversationId: 'conv-1',
+            prompt: 'p',
+            mode: 'agent',
+            status: 'executing',
+            createdAt: new Date().toISOString(),
+          },
+        },
+        activeTaskId: 'task-1',
+      });
+
+      await useTaskStore.getState().stopTask('task-1');
+
+      const task = useTaskStore.getState().tasks['task-1'];
+      expect(task.status).toBe('cancelled');
+      expect(useTaskStore.getState().activeTaskId).toBeNull();
+    });
+
+    it('把尾回合标成 cancelled —— 手动停止的回合不再折叠（过程留在眼前）', async () => {
+      agentStopTask.mockResolvedValue(undefined);
+      const prompt: AgentMessage = {
+        id: 'u1',
+        role: 'user',
+        content: '跑一下',
+        timestamp: new Date().toISOString(),
+      };
+      const runningTool: AgentMessage = {
+        id: 'tool-1',
+        role: 'tool',
+        content: 'executing',
+        timestamp: new Date().toISOString(),
+        isExecuting: true,
+        toolResult: {
+          toolName: 'execute_command',
+          summary: '',
+          result: '',
+          success: true,
+          blocked: false,
+        },
+      };
+      useConversationStore.setState({
+        activeConversationId: 'conv-1',
+        messages: { 'conv-1': [prompt, runningTool] },
+      });
+      useTaskStore.setState({
+        tasks: {
+          'task-1': {
+            id: 'task-1',
+            sessionId: 's1',
+            conversationId: 'conv-1',
+            prompt: 'p',
+            mode: 'agent',
+            status: 'executing',
+            createdAt: new Date().toISOString(),
+          },
+        },
+        activeTaskId: 'task-1',
+      });
+
+      await useTaskStore.getState().stopTask('task-1');
+
+      // 状态写在回合锚点（首条 user）上，别的消息不带
+      const msgs = useConversationStore.getState().messages['conv-1'];
+      expect(msgs[0].turnState).toBe('cancelled');
+      expect(msgs[1].turnState).toBeUndefined();
+    });
+
+    it('removes the retrying system pill on stop —— 重试等待中点停止不残留「正在重试请求」', async () => {
+      // 回归：点停止走本地收尾（先拆通道再发命令），后端的 Cancelled 事件
+      // 收不到，handleCancelled 里过滤 isRetrying 行的清理不会执行。残留的
+      // 倒计时胶囊会在本地倒计时归零后翻成「正在重试请求 (n/m)…」永挂。
+      agentStopTask.mockResolvedValue(undefined);
+      const retryPill: AgentMessage = {
+        id: 'retry-1',
+        role: 'system',
+        content: '',
+        timestamp: new Date().toISOString(),
+        isRetrying: true,
+        retryAttempt: 2,
+        retryMaxAttempts: 4,
+        retryTotalDelaySecs: 8,
+        retryLastError: 'timeout',
+      };
+      useConversationStore.setState({
+        activeConversationId: 'conv-1',
+        messages: {
+          'conv-1': [
+            { id: 'u1', role: 'user', content: '跑一下', timestamp: '' },
+            retryPill,
+          ],
+          // 别的对话的重试胶囊不受牵连
+          'conv-2': [{ ...retryPill, id: 'retry-2' }],
+        },
+      });
+      useTaskStore.setState({
+        tasks: {
+          'task-1': {
+            id: 'task-1',
+            sessionId: 's1',
+            conversationId: 'conv-1',
+            prompt: 'p',
+            mode: 'agent',
+            status: 'executing',
+            createdAt: new Date().toISOString(),
+          },
+        },
+        activeTaskId: 'task-1',
+      });
+
+      await useTaskStore.getState().stopTask('task-1');
+
+      const conv1 = useConversationStore.getState().messages['conv-1'];
+      expect(conv1.some((m) => m.role === 'system' && m.isRetrying)).toBe(false);
+      // 用户消息原样保留，不误删
+      expect(conv1.map((m) => m.id)).toEqual(['u1']);
+      const conv2 = useConversationStore.getState().messages['conv-2'];
+      expect(conv2.some((m) => m.role === 'system' && m.isRetrying)).toBe(true);
+    });
+
+    it('marks tool messages even when agentStopTask throws', async () => {
+      agentStopTask.mockRejectedValue(new Error('backend gone'));
+      useConversationStore.setState({
+        activeConversationId: 'conv-1',
+        messages: {
+          'conv-1': [
+            {
+              id: 'tool-1',
+              role: 'tool',
+              content: 'executing',
+              timestamp: new Date().toISOString(),
+              isExecuting: true,
+              toolResult: {
+                toolName: 'execute_command',
+                summary: '',
+                result: '',
+                success: true,
+                blocked: false,
+              },
+            },
+          ],
+        },
+      });
+      useTaskStore.setState({
+        tasks: {
+          'task-1': {
+            id: 'task-1',
+            sessionId: 's1',
+            conversationId: 'conv-1',
+            prompt: 'p',
+            mode: 'agent',
+            status: 'executing',
+            createdAt: new Date().toISOString(),
+          },
+        },
+        activeTaskId: 'task-1',
+      });
+
+      await expect(useTaskStore.getState().stopTask('task-1')).rejects.toThrow('backend gone');
+
+      const toolMsg = useConversationStore.getState().messages['conv-1'][0];
+      expect(toolMsg.isExecuting).toBe(false);
+      expect(toolMsg.toolResult?.wasAborted).toBe(true);
+      expect(cleanupTaskListenersMock).toHaveBeenCalledWith('task-1');
+    });
+
+    it('only marks tool cards in the stopped task conversation (subagents stay intact)', async () => {
+      agentStopTask.mockResolvedValue(undefined);
+      const conv1Tool: AgentMessage = {
+        id: 'tool-a',
+        role: 'tool',
+        content: '',
+        timestamp: new Date().toISOString(),
+        isExecuting: true,
+        toolResult: {
+          toolName: 'execute_command',
+          summary: '',
+          result: '',
+          success: true,
+          blocked: false,
+        },
+      };
+      const conv2Tool: AgentMessage = {
+        id: 'tool-b',
+        role: 'tool',
+        content: '',
+        timestamp: new Date().toISOString(),
+        isExecuting: true,
+        toolResult: {
+          toolName: 'subagent',
+          summary: '',
+          result: '',
+          success: true,
+          blocked: false,
+        },
+      };
+      useConversationStore.setState({
+        activeConversationId: 'conv-1',
+        messages: {
+          'conv-1': [conv1Tool],
+          'conv-2': [conv2Tool],
+        },
+      });
+      useTaskStore.setState({
+        tasks: {
+          'task-1': {
+            id: 'task-1',
+            sessionId: 's1',
+            conversationId: 'conv-1',
+            prompt: 'p',
+            mode: 'agent',
+            status: 'executing',
+            createdAt: new Date().toISOString(),
+          },
+        },
+        activeTaskId: 'task-1',
+      });
+
+      await useTaskStore.getState().stopTask('task-1');
+
+      const conv1Msg = useConversationStore.getState().messages['conv-1'][0];
+      expect(conv1Msg.toolResult?.wasAborted).toBe(true);
+      // Other conversation's in-flight card must NOT be marked aborted
+      const conv2Msg = useConversationStore.getState().messages['conv-2'][0];
+      expect(conv2Msg.isExecuting).toBe(true);
+      expect(conv2Msg.toolResult?.wasAborted).toBeUndefined();
+    });
+
+    it('cascades to running subtasks: marks, unlistens and cancels them', async () => {
+      agentStopTask.mockResolvedValue(undefined);
+      const mainTool: AgentMessage = {
+        id: 'tool-main',
+        role: 'tool',
+        content: '',
+        timestamp: new Date().toISOString(),
+        isExecuting: true,
+        toolResult: {
+          toolName: 'subagent',
+          summary: '',
+          result: '',
+          success: true,
+          blocked: false,
+        },
+      };
+      const subTool: AgentMessage = {
+        id: 'tool-sub',
+        role: 'tool',
+        content: '',
+        timestamp: new Date().toISOString(),
+        isExecuting: true,
+        toolResult: {
+          toolName: 'execute_command',
+          summary: '',
+          result: 'partial',
+          success: true,
+          blocked: false,
+        },
+      };
+      useConversationStore.setState({
+        activeConversationId: 'main-conv',
+        messages: { 'main-conv': [mainTool], 'sub-conv': [subTool] },
+      });
+      useTaskStore.setState({
+        tasks: {
+          'main-1': {
+            id: 'main-1',
+            sessionId: 's1',
+            conversationId: 'main-conv',
+            prompt: 'p',
+            mode: 'agent',
+            status: 'executing',
+            createdAt: new Date().toISOString(),
+          },
+          'sub-1': {
+            id: 'sub-1',
+            sessionId: 's1',
+            conversationId: 'sub-conv',
+            prompt: 'research',
+            mode: 'plan',
+            status: 'planning',
+            createdAt: new Date().toISOString(),
+            parentTaskId: 'main-1',
+          },
+        },
+        activeTaskId: 'main-1',
+      });
+
+      await useTaskStore.getState().stopTask('main-1');
+
+      const tasks = useTaskStore.getState().tasks;
+      expect(tasks['main-1'].status).toBe('cancelled');
+      // 子任务必须同步标记 cancelled（否则后端级联取消后 Done 事件会被
+      // 残留 listener 消费，handleDone 误标 completed）
+      expect(tasks['sub-1'].status).toBe('cancelled');
+      // 主 + 子 listener 都被清理
+      expect(cleanupTaskListenersMock).toHaveBeenCalledWith('main-1');
+      expect(cleanupTaskListenersMock).toHaveBeenCalledWith('sub-1');
+      // 子对话执行中的工具卡片也被标记中断
+      const subMsg = useConversationStore.getState().messages['sub-conv'][0];
+      expect(subMsg.toolResult?.wasAborted).toBe(true);
+    });
+
+    it('does not overwrite terminal subtask status when stopping parent', async () => {
+      agentStopTask.mockResolvedValue(undefined);
+      // 子任务已自然完成、主任务仍在等 subagent 工具结果 → 停止主任务时
+      // 子任务保持 completed，不能被误标成 cancelled。
+      useTaskStore.setState({
+        tasks: {
+          'main-1': {
+            id: 'main-1',
+            sessionId: 's1',
+            conversationId: 'main-conv',
+            prompt: 'p',
+            mode: 'agent',
+            status: 'executing',
+            createdAt: new Date().toISOString(),
+          },
+          'sub-1': {
+            id: 'sub-1',
+            sessionId: 's1',
+            conversationId: 'sub-conv',
+            prompt: 'research',
+            mode: 'plan',
+            status: 'completed',
+            createdAt: new Date().toISOString(),
+            parentTaskId: 'main-1',
+          },
+        },
+        activeTaskId: 'main-1',
+      });
+
+      await useTaskStore.getState().stopTask('main-1');
+
+      const tasks = useTaskStore.getState().tasks;
+      expect(tasks['main-1'].status).toBe('cancelled');
+      expect(tasks['sub-1'].status).toBe('completed');
+      // 已终态子任务不做 listener 清理（其 listener 早已在 done 分支卸载）
+      expect(cleanupTaskListenersMock).toHaveBeenCalledTimes(1);
+      expect(cleanupTaskListenersMock).toHaveBeenCalledWith('main-1');
+    });
+  });
+
+  describe('recordContextUsage（用量按会话落桶）', () => {
+    const ev = (promptTokens: number, usedTokens: number, window = 200_000) => ({
+      type: 'contextUsage' as const,
+      promptTokens,
+      completionTokens: 10,
+      totalTokens: promptTokens + 10,
+      contextWindow: window,
+      usedTokens,
+      estimated: false,
+      systemTokens: 100,
+      toolsTokens: 200,
+      messageTokens: usedTokens - 300,
+    });
+
+    beforeEach(() => {
+      useTaskStore.setState({ usageByConversation: {} });
+    });
+
+    it('覆盖不累加：同一会话的新事件直接替换（事件带的是后端写库后的累计值）', () => {
+      useTaskStore.getState().recordContextUsage('conv-1', ev(100, 1000));
+      useTaskStore.getState().recordContextUsage('conv-1', ev(300, 2000));
+      const entry = useTaskStore.getState().usageByConversation['conv-1'];
+      expect(entry.usage.promptTokens).toBe(300); // 不是 400
+      expect(entry.usage.lastContext?.usedTokens).toBe(2000);
+      expect(entry.windowTokens).toBe(200_000);
+    });
+
+    it('不同会话各自独立：子会话的事件不污染主会话读数', () => {
+      useTaskStore.getState().recordContextUsage('main', ev(100, 1000));
+      useTaskStore.getState().recordContextUsage('sub', ev(500, 3000, 64_000));
+      const all = useTaskStore.getState().usageByConversation;
+      expect(all['main'].usage.promptTokens).toBe(100);
+      expect(all['sub'].usage.promptTokens).toBe(500);
+      expect(all['main'].windowTokens).toBe(200_000);
+      expect(all['sub'].windowTokens).toBe(64_000);
+    });
+
+    it('折成落库形状：平的字段进 lastContext，可选字段缺失保持 undefined', () => {
+      useTaskStore.getState().recordContextUsage('conv-1', ev(100, 1000));
+      const usage = useTaskStore.getState().usageByConversation['conv-1'].usage;
+      expect(usage.reasoningTokens).toBeUndefined();
+      expect(usage.cachedReadTokens).toBeUndefined();
+      expect(usage.lastContext).toEqual({
+        usedTokens: 1000,
+        estimated: false,
+        systemTokens: 100,
+        toolsTokens: 200,
+        messageTokens: 700,
+      });
+    });
+  });
+});

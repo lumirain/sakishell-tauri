@@ -1,0 +1,308 @@
+/**
+ * agentTurnFold.ts — 已结束回合（turn）的过程折叠分段纯函数。
+ *
+ * 语义（回合过程折叠，独立于连续工具卡片的按工具名计数）：
+ * - 回合边界：user 消息是硬边界。相邻两条 user 消息之间 = 一个回合；
+ *   被 rollback / 新 user 打断的半截过程也算一个（已结束的）回合。
+ * - 已结束判定：回合内最后一条「有回复内容的纯文本 assistant」= 答案；
+ *   若回合以 tool / thinking / 空 assistant 收尾（无纯文本答案），
+ *   则这个回合**正在流 / 被打断**，不可折叠（等待后续补完）。
+ * - 只折叠「长回合」：过程 tool 消息 >= TOOL_FOLD_MIN 才默认折叠；
+ *   短回合保持展开，避免过度压缩（开关关闭时完全不折叠）。
+ * - 计数口径（只数最终答案之前）：toolCallCount = tool 消息条数；
+ *   messageCount = 有回复内容的 assistant 消息数（含 thinking/含 tool_calls）；
+ *   subagentCount = toolResult.toolName 为 subagent（或历史 task）的 tool 消息数。
+ * - 交付物豁免：成功的「交付物型」工具调用（`toolCatalog` 声明 `deliverable` 的，
+ *   现为 render_html 可视化图表）不是过程 —— 不计入 toolCallCount（也不占
+ *   TOOL_FOLD_MIN 阈值），折叠态下仍恒渲染（`TurnSegment.deliverableMembers`）；
+ *   失败 / 被拦的调用照旧算过程。
+ * - compaction 卡片 / system 消息 / user 是「不折叠锚点」：过程区不含它们。
+ * - **收尾状态优先**：回合首条 user 消息上带 `turnState`（后端在 agent loop
+ *   停止时记录并持久化的停止原因）时，只有 `completed` 允许折叠；停下来
+ *   的原因不是「模型自然结束」——用户手动停止、任务失败、崩溃留下的痕迹 ——
+ *   一律保持展开（`turnStopVetoed`）。没有记录（旧数据）则维持按形态判定。
+ *
+ * 本模块只做「分段 + 计数」，不做任何渲染/状态 —— 纯函数，便于单测。
+ */
+
+import type { AgentMessage, TurnState } from "@/lib/types";
+import { isSubagentTool } from "@/lib/toolCatalog";
+import { isDeliveredToolResult } from "@/lib/toolCallSummary";
+
+/** 已完成回合的过程 tool 消息达到该条数才默认折叠。 */
+export const TOOL_FOLD_MIN = 3;
+
+/** 折叠控制行文案里显示的最大计数（超过显示 “n+”，避免超长回合撑爆标签）。 */
+export const COUNT_CAP = 99;
+
+/** 有回复内容的 assistant：内容 / thinking / tool_calls / loading 骨架。 */
+export function hasAssistantContent(msg: AgentMessage): boolean {
+  if (msg.role !== "assistant") return false;
+  if (msg.isLoading) return true;
+  if (msg.content) return true;
+  if (msg.reasoningContent) return true;
+  if (msg.toolCall) return true;
+  if (msg.toolCalls && msg.toolCalls.length > 0) return true;
+  return false;
+}
+
+/** 纯文本答案：有回复内容的 assistant 且不含任何 tool_calls。 */
+export function isFinalAnswer(msg: AgentMessage): boolean {
+  if (msg.role !== "assistant" || msg.isLoading) return false;
+  if (!msg.content && !msg.reasoningContent) return false;
+  if (msg.toolCall) return false;
+  if (msg.toolCalls && msg.toolCalls.length > 0) return false;
+  return true;
+}
+
+export interface TurnSegment {
+  /** 稳定 key：会话内不重复即可。用首条 user 消息 id 或偏移量编码。 */
+  readonly key: string;
+  /** 回合内全部消息（含 user 开头的完整消息序列）。 */
+  readonly messages: readonly AgentMessage[];
+  /** 控制行插入位置：回合内第一条 user 之后的索引（0 = 紧跟 user）。 */
+  readonly controlIndex: number;
+  /** 最终答案在 messages 中的下标；null = 回合未结束（不可折叠）。 */
+  readonly answerIndex: number | null;
+  /** 折叠区内「可折叠成员」消息（答案之前的 tool / assistant 过程行）。 */
+  readonly foldMembers: readonly AgentMessage[];
+  /** 交付物（成功的 deliverable 工具结果，时间序子集）：折叠态也恒渲染；
+   *  展开态它们已在 foldMembers 里按时间序出现，不重复渲染。 */
+  readonly deliverableMembers: readonly AgentMessage[];
+  /** 计数（只数答案之前）。 */
+  readonly toolCallCount: number;
+  readonly messageCount: number;
+  readonly subagentCount: number;
+  /** 是否达到“长回合”阈值、可被折叠。 */
+  readonly foldable: boolean;
+}
+
+function isSubagentToolResult(msg: AgentMessage): boolean {
+  return msg.role === 'tool' && !!msg.toolResult && isSubagentTool(msg.toolResult.toolName);
+}
+
+/**
+ * 回合是否被「非正常停止」否决折叠。
+ *
+ * 判据是后端记录在**回合首条 user 消息**上的收尾状态（`messages.turn_state`，
+ * 前端 live 阶段由 stopTask / handleDone / handleError 同步写入同一字段）：
+ * - `undefined`（没有记录：旧数据、没锚定到 user 行）→ **不否决**，维持按
+ *   消息形态判定的既有行为（兼容旧会话，不清空不重置任何东西）；
+ * - `completed` → 不否决（模型自然结束，正常收起来）；
+ * - 其余（`running` / `cancelled` / `failed` / `interrupted`）→ 否决。
+ *
+ * 为什么不信消息形态：被打断的回合末条消息也常常「长得像答案」（模型在
+ * 中途输出的文本、被截断的回复），按形态判定会在用户刚按下停止的那一刻把
+ * 过程收走 —— 这层记录就是用来去掉这个猜测的。
+ */
+export function turnStopVetoed(state: TurnState | undefined): boolean {
+  return state !== undefined && state !== 'completed';
+}
+
+/**
+ * 这条消息是不是「一轮的开头」。
+ *
+ * `user` 与 `notice` 都算：`notice` 是系统替后台作业写的结算告知，它自己就是
+ * 自动继续那一轮的 prompt（后端把它落库成 role=notice，不冒充用户打的字）。
+ * 若只认 `user`，那条告知会被并进**上一轮**的尾巴 —— 上一轮的折叠判定、
+ * 答案定位、过程计数全都被它带偏。
+ */
+export function isTurnStart(message: AgentMessage): boolean {
+  return message.role === 'user' || message.role === 'notice';
+}
+
+/**
+ * 把收尾状态写到**尾回合的锚点**（该对话最后一条 user 消息）上，返回新数组。
+ *
+ * 用在 live 阶段（事件/停止动作落下时）：后端把同样的状态持久化进
+ * `messages.turn_state`，重启后由 load 路径填回同一个字段 —— 两边写的是同一
+ * 个位置（回合首条 user 消息），所以 live 与重载后的折叠判定天然一致。
+ *
+ * 找不到 user 消息（该对话没加载 / 还没发出过消息）→ 原样返回（不造空回合）。
+ *
+ * `finishedAt`（可选）：回合结束的时刻，随状态一起记在锚点上（`turnFinishedAt`，
+ * 任务用时的 live 终点）。**只在状态真的发生变化时才记**：完成信号会从两条路径
+ * 各到一次，用时以先到的那次为准；已经是该状态的回合（比如从库里载回来的）再被
+ * 叫一次，不能把「现在」当成它的结束时间。
+ */
+export function withTailTurnState(
+  messages: AgentMessage[],
+  state: TurnState,
+  finishedAt?: string,
+): AgentMessage[] {
+  let idx = -1;
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    if (isTurnStart(messages[i])) {
+      idx = i;
+      break;
+    }
+  }
+  if (idx === -1 || messages[idx].turnState === state) return messages;
+  return messages.map((m, i) =>
+    i === idx
+      ? { ...m, turnState: state, ...(finishedAt !== undefined ? { turnFinishedAt: finishedAt } : {}) }
+      : m,
+  );
+}
+
+/** 回合内所有消息（含开头的 user）。 */
+function collectTurn(
+  messages: readonly AgentMessage[],
+  start: number,
+  end: number, // exclusive
+): { turn: readonly AgentMessage[]; userIndex: number } {
+  const turn = messages.slice(start, end);
+  // user 可能不在回合最前（如 compaction 打断后新 user），取第一条 user。
+  const userIndex = turn.findIndex((m) => isTurnStart(m));
+  return { turn, userIndex };
+}
+
+function turnKey(turn: readonly AgentMessage[], start: number): string {
+  const firstUser = turn.find((m) => isTurnStart(m));
+  if (firstUser?.id) return `u:${firstUser.id}`;
+  // 兜底（理论上 user 总是存在）：用偏移量。
+  return `i:${start}`;
+}
+
+/**
+ * 把一段消息流切成「回合段」，逐段算出答案/计数/可折叠性。
+ *
+ * MSL 无 DSH 的 turn/end 事件；一个任务回合 = 一条 user 起、直到任务结束
+ * （handleDone）的连续消息。任务进行中模型会在 tool 之间输出多条纯文本
+ * assistant（每轮 LLM 调用各成一条），因此「段内最后一条纯文本 assistant」
+ * 不能当作回合结束 —— 它可能是任务中途的插话。真正的回合结束信号是
+ * **任务运行态**：`tailActive=true`（正在跑的任务的尾回合）永不折叠，
+ * 任务结束（isRunning=false，尾部收束为纯文本总结）才允许折叠。
+ *
+ * @param messages 已按时间正序排列的完整消息流（调用方负责切片窗口）。
+ * @param opts.tailActive 尾回合（最后一条 user 之后的回合）是否处于运行中
+ *   （对应 isRunning）；true 时该尾回合强制不可折叠。
+ * @returns 回合段数组（保持原顺序）。
+ *
+ * 除形态规则外，每个回合还要过一遍**收尾状态**（回合首条 user 上的
+ * `turnState`，后端在 agent loop 停止时记录并持久化）：非 `completed`
+ * 的回合不折叠 —— 见 `turnStopVetoed`。
+ */
+export function segmentTurns(
+  messages: readonly AgentMessage[],
+  opts?: { tailActive?: boolean },
+): TurnSegment[] {
+  const segments: TurnSegment[] = [];
+  const tailActive = opts?.tailActive ?? false;
+  let i = 0;
+  const n = messages.length;
+  while (i < n) {
+    if (!isTurnStart(messages[i])) {
+      // 会话可能以 system / 孤立过程消息开头（历史加载、rollback 残留）。
+      // 它们不构成回合，原样渲染、不参与折叠。
+      segments.push({
+        key: `lone:${i}`,
+        messages: [messages[i]],
+        controlIndex: 0,
+        answerIndex: null,
+        foldMembers: [],
+        deliverableMembers: [],
+        toolCallCount: 0,
+        messageCount: 0,
+        subagentCount: 0,
+        foldable: false,
+      });
+      i += 1;
+      continue;
+    }
+    // 回合 = 该 user 起到下一条 user 前（含半截被打断的过程）。
+    let j = i + 1;
+    while (j < n && !isTurnStart(messages[j])) j += 1;
+    const { turn, userIndex } = collectTurn(messages, i, j);
+    // 尾回合 = 该 user 之后没有更新的 user（回合延伸到消息流末尾）。
+    const isTail = j >= n;
+
+    // 找最后一条纯文本答案。
+    let answerIndex: number | null = null;
+    for (let k = turn.length - 1; k >= 0; k -= 1) {
+      if (isFinalAnswer(turn[k])) {
+        answerIndex = k;
+        break;
+      }
+    }
+    // 半截回合（没有纯文本答案）→ 不可折叠，原样渲染。
+    if (answerIndex === null) {
+      segments.push({
+        key: turnKey(turn, i),
+        messages: turn,
+        controlIndex: userIndex + 1,
+        answerIndex: null,
+        foldMembers: [],
+        deliverableMembers: [],
+        toolCallCount: 0,
+        messageCount: 0,
+        subagentCount: 0,
+        foldable: false,
+      });
+      i = j;
+      continue;
+    }
+
+    // 计数：只数答案之前（含答案之前的所有 process 行；答案本身不计）。
+    const before = turn.slice(0, answerIndex);
+    let toolCallCount = 0;
+    let messageCount = 0;
+    let subagentCount = 0;
+    for (const m of before) {
+      // 交付物（成功的可视化图表等）不计入过程步数 —— 它折叠态也显示。
+      if (isDeliveredToolResult(m)) continue;
+      if (m.role === "tool") {
+        toolCallCount += 1;
+        if (isSubagentToolResult(m)) subagentCount += 1;
+      } else if (hasAssistantContent(m)) {
+        messageCount += 1;
+      }
+    }
+
+    // 折叠成员 = 答案之前的 tool / assistant 过程行（user / system 除外）。
+    const foldMembers = before.filter(
+      (m) => m.role === "tool" || (m.role === "assistant" && hasAssistantContent(m)),
+    );
+    // 交付物 = 成功的 deliverable 工具结果（时间序子集），折叠态恒渲染。
+    const deliverableMembers = before.filter(isDeliveredToolResult);
+    // 任务尚未结束（尾回合且正在跑）→ 不折叠：模型可能继续输出 tool 或
+    // 更多文本，现在折叠会在任务中途把过程收走（“干一半收起”）。
+    // 过程中间夹 system（compaction 卡等永显锚点）→ 也不折叠。
+    // 收尾状态不是「正常结束」（手动停止 / 失败 / 崩溃痕迹）→ 同样不折叠。
+    const foldable = !(isTail && tailActive)
+      && toolCallCount >= TOOL_FOLD_MIN
+      && !before.some((m) => m.role === "system")
+      && !turn.some((m) => m.isExecuting || m.isLoading)
+      && !turnStopVetoed(turn[userIndex]?.turnState);
+
+    segments.push({
+      key: turnKey(turn, i),
+      messages: turn,
+      controlIndex: userIndex + 1,
+      answerIndex,
+      foldMembers,
+      deliverableMembers,
+      toolCallCount,
+      messageCount,
+      subagentCount,
+      foldable,
+    });
+    i = j;
+  }
+  return segments;
+}
+
+/** 整个回合的过程摘要：步骤与消息计数，和工具卡片分组保持独立。 */
+export function turnFoldLabel(seg: Pick<TurnSegment, 'toolCallCount' | 'messageCount' | 'subagentCount'>): string {
+  const parts = [
+    seg.toolCallCount > 0 ? `已执行 ${seg.toolCallCount} 步` : null,
+    seg.subagentCount > 0 ? `${seg.subagentCount} 个任务` : null,
+    seg.messageCount > 0 ? `共 ${seg.messageCount} 条消息` : null,
+  ].filter(Boolean);
+  return parts.length > 0 ? parts.join(' · ') : '查看过程';
+}
+
+/** 折叠/展开时的按钮文案。 */
+export function turnFoldToggleLabel(open: boolean): string {
+  return open ? "收起过程" : "查看过程";
+}

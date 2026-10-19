@@ -1,0 +1,204 @@
+//! Plugin WebView lifecycle: create, set-bounds, close.
+//!
+//! Static file serving lives in `plugin_uri.rs`; HTTP API dispatch in
+//! `plugin_api.rs`; enabled-state check in `plugins::enabled`.
+
+// Multi-webview (Window::add_child + webview reposition/close) is a
+// desktop-only capability in Tauri; on mobile these commands degrade to a
+// clear error so plugin views simply don't mount there.
+#[cfg(desktop)]
+use tauri::utils::config::Color;
+#[cfg(desktop)]
+use tauri::{LogicalPosition, LogicalSize, Manager, WebviewBuilder, WebviewUrl};
+
+#[cfg(desktop)]
+use crate::plugins::enabled::is_plugin_enabled_async;
+
+#[cfg(mobile)]
+const MOBILE_UNSUPPORTED: &str = "plugin webviews are not supported on mobile";
+
+/// 注入到所有插件配置 WebView 的深色配色 CSS 变量（与主应用 UI 配色一致）。
+/// 子 WebView 是独立文档，无法继承主应用的样式；这里把配色变量写到
+/// `<html>` 上，插件 configView 用 `var(--bg)` 等即可与主应用视觉统一，
+/// 所有插件配置界面统一受益（不是某个插件的特批）。
+/// 注意：主应用目前**没有可切换的主题系统**，这组变量是固定深色配色。
+/// 注意：initialization_script 在 DOM 解析前执行，`document.documentElement`
+/// 此时可能为 null，必须等待 DOM 就绪后再设置变量。
+const CONFIG_COLOR_SCRIPT: &str = r#"
+(() => {
+  const vars = {
+    '--bg': '#18181b',
+    '--bg-secondary': '#27272a',
+    '--bg-elevated': '#1c1c1f',
+    '--border': '#3f3f46',
+    '--border-strong': '#52525b',
+    '--text': '#f4f4f5',
+    '--text-secondary': '#a1a1aa',
+    '--text-muted': '#71717a',
+    '--accent': '#a78bfa',
+    '--accent-hover': '#c4b5fd',
+    '--radius-sm': '6px',
+    '--radius-md': '8px',
+    '--radius-lg': '12px',
+    '--radius-xl': '16px',
+    '--danger': '#f87171',
+    '--success': '#4ade80',
+    '--font': 'system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif',
+  };
+  const apply = () => {
+    const el = document.documentElement;
+    if (!el) return;
+    for (const [k, v] of Object.entries(vars)) el.style.setProperty(k, v);
+  };
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', apply);
+  } else {
+    apply();
+  }
+})();
+"#;
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginWebviewCreateParams {
+    pub label: String,
+    pub plugin_id: String,
+    pub entry: String,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+#[cfg(mobile)]
+#[tauri::command]
+pub async fn plugin_webview_create(
+    _app: tauri::AppHandle,
+    _params: PluginWebviewCreateParams,
+) -> Result<(), String> {
+    Err(MOBILE_UNSUPPORTED.to_string())
+}
+
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn plugin_webview_create(
+    app: tauri::AppHandle,
+    params: PluginWebviewCreateParams,
+) -> Result<(), String> {
+    if app.get_webview(&params.label).is_some() {
+        return Ok(());
+    }
+
+    if !is_plugin_enabled_async(&app, &params.plugin_id).await {
+        return Err(format!("plugin disabled: {}", params.plugin_id));
+    }
+
+    let window = app
+        .get_window("main")
+        .ok_or_else(|| "main window not found".to_string())?;
+
+    let url = format!("plugin://{}/{}", params.plugin_id, params.entry);
+    let webview_url = WebviewUrl::External(url::Url::parse(&url).map_err(|e| e.to_string())?);
+
+    let label_for_loaded = params.label.clone();
+    let plugin_id_for_loaded = params.plugin_id.clone();
+    let app_for_loaded = app.clone();
+    let on_page_load = move |_webview: tauri::Webview, payload: tauri::webview::PageLoadPayload| {
+        use tauri::Emitter;
+        let event_name = match payload.event() {
+            tauri::webview::PageLoadEvent::Started => "started",
+            tauri::webview::PageLoadEvent::Finished => "finished",
+        };
+        let _ = app_for_loaded.emit(
+            &format!("webview://page-load/{}", label_for_loaded),
+            serde_json::json!({
+                "pluginId": plugin_id_for_loaded,
+                "phase": event_name,
+                "url": payload.url(),
+            }),
+        );
+    };
+
+    window
+        .add_child(
+            WebviewBuilder::new(&params.label, webview_url)
+                .background_color(Color(24, 24, 27, 255))
+                .initialization_script(CONFIG_COLOR_SCRIPT)
+                .on_page_load(on_page_load),
+            LogicalPosition::new(params.x, params.y),
+            LogicalSize::new(params.width.max(1.0), params.height.max(1.0)),
+        )
+        .map_err(|e| e.to_string())?;
+
+    // Register a webview-event listener to surface crashes / navigation
+    // failures to the main window. We resolve the webview by label after
+    // it has been added to the window.
+    let label_for_evt = params.label.clone();
+    let plugin_id_for_evt = params.plugin_id.clone();
+    let app_for_evt = app.clone();
+    if let Some(webview) = app.get_webview(&params.label) {
+        webview.on_webview_event(move |event| {
+            use tauri::Emitter;
+            let event_kind = format!("{:?}", event);
+            let _ = app_for_evt.emit(
+                &format!("webview://event/{}", label_for_evt),
+                serde_json::json!({
+                    "pluginId": plugin_id_for_evt,
+                    "event": event_kind,
+                }),
+            );
+        });
+    }
+
+    Ok(())
+}
+
+#[cfg(mobile)]
+#[tauri::command]
+pub async fn plugin_webview_set_bounds(
+    _app: tauri::AppHandle,
+    _label: String,
+    _x: f64,
+    _y: f64,
+    _width: f64,
+    _height: f64,
+) -> Result<(), String> {
+    Err(MOBILE_UNSUPPORTED.to_string())
+}
+
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn plugin_webview_set_bounds(
+    app: tauri::AppHandle,
+    label: String,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> Result<(), String> {
+    let webview = app
+        .get_webview(&label)
+        .ok_or_else(|| format!("webview {} not found", label))?;
+    webview
+        .set_position(LogicalPosition::new(x, y))
+        .map_err(|e| e.to_string())?;
+    webview
+        .set_size(LogicalSize::new(width, height))
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[cfg(mobile)]
+#[tauri::command]
+pub async fn plugin_webview_close(_app: tauri::AppHandle, _label: String) -> Result<(), String> {
+    Err(MOBILE_UNSUPPORTED.to_string())
+}
+
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn plugin_webview_close(app: tauri::AppHandle, label: String) -> Result<(), String> {
+    if let Some(webview) = app.get_webview(&label) {
+        webview.close().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}

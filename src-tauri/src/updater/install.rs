@@ -1,0 +1,314 @@
+//! 平台安装动作：把「已下载并校验通过的安装包」真正装上去。
+//!
+//! 两端能力不同，这是平台决定的，不是实现取舍：
+//! - **Windows**：NSIS 支持 `/S` 静默 + `/UPDATE` 更新模式 + `/R` 装完重启，
+//!   因此可以做到「退出即自动安装」；安装只发生在应用退出之后（`RunEvent::Exit`）。
+//! - **Android**：系统不允许普通应用静默安装 APK，必须由用户在系统安装器界面
+//!   确认。因此这里只负责把 `content://` URI 交给系统安装器（`ACTION_VIEW`），
+//!   签名一致性与版本递增由系统强制校验；安装结果通过下次启动的版本比对判定
+//!   （`cleanup_update_dir` 见到 `version <= current` 即认定装成功并删包）。
+//! - **其他桌面平台**：不支持，`update_capabilities` 会关掉入口。
+
+// 平台分支各用一部分导入，按平台分别引入以免非本平台构建出现未使用警告。
+#[cfg(windows)]
+use std::path::Path;
+
+#[cfg(windows)]
+use tauri::Manager;
+
+use tauri::AppHandle;
+
+use super::PendingInstall;
+#[cfg(windows)]
+use super::UpdaterState;
+
+use crate::error::AppError;
+
+/// 应用退出时安装（Windows 专用）。
+///
+/// 用 ping 延迟约 2 秒再运行安装器，确保主进程完全退出、NSIS 的
+/// `CheckIfAppIsRunning` 不会撞上退出中的进程（该宏在 silent 模式下会直接
+/// kill 残留进程，属于兜底而非正常路径）。`/R` 让安装器装完自动启动应用，
+/// 实现「立即重启更新」的自动重开。
+///
+/// **更新方式门控**：「关闭」模式下不做自动安装 —— 用户明确表示不要自动更新，
+/// 退出瞬间静默装上是最让人措手不及的一种。用户点过「立即安装」的手动请求
+/// （`manual_install_requested`）照装。
+#[cfg(windows)]
+pub(super) fn install_on_exit(app: &AppHandle) {
+    let Some(state) = app.try_state::<UpdaterState>() else {
+        return;
+    };
+    let (pending, restart) = {
+        let Ok(mut inner) = state.0.lock() else {
+            return;
+        };
+        // 先判定该不该装、再 take pending：跳过安装时必须把 pending 留着，
+        // 下次启动 `cleanup_update_dir` 才能把包恢复成「已就绪」，用户仍可
+        // 在设置页手动装（take 走了就变成包白下载一场空）。
+        if !inner.manual_install_requested && !auto_install_allowed(app) {
+            if let Some(p) = &inner.pending {
+                log::info!(
+                    "更新方式为「关闭」，跳过退出时自动安装 v{}（安装包保留，可在设置页手动安装）",
+                    p.version
+                );
+            }
+            return;
+        }
+        let Some(pending) = inner.pending.take() else {
+            return;
+        };
+        (pending, inner.restart_after_install)
+    };
+    log::info!(
+        "应用退出，静默安装更新 v{}（重启应用: {}）: {}",
+        pending.version,
+        restart,
+        pending.installer_path.display()
+    );
+    if !pending.installer_path.is_file() {
+        // 安装包已被系统清理（见 `mod.rs` 的 `reset_stale_ready`）：拉安装器只会
+        // 静默失败，干脆不拉；过期的 pending.json 由下次启动的清理逻辑删掉。
+        log::warn!(
+            "待装安装包已不在磁盘上，跳过退出安装: {}",
+            pending.installer_path.display()
+        );
+        return;
+    }
+    spawn_installer(&pending.installer_path, restart);
+}
+
+/// 退出时是否允许自动安装。读不到设置时按「允许」处理：这是门控引入前的
+/// 行为，宁可照旧也不要静默吞掉用户期待的更新（此时 pending 来自一次
+/// 正常完成的自动下载）。
+#[cfg(windows)]
+fn auto_install_allowed(app: &AppHandle) -> bool {
+    let Some(state) = app.try_state::<crate::AppState>() else {
+        return true;
+    };
+    // 先落到局部变量：直接把 match 当尾表达式会让读锁守卫活到函数末尾，
+    // 与 `state` 的析构顺序冲突（E0597）。
+    let mode = match state.settings.try_read() {
+        Ok(settings) => settings.update_mode,
+        Err(_) => return true,
+    };
+    mode != crate::config::settings::UpdateMode::Off
+}
+
+/// 「立即安装」：Windows 记录重启标记后退出应用（真正安装由退出钩子完成）；
+/// Android 直接把已下载的 APK 交给系统安装器。
+pub(super) fn launch_now(
+    app: &AppHandle,
+    pending: &PendingInstall,
+    restart_after_install: bool,
+) -> Result<(), AppError> {
+    #[cfg(windows)]
+    {
+        log::info!(
+            "用户请求立即安装 v{}，退出并交由安装器处理: {}",
+            pending.version,
+            pending.installer_path.display()
+        );
+        let state = app.state::<UpdaterState>();
+        {
+            let mut inner = state
+                .0
+                .lock()
+                .map_err(|_| AppError::Other("更新器状态被占用".into()))?;
+            inner.restart_after_install = restart_after_install;
+        }
+        // 退出阻塞在事件循环里，退出钩子会接管安装。
+        app.exit(0);
+        Ok(())
+    }
+    #[cfg(target_os = "android")]
+    {
+        let _ = app;
+        let _ = restart_after_install; // 安卓安装完由系统重启应用
+        let path = pending
+            .installer_path
+            .to_str()
+            .ok_or_else(|| AppError::Other("安装包路径无效".into()))?;
+        android::install_apk(path)
+    }
+    #[cfg(not(any(windows, target_os = "android")))]
+    {
+        let _ = (app, pending, restart_after_install);
+        Err(AppError::Other(
+            "当前平台不支持后台自动更新，请前往下载页手动安装".into(),
+        ))
+    }
+}
+
+/// 当前网络是否允许自动下载（Android 只在非计量网络下自动下载，避免在移动
+/// 数据上静默消耗几十 MB；手动触发不受此限制）。
+///
+/// 查询失败时按「计量网络」处理并告警：误自动下载会让用户花流量，而不自动
+/// 下载只是少了个便利，用户仍可手动触发。
+#[cfg(target_os = "android")]
+pub(super) fn is_unmetered_network() -> bool {
+    match android::call_activity("networkMetered", None) {
+        Ok(status) => status == "unmetered",
+        Err(e) => {
+            log::warn!("网络计量状态查询失败，按计量网络处理（不自动下载）: {}", e);
+            false
+        }
+    }
+}
+
+/// 调用 MainActivity 上的原生方法（`notify` 的通知投递走这里）。
+/// 与 `is_unmetered_network` 同一条 JNI 通道，签名约束见 `android::call_activity`。
+#[cfg(target_os = "android")]
+pub(super) fn call_native(method: &str, arg: Option<&str>) -> Result<String, String> {
+    android::call_activity(method, arg)
+}
+
+/// 非 Android 平台没有流量概念。
+#[cfg(not(target_os = "android"))]
+pub(super) fn is_unmetered_network() -> bool {
+    true
+}
+
+// ── Windows ─────────────────────────────────────────────────────
+
+#[cfg(windows)]
+fn spawn_installer(installer_path: &Path, restart_after_install: bool) {
+    use std::os::windows::process::CommandExt as _;
+    use std::process::Command;
+
+    // CREATE_NO_WINDOW：隐藏 cmd 与安装器的任何残余 UI
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    // /R 仅在用户主动点「立即安装」时带上：装完自动启动应用。
+    // 自然退出不带 —— 安装完窗口自己弹出来反而打扰。
+    let restart_flag = if restart_after_install { " /R" } else { "" };
+    // 安装包路径**不拼进命令文本**：cmd 在双引号内照样做 `%VAR%` 展开，路径里
+    // 带 `%` 形态时（例如缓存目录恰好被包进 %USERPROFILE% 之类的字面包裹，或
+    // 用户名/目录名本身就含 %NAME%）会被静默换成别的路径。改成经环境变量传递：
+    // 展开只发生一次，变量值里的 `%` 不会再被解释。
+    let script = format!(
+        "ping -n 3 127.0.0.1 >nul & \"%MARCEL_UPDATE_INSTALLER%\" /S{} /UPDATE",
+        restart_flag
+    );
+    // 必须用 raw_arg：arg() 会把内部引号转义成 \"，而 cmd 不认反斜杠转义，
+    // 会把 \"C:\...exe\" 整段当作命令名（真机实测踩过：静默失败无任何提示）。
+    let result = Command::new("cmd")
+        .arg("/C")
+        .env("MARCEL_UPDATE_INSTALLER", installer_path.as_os_str())
+        .raw_arg(&script)
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn();
+    if let Err(e) = result {
+        // 安装器拉不起来：放弃本次（pending 已消费，下次启动重新检查下载）
+        log::warn!("启动静默安装器失败: {}", e);
+    }
+}
+
+// ── Android ─────────────────────────────────────────────────────
+
+#[cfg(target_os = "android")]
+mod android {
+    use jni::objects::{JObject, JString, JValue};
+    use jni::JNIEnv;
+
+    use crate::error::AppError;
+
+    /// 调用 MainActivity 上的原生方法（见 `gen/android/.../MainActivity.kt`）。
+    ///
+    /// 与 `util.rs` 的 content URI 查询同一套惯用法：JNI 失败一律返回 Err，
+    /// 不 panic、不留 pending exception（留着会让后续 JNI 调用处于非法状态）。
+    /// 入参/返回都用字符串，避免每个方法各写一套签名。
+    pub(super) fn call_activity(method: &str, arg: Option<&str>) -> Result<String, String> {
+        let ctx = ndk_context::android_context();
+        let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }
+            .map_err(|e| format!("获取 JavaVM 失败: {}", e))?;
+        let mut guard = vm
+            .attach_current_thread()
+            .map_err(|e| format!("attach JVM 线程失败: {}", e))?;
+        let env: &mut JNIEnv = &mut guard;
+        let activity = unsafe { JObject::from_raw(ctx.context() as jni::sys::jobject) };
+
+        // 闭包内完成「调用 + 取出字符串」，避免把 JNI 局部引用（JString）带出
+        // 闭包 —— 它的生命周期绑定在本次 JNI 调用上。
+        let call = |env: &mut JNIEnv| -> jni::errors::Result<String> {
+            let returned: JObject = match arg {
+                Some(value) => {
+                    let jarg: JObject = env.new_string(value)?.into();
+                    env.call_method(
+                        &activity,
+                        method,
+                        "(Ljava/lang/String;)Ljava/lang/String;",
+                        &[JValue::Object(&jarg)],
+                    )?
+                    .l()?
+                }
+                None => env
+                    .call_method(&activity, method, "()Ljava/lang/String;", &[])?
+                    .l()?,
+            };
+            let jstr = JString::from(returned);
+            env.get_string(&jstr)
+                .map(|s| s.to_string_lossy().into_owned())
+        };
+
+        match call(env) {
+            Ok(value) => Ok(value),
+            Err(e) => {
+                // 先取异常详情再清除：异常内容（类名 + message）是定位「方法不
+                // 存在」这类问题的唯一线索，直接丢掉就只剩 jni crate 那句笼统的
+                // "Java exception was thrown"（v1.4.1 的 release 包「立即安装」
+                // 失败就是这么被挡住的 —— 真因是 R8 把方法整个裁掉了）。
+                let detail = take_pending_exception(env);
+                // 兜底：上面提前返回（拿不到 throwable）时异常可能还挂着，
+                // pending exception 必须清掉，否则后续 JNI 调用处于非法状态。
+                let _ = env.exception_clear();
+                Err(match detail {
+                    Some(text) => format!("调用原生方法 {} 失败: {}（{}）", method, text, e),
+                    None => format!("调用原生方法 {} 失败: {}", method, e),
+                })
+            }
+        }
+    }
+
+    /// 读取 pending exception 的 `toString()`，形如
+    /// `java.lang.NoSuchMethodError: no non-static method
+    /// "Lcom/marcel/ssh/MainActivity;.installUpdateApk(Ljava/lang/String;)Ljava/lang/String;"`。
+    ///
+    /// 顺序不能颠倒：存在 pending exception 时 JNI 只允许调用极少数函数（取异常、
+    /// 清异常等），所以必须先用 `exception_occurred()` 拿到 throwable 引用、再
+    /// `exception_clear()` 清掉异常，之后才能安全地对它调 `toString()`。
+    /// 取不到（本来就没有异常 / 中途失败）时返回 None，由调用方回落到原错误文本。
+    fn take_pending_exception(env: &mut JNIEnv) -> Option<String> {
+        let throwable = env.exception_occurred().ok()?;
+        if throwable.is_null() {
+            return None;
+        }
+        env.exception_clear().ok()?;
+        let text = env
+            .call_method(&throwable, "toString", "()Ljava/lang/String;", &[])
+            .ok()?
+            .l()
+            .ok()?;
+        let text = JString::from(text);
+        env.get_string(&text)
+            .ok()
+            .map(|s| s.to_string_lossy().into_owned())
+    }
+
+    /// 把已下载的 APK 交给系统安装器。
+    ///
+    /// Kotlin 侧返回状态字符串，这里翻译成用户能看懂的错误：
+    /// - `started`：已拉起系统安装界面（用户在系统界面确认安装）；
+    /// - `need_permission`：尚未允许「安装未知应用」，Kotlin 已顺带打开授权页；
+    /// - 其他：异常信息。
+    pub(super) fn install_apk(path: &str) -> Result<(), AppError> {
+        match call_activity("installUpdateApk", Some(path)) {
+            Ok(status) if status == "started" => Ok(()),
+            Ok(status) if status == "need_permission" => Err(AppError::Other(
+                "需要先允许「安装未知应用」，已为你打开设置页；授权后返回再点一次「立即安装」"
+                    .into(),
+            )),
+            Ok(other) => Err(AppError::Other(format!("拉起系统安装器失败: {}", other))),
+            Err(e) => Err(AppError::Other(format!("拉起系统安装器失败: {}", e))),
+        }
+    }
+}

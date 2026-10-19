@@ -1,0 +1,61 @@
+# Dependencies（pnpm-lock.yaml 必须入库：CI 用 --frozen-lockfile 校验，发版构建也靠它复现）
+node_modules/
+
+# Build outputs
+dist/
+
+# 日志（构建与调试产物，不入仓库）
+*.log
+
+# Rust
+src-tauri/target/
+# 并行 review/agent 用的独立构建目录（与主 target/ 分离，不抢锁）
+src-tauri/target-zcode/
+
+# IDE
+AGENTS.md
+.agents/
+.vscode/
+.idea/
+.workbuddy/
+.zcode/
+.trae/*
+!.trae/skills/
+!.trae/skills/release/
+!.trae/skills/release/SKILL.md
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+
+# Python (sync server)
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 同步服务端运行时产物
+server/config.toml
+server/data/
+
+# 官网
+website/
+
+# 沙箱测试环境（本机实验用，不入仓库）
+sandbox-test/
+
+# 本地 scratch（visualize 卡片等临时产物，不入仓库）
+viz/
+
+# 本地调试产物（repro 脚本、review diff 等，不入仓库）
+scratch/
+
+.workbuddy/
+promo/

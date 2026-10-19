@@ -1,0 +1,496 @@
+import { create } from "zustand";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import type { Session, ConnectionConfig } from "@/lib/types";
+import * as tauri from "@/lib/tauri";
+import { getErrorMessage } from "@/lib/errors";
+import { formatConnLabel } from "@/lib/privacy";
+import { DEBUG_SERVER_ID, isDebugConnection, isDebugSession } from "@/lib/debugServer";
+import { useSettingsStore } from "./settingsStore";
+import { terminalInstanceManager } from "@/components/terminal/TerminalInstanceManager";
+
+interface SessionState {
+  sessions: Record<string, Session>;
+  activeSessionId: string | null;
+
+  connectDebugServer: () => string;
+  connect: (config: ConnectionConfig) => Promise<string>;
+  connectWithSavedPassword: (
+    connectionId: string,
+    connLabel: string,
+    trustNewHostKey?: boolean,
+  ) => Promise<string>;
+  connectWithSavedPassphrase: (
+    connectionId: string,
+    connLabel: string,
+    trustNewHostKey?: boolean,
+  ) => Promise<string>;
+  reconnect: (sessionId: string, trustNewHostKey?: boolean) => Promise<void>;
+  disconnect: (sessionId: string) => Promise<void>;
+  setActiveSession: (sessionId: string | null) => void;
+  getActiveSession: () => Session | null;
+  updateSessionStatus: (
+    sessionId: string,
+    status: Session["status"],
+    errorMessage?: string,
+  ) => void;
+}
+
+/**
+ * 连接失败会留下一个 `status: "error"` 的会话——**这是有意的**：失败详情就打在它的
+ * 终端横幅里，用户要靠它看清原因，所以不能失败即删。
+ *
+ * 但同一条连接重试会一摞摞攒出同名的"连接失败"标签（点一次连接可能试两次：先用
+ * 已存的凭证、再不带凭证试一次），只能手动一个个关。所以重试时**复用**那条已有的
+ * 失败会话槽位，而不是再开一个新的。
+ */
+function failedSessionIdFor(
+  sessions: Record<string, Session>,
+  connectionId: string | undefined,
+): string | null {
+  if (!connectionId) return null;
+  const found = Object.values(sessions).find(
+    (s) => s.configId === connectionId && s.status === "error",
+  );
+  return found?.id ?? null;
+}
+
+/**
+ * 挑一个放本次连接的会话槽位：复用同一条连接的失败槽位，否则新开。
+ * 复用时要清掉横幅的"已显示过"标记，否则第二次失败的原因不会出现在终端里。
+ */
+function allocateSessionSlot(
+  sessions: Record<string, Session>,
+  connectionId: string | undefined,
+): string {
+  const reused = failedSessionIdFor(sessions, connectionId);
+  if (!reused) return crypto.randomUUID();
+  terminalInstanceManager.prepareReconnect(reused);
+  return reused;
+}
+
+export const useSessionStore = create<SessionState>((set, get) => ({
+  sessions: {},
+  activeSessionId: null,
+
+  connectDebugServer: () => {
+    const existing = Object.values(get().sessions).find((session) =>
+      isDebugSession(session.id),
+    );
+    if (existing) {
+      set({ activeSessionId: existing.id });
+      return existing.id;
+    }
+
+    const sessionId = `debug-session:${crypto.randomUUID()}`;
+    const session: Session = {
+      id: sessionId,
+      connectionId: "msfakeserver",
+      configId: DEBUG_SERVER_ID,
+      status: "connected",
+      createdAt: new Date().toISOString(),
+    };
+    set((state) => ({
+      sessions: { ...state.sessions, [sessionId]: session },
+      activeSessionId: sessionId,
+    }));
+    return sessionId;
+  },
+
+  connect: async (config: ConnectionConfig) => {
+    if (isDebugConnection(config.connectionId)) return get().connectDebugServer();
+    const tempId = allocateSessionSlot(get().sessions, config.connectionId);
+    const privacyMode =
+      useSettingsStore.getState().settings.privacyMode ?? false;
+    const connLabel = formatConnLabel(
+      config.username,
+      config.host,
+      config.port,
+      privacyMode,
+    );
+    const session: Session = {
+      id: tempId,
+      connectionId: connLabel,
+      status: "connecting",
+      createdAt: new Date().toISOString(),
+      configId: config.connectionId,
+    };
+
+    set((state) => ({
+      sessions: { ...state.sessions, [tempId]: session },
+      activeSessionId: tempId,
+    }));
+
+    try {
+      const sessionId = await tauri.sshConnect(config);
+
+      set((state) => {
+        const updated = { ...state.sessions };
+        delete updated[tempId];
+        updated[sessionId] = {
+          ...session,
+          id: sessionId,
+          status: "connected",
+        };
+        return { sessions: updated, activeSessionId: sessionId };
+      });
+      await attachSessionStatusListener(sessionId);
+      await reconcileSessionSnapshot(sessionId);
+
+      return sessionId;
+    } catch (err) {
+      const errorMessage = getErrorMessage(err);
+      set((state) => {
+        const updated = { ...state.sessions };
+        const existing = updated[tempId];
+        if (existing) {
+          updated[tempId] = { ...existing, status: "error", errorMessage };
+        }
+        return { sessions: updated };
+      });
+      throw err;
+    }
+  },
+
+  connectWithSavedPassword: async (
+    connectionId: string,
+    connLabel: string,
+    trustNewHostKey = false,
+  ) => {
+    if (isDebugConnection(connectionId)) return get().connectDebugServer();
+    const tempId = allocateSessionSlot(get().sessions, connectionId);
+    const session: Session = {
+      id: tempId,
+      connectionId: connLabel,
+      status: "connecting",
+      createdAt: new Date().toISOString(),
+      configId: connectionId,
+    };
+
+    set((state) => ({
+      sessions: { ...state.sessions, [tempId]: session },
+      activeSessionId: tempId,
+    }));
+
+    try {
+      const sessionId = await tauri.connectWithSavedPassword(
+        connectionId,
+        trustNewHostKey,
+      );
+
+      set((state) => {
+        const updated = { ...state.sessions };
+        delete updated[tempId];
+        updated[sessionId] = {
+          ...session,
+          id: sessionId,
+          status: "connected",
+        };
+        return { sessions: updated, activeSessionId: sessionId };
+      });
+      await attachSessionStatusListener(sessionId);
+      await reconcileSessionSnapshot(sessionId);
+
+      return sessionId;
+    } catch (err) {
+      const errorMessage = getErrorMessage(err);
+      set((state) => {
+        const updated = { ...state.sessions };
+        const existing = updated[tempId];
+        if (existing) {
+          updated[tempId] = { ...existing, status: "error", errorMessage };
+        }
+        return { sessions: updated };
+      });
+      throw err;
+    }
+  },
+
+  connectWithSavedPassphrase: async (
+    connectionId: string,
+    connLabel: string,
+    trustNewHostKey = false,
+  ) => {
+    if (isDebugConnection(connectionId)) return get().connectDebugServer();
+    const tempId = allocateSessionSlot(get().sessions, connectionId);
+    const session: Session = {
+      id: tempId,
+      connectionId: connLabel,
+      status: "connecting",
+      createdAt: new Date().toISOString(),
+      configId: connectionId,
+    };
+
+    set((state) => ({
+      sessions: { ...state.sessions, [tempId]: session },
+      activeSessionId: tempId,
+    }));
+
+    try {
+      const sessionId = await tauri.connectWithSavedPassphrase(
+        connectionId,
+        trustNewHostKey,
+      );
+
+      set((state) => {
+        const updated = { ...state.sessions };
+        delete updated[tempId];
+        updated[sessionId] = {
+          ...session,
+          id: sessionId,
+          status: "connected",
+        };
+        return { sessions: updated, activeSessionId: sessionId };
+      });
+      await attachSessionStatusListener(sessionId);
+      await reconcileSessionSnapshot(sessionId);
+
+      return sessionId;
+    } catch (err) {
+      const errorMessage = getErrorMessage(err);
+      set((state) => {
+        const updated = { ...state.sessions };
+        const existing = updated[tempId];
+        if (existing) {
+          updated[tempId] = { ...existing, status: "error", errorMessage };
+        }
+        return { sessions: updated };
+      });
+      throw err;
+    }
+  },
+
+  reconnect: async (sessionId: string, trustNewHostKey = false) => {
+    const session = get().sessions[sessionId];
+    if (!session) {
+      throw new Error(`会话不存在: ${sessionId}`);
+    }
+    if (isDebugSession(sessionId)) {
+      terminalInstanceManager.onReconnected(sessionId);
+      set((state) => ({
+        sessions: {
+          ...state.sessions,
+          [sessionId]: { ...session, status: "connected", errorMessage: undefined },
+        },
+      }));
+      return;
+    }
+    const connectionId = session.configId;
+    if (!connectionId) {
+      throw new Error("临时连接无法自动重连，请去侧边栏重新连接");
+    }
+
+    set((state) => ({
+      sessions: {
+        ...state.sessions,
+        [sessionId]: {
+          ...state.sessions[sessionId],
+          status: "connecting",
+          errorMessage: undefined,
+        },
+      },
+    }));
+    // Allow a new failure banner if reconnect fails; keep stdin disabled
+    terminalInstanceManager.prepareReconnect(sessionId);
+
+    try {
+      await tauri.sshReconnect(sessionId, connectionId, trustNewHostKey);
+      await attachSessionStatusListener(sessionId);
+      await reconcileSessionSnapshot(sessionId);
+      terminalInstanceManager.onReconnected(sessionId);
+      set((state) => {
+        const existing = state.sessions[sessionId];
+        if (!existing) return state;
+        return {
+          sessions: {
+            ...state.sessions,
+            [sessionId]: {
+              ...existing,
+              status: "connected",
+              errorMessage: undefined,
+            },
+          },
+        };
+      });
+    } catch (err) {
+      const errorMessage = getErrorMessage(err);
+      set((state) => {
+        const existing = state.sessions[sessionId];
+        if (!existing) return state;
+        return {
+          sessions: {
+            ...state.sessions,
+            [sessionId]: { ...existing, status: "error", errorMessage },
+          },
+        };
+      });
+      // Connect failed before a live session — still show banner + disable stdin
+      terminalInstanceManager.showDisconnectBanner(
+        sessionId,
+        "error",
+        errorMessage,
+      );
+      throw err;
+    }
+  },
+
+  disconnect: async (sessionId: string) => {
+    set((state) => {
+      const updated = { ...state.sessions };
+      delete updated[sessionId];
+      const remainingIds = Object.keys(updated);
+      const nextActiveId =
+        state.activeSessionId === sessionId
+          ? (remainingIds[remainingIds.length - 1] ?? null)
+          : state.activeSessionId;
+      return { sessions: updated, activeSessionId: nextActiveId };
+    });
+    if (isDebugSession(sessionId)) return;
+    try {
+      await tauri.sshDisconnect(sessionId);
+    } catch (err) {
+      console.warn("Disconnect error (session may already be closed):", err);
+    }
+  },
+
+  setActiveSession: (sessionId: string | null) => {
+    set({ activeSessionId: sessionId });
+  },
+
+  getActiveSession: () => {
+    const { sessions, activeSessionId } = get();
+    if (!activeSessionId) return null;
+    return sessions[activeSessionId] ?? null;
+  },
+
+  updateSessionStatus: (
+    sessionId: string,
+    status: Session["status"],
+    errorMessage?: string,
+  ) => {
+    const session = get().sessions[sessionId];
+    if (!session) return;
+
+    const prev = session.status;
+    // Side effects outside set(); banner is idempotent via disconnectBannerShown
+    if (status === "disconnected" && prev !== "disconnected") {
+      const reason = errorMessage?.trim() || "连接已关闭";
+      const kind = reason === "已主动断开连接" ? "manual" : "disconnected";
+      terminalInstanceManager.showDisconnectBanner(sessionId, kind, reason);
+    } else if (status === "error" && prev !== "error") {
+      terminalInstanceManager.showDisconnectBanner(
+        sessionId,
+        "error",
+        errorMessage?.trim() || "未知错误",
+      );
+    } else if (status === "connected" && prev !== "connected") {
+      terminalInstanceManager.onReconnected(sessionId);
+    } else if (status === "connecting") {
+      terminalInstanceManager.setStdinEnabled(sessionId, false);
+    }
+
+    set((state) => {
+      const current = state.sessions[sessionId];
+      if (!current) return state;
+      return {
+        sessions: {
+          ...state.sessions,
+          [sessionId]: {
+            ...current,
+            status,
+            errorMessage:
+              status === "error" || status === "disconnected"
+                ? errorMessage
+                : undefined,
+          },
+        },
+      };
+    });
+  },
+}));
+
+/**
+ * Track active backend status listeners so we don't double-subscribe.
+ */
+const statusListeners: Map<string, UnlistenFn> = new Map();
+
+function parseStatusPayload(
+  payload: unknown,
+): { status: Session["status"]; reason?: string } | null {
+  // Legacy plain strings
+  if (payload === "connected") return { status: "connected" };
+  if (payload === "disconnected")
+    return { status: "disconnected", reason: "连接已关闭" };
+
+  if (typeof payload !== "object" || payload === null) return null;
+  const obj = payload as Record<string, unknown>;
+
+  // serde externally-tagged: { "disconnected": { "reason": "..." } }
+  if ("disconnected" in obj) {
+    const inner = obj.disconnected;
+    if (typeof inner === "object" && inner !== null) {
+      const reason = (inner as Record<string, unknown>).reason;
+      return {
+        status: "disconnected",
+        reason:
+          typeof reason === "string" && reason.trim() ? reason : "连接已关闭",
+      };
+    }
+    return { status: "disconnected", reason: "连接已关闭" };
+  }
+
+  // { "error": "..." }  (tuple variant Error(String))
+  if ("error" in obj) {
+    const errorMessage =
+      typeof obj.error === "string" && obj.error.trim()
+        ? obj.error
+        : "未知错误";
+    return { status: "error", reason: errorMessage };
+  }
+
+  // { "connected": null } or just nested form
+  if ("connected" in obj) return { status: "connected" };
+
+  return null;
+}
+
+async function reconcileSessionSnapshot(sessionId: string) {
+  const active = await tauri.sshListSessions();
+  if (!active.includes(sessionId)) {
+    useSessionStore
+      .getState()
+      .updateSessionStatus(sessionId, "disconnected", "连接已关闭");
+    const unlisten = statusListeners.get(sessionId);
+    unlisten?.();
+    statusListeners.delete(sessionId);
+  }
+}
+
+async function attachSessionStatusListener(sessionId: string) {
+  if (statusListeners.has(sessionId)) return;
+
+  const unlisten = await listen<unknown>(
+    `ssh://status/${sessionId}`,
+    (event) => {
+      const parsed = parseStatusPayload(event.payload);
+      if (!parsed) return;
+      const store = useSessionStore.getState();
+      if (parsed.status === "connected") {
+        store.updateSessionStatus(sessionId, "connected");
+      } else if (parsed.status === "disconnected") {
+        // 任务不在这里收尾：后端断连观察者已按会话级联停止它们（与停止按钮同一
+        // 套语义，见 `agent::manager::stop_task_cascade`），界面由那条
+        // `StreamEvent::Cancelled` → `handleCancelled` 落定；主动断开那一侧走的是
+        // `sessionConversationBindingManager.onSessionDisconnected` 的本地收尾。
+        store.updateSessionStatus(sessionId, "disconnected", parsed.reason);
+        const fn = statusListeners.get(sessionId);
+        if (fn) {
+          fn();
+          statusListeners.delete(sessionId);
+        }
+      } else if (parsed.status === "error") {
+        store.updateSessionStatus(sessionId, "error", parsed.reason);
+      }
+    },
+  );
+  statusListeners.set(sessionId, unlisten);
+}

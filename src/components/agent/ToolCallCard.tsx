@@ -1,0 +1,478 @@
+import { memo, useState, useEffect, useRef, useCallback } from 'react';
+import type { AgentMessage } from '@/lib/types';
+import FileChangeView from './FileChangeView';
+import LiveOutputPanel from './LiveOutputPanel';
+import TransientReveal from './TransientReveal';
+import { useConversationStore } from '@/stores/conversationStore';
+import { useSettingsStore } from '@/stores/settingsStore';
+import { readWebToolStatus, webToolChips, webToolDetails, webToolNotice } from '@/lib/webToolStatus';
+import {
+  asArgString,
+  fileChangeToolName,
+  isSubagentTool,
+  toolDisplayName,
+  toolPreview,
+  toolSpec,
+} from '@/lib/toolCatalog';
+// 卡片骨架（容器 + 标题行）与图标/小标记是共用的：「系统告知」卡用的是同一副
+// 壳（见 `jobNoticeCard`），样式只留这一份。
+import { ToolCardFrame, ToolChip } from './toolCardChrome';
+import { useMessageViewState } from './messageViewState';
+
+interface Props {
+  message: AgentMessage;
+  autoExpand?: boolean;
+  /** Stable id for parent expand tracking (avoids inline closures). */
+  messageId?: string;
+  onExpandChange?: (messageId: string, expanded: boolean) => void;
+}
+
+/** 打开 subagent 工具对应的子agent对话（查看完整调研过程）。 */
+function openSubConversation(metadata: Record<string, unknown> | undefined) {
+  const convId = metadata?.subConversationId;
+  if (typeof convId === 'string' && convId) {
+    void useConversationStore.getState().switchConversation(convId);
+  }
+}
+
+/**
+ * 审批判定的来源标注：哪个引擎判的、把握多大。
+ *
+ * 只做展示，不改变任何判定结果。置信度写「分布集中度」而不是「可信度」——
+ * 官方对 Jev 的 `confidence` 定义是概率分布的集中程度，不是这次判定正确的
+ * 概率，更不构成执行许可。措辞写错会让用户以为自己看到了准确率。
+ */
+function ApprovalMeta({
+  engine,
+  confidence,
+}: {
+  engine?: 'model' | 'jev';
+  confidence?: number;
+}) {
+  const isJev = engine === 'jev';
+  if (!isJev && confidence === undefined) return null;
+  return (
+    <div className="flex items-center gap-2 text-[11px] text-zinc-500 mb-0.5">
+      {isJev && (
+        <span className="rounded bg-zinc-700/60 px-1.5 py-px text-zinc-300">
+          Jev 判定
+        </span>
+      )}
+      {confidence !== undefined && (
+        <span
+          className="tabular-nums"
+          title="Jev 的置信度表示概率分布的集中程度（分布越集中越高），不是判定正确的概率，也不代表这条命令可以执行。"
+        >
+          分布集中度 {Math.round(confidence * 100)}%
+        </span>
+      )}
+    </div>
+  );
+}
+
+function ToolCallCard({ message, autoExpand, messageId, onExpandChange }: Props) {
+  const [expanded, setExpanded] = useMessageViewState('tool-expanded', autoExpand ?? false);
+  const previousAutoExpand = useRef(autoExpand);
+  const wasExecutingRef = useRef(message.isExecuting);
+  const onExpandChangeRef = useRef(onExpandChange);
+  const lastNotifiedExpandedRef = useRef<boolean | null>(null);
+  const expandNotifyId = messageId ?? message.id;
+  // 真实命令超时来自用户设置（后端 command_timeout_secs），不是模型传参。
+  const commandTimeoutSecs = useSettingsStore((s) => s.settings.commandTimeoutSecs);
+  // 多机操控：可操作机器集合大小（勾选的服务器数量）。目标机器指示器的
+  // 名字截断上限随集合增大而收紧——服务器越多，单条指示器占的宽度预算越小，
+  // 避免名字/徽标把卡片标题行顶满。
+  const multiHostCount = useSettingsStore(
+    (s) => s.settings.experimentalSettings?.multiHostConnectionIds?.length ?? 0,
+  );
+  // 卡片实际宽度（ResizeObserver 观察卡片根容器）：Agent 面板可拖拽，面板窄
+  // → 卡片窄 → 目标机器指示器截断上限进一步收紧，避免在窄面板里顶掉标题行。
+  // 用 callback ref 而非 useContainerWidth——ToolCallCard 的 toolResult 分支
+  // 是条件渲染，静态 ref 首次为空时 observer 不会建立。
+  // React 18 语义：callback ref 返回 cleanup 不生效；卸载时 React 以 null 再调
+  // 一次 callback ref，故在 null 分支 disconnect（React 19 兼容同样成立）。
+  const [cardWidth, setCardWidth] = useState(0);
+  const cardObserverRef = useRef<ResizeObserver | null>(null);
+  const cardRefCb = useCallback((node: HTMLDivElement | null) => {
+    if (!node) {
+      cardObserverRef.current?.disconnect();
+      cardObserverRef.current = null;
+      return;
+    }
+    const update = () => setCardWidth(node.clientWidth);
+    update();
+    cardObserverRef.current?.disconnect();
+    const ro = new ResizeObserver(update);
+    cardObserverRef.current = ro;
+    ro.observe(node);
+  }, []);
+
+  onExpandChangeRef.current = onExpandChange;
+
+  // Notify parent only when expanded actually changes (not on every parent re-render).
+  useEffect(() => {
+    if (lastNotifiedExpandedRef.current === expanded) return;
+    lastNotifiedExpandedRef.current = expanded;
+    onExpandChangeRef.current?.(expandNotifyId, expanded);
+  }, [expanded, expandNotifyId]);
+
+  useEffect(() => {
+    // Remounting an offscreen row must not undo the user's saved expansion.
+    if (previousAutoExpand.current !== autoExpand) setExpanded(!!autoExpand);
+    previousAutoExpand.current = autoExpand;
+  }, [autoExpand, setExpanded]);
+
+  // Auto-collapse when execution completes (transition true→false)
+  useEffect(() => {
+    const was = wasExecutingRef.current;
+    wasExecutingRef.current = message.isExecuting;
+    if (was && !message.isExecuting) {
+      setExpanded(false);
+    }
+  }, [message.isExecuting, setExpanded]);
+
+  // Handle tool result messages (from stored history or live stream)
+  if (message.toolResult) {
+    const tr = message.toolResult;
+    const { display: displayName } = toolDisplayName(tr.toolName);
+    const preview = toolPreview(tr.toolName, tr.arguments) || tr.summary;
+    // 参数主体是文件改动的工具展开后渲染 diff；不认识的工具回退原始输出。
+    const fileChangeTool = fileChangeToolName(tr.toolName);
+    const isExecuting = message.isExecuting;
+    const hasOutput = !!tr.result;
+    // 多机操控：目标机器归属。优先用结果 metadata 的权威 targetHostLabel
+    // （后端解析 host→会话后回填，含消歧后缀）；执行中 metadata 尚未回填，
+    // 从工具调用参数 `host` 读取——发起调用时模型已带上目标机器，执行中
+    // 卡片即显示将/正在运行在哪台机器（并发派发多机 subagent 时可区分）。
+    const metaHost =
+      tr.metadata && typeof (tr.metadata as Record<string, unknown>).targetHostLabel === 'string'
+        ? ((tr.metadata as Record<string, unknown>).targetHostLabel as string)
+        : '';
+    // host 参数仅对支持多机目标的工具（bash/execute_command/upload_file/
+    // download_file/subagent/task）有意义；其他工具即使误传也忽略。
+    const argHost =
+      asArgString((tr.arguments as Record<string, unknown> | undefined)?.host) ?? '';
+    const targetHost = metaHost || argHost;
+    // 截断上限 = min(绝对上限 10, 机器集合因子, 卡片宽度因子)，且不低于下限。
+    // - 集合因子：勾选服务器越多越收紧（120/count：5 台=24 但被 10 封顶，
+    //   13 台=9、15+ 台=8）——服务器多时单条指示器宽度预算小；
+    // - 宽度因子：Agent 面板可拖拽，卡片窄时进一步收紧（cardWidth/60：
+    //   600px=10、360px=6、240px=4）——窄面板里不能顶掉标题行；
+    // - 下限 4：极窄也保留可辨识前缀（hover 有全名）。
+    const MAX_HOST_CHARS_BASE = 10;
+    const MIN_HOST_CHARS = 4;
+    // cardWidth===0 表示尚未测量（首次渲染 RO 未回调）：宽度因子不限制，
+    // 避免首帧按 0 宽过度收紧后闪跳回正常长度。
+    const widthFactor =
+      cardWidth > 0 ? Math.floor(cardWidth / 60) : MAX_HOST_CHARS_BASE;
+    const collectionFactor = multiHostCount > 0 ? Math.floor(120 / multiHostCount) : MAX_HOST_CHARS_BASE;
+    const hostCharLimit = Math.max(
+      MIN_HOST_CHARS,
+      Math.min(MAX_HOST_CHARS_BASE, widthFactor, collectionFactor),
+    );
+    // 按码点截断（机器名可能含中文/emoji——slice 会切坏代理对）。
+    const hostChars = Array.from(targetHost);
+    const displayHost =
+      hostChars.length > hostCharLimit
+        ? `${hostChars.slice(0, hostCharLimit).join('')}…`
+        : targetHost;
+    // 子 agent 读写模式标注（subagent metadata.mode === "agent"）
+    const subMode =
+      isSubagentTool(tr.toolName) && tr.metadata &&
+      (tr.metadata as Record<string, unknown>).mode === 'agent'
+        ? '读写'
+        : '';
+    // 子agent 模型：用户配置候选后主 agent 可经 model 参数选型。执行中读参数
+    // `model`（与 host chip 同理，发起时模型已写明）；结束后用 metadata 的
+    // modelLabel —— 那是 spawn 解析后真实落地的模型（选错回落时不说谎）。
+    // 两处读取都按工具名收口：只有 subagent 族会在 metadata 里写 modelLabel。
+    const subMetaModel =
+      isSubagentTool(tr.toolName) && tr.metadata &&
+      typeof (tr.metadata as Record<string, unknown>).modelLabel === 'string'
+        ? ((tr.metadata as Record<string, unknown>).modelLabel as string)
+        : '';
+    const argModel =
+      isSubagentTool(tr.toolName)
+        ? asArgString((tr.arguments as Record<string, unknown> | undefined)?.model) ?? ''
+        : '';
+    const subModel = subMetaModel || argModel;
+    // 联网工具（web_search / http_get）：本次用的是哪个后端、有没有降级、页面
+    // 是否被网站的人机验证拦下。旧会话没有这些字段 → status 为 null，界面不变。
+    const webStatus = readWebToolStatus(
+      tr.toolName, tr.metadata, !isExecuting && !tr.blocked ? tr.success : undefined,
+    );
+    const webChips = webStatus ? webToolChips(webStatus) : [];
+    const webNotice = webStatus ? webToolNotice(webStatus) : null;
+    const webDetails = webStatus ? webToolDetails(webStatus) : [];
+
+    return (
+      <ToolCardFrame
+        containerRef={cardRefCb}
+        composing={message.isExecuting ? !!message.isComposing : undefined}
+        toolName={tr.toolName}
+        label={displayName}
+        tone={tr.blocked ? 'danger' : tr.wasTimeout || tr.wasAborted ? 'warning' : 'default'}
+        busy={isExecuting}
+        expanded={expanded}
+        onToggle={() => !isExecuting && setExpanded((v) => !v)}
+        chips={
+          <>
+            {targetHost && (
+              <ToolChip
+                title={`目标机器：${targetHost}`}
+                className="flex items-center gap-1 max-w-[160px]"
+                shrinkable
+              >
+                <svg className="w-3 h-3 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 12h14M12 5l7 7-7 7" />
+                </svg>
+                <span className="truncate">{displayHost}</span>
+              </ToolChip>
+            )}
+            {subMode && <ToolChip>读写子agent</ToolChip>}
+            {subModel && (
+              <ToolChip
+                title={`子agent 模型：${subModel}`}
+                className="flex items-center gap-1 max-w-[140px]"
+                shrinkable
+              >
+                <svg className="w-3 h-3 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <rect x="7" y="7" width="10" height="10" rx="1.5" />
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 3v2M14 3v2M10 19v2M14 19v2M3 10h2M3 14h2M19 10h2M19 14h2" />
+                </svg>
+                <span className="truncate">{subModel}</span>
+              </ToolChip>
+            )}
+            {webChips.map((chip) => (
+              <ToolChip key={chip.key} tone={chip.tone} title={chip.title}>
+                {chip.label}
+              </ToolChip>
+            ))}
+          </>
+        }
+        preview={preview}
+        trailing={
+          <>
+            {tr.blocked && (
+              <span className="flex-shrink-0 text-xs text-red-400 font-medium">已阻止</span>
+            )}
+            {!tr.blocked && tr.wasAborted && (
+              <span className="flex-shrink-0 text-xs text-amber-400 font-medium">已中断</span>
+            )}
+            {!tr.blocked && !tr.wasAborted && tr.wasTimeout && (
+              <span className="flex-shrink-0 text-xs text-amber-400 font-medium">超时</span>
+            )}
+          </>
+        }
+      >
+        {/* 运行中的 subagent 卡片：提供"查看"入口跳转子对话（实时调研过程） */}
+        {isSubagentTool(tr.toolName) && isExecuting && (
+          (() => {
+            const meta = tr.metadata as Record<string, unknown> | undefined;
+            const subConvId = meta?.subConversationId;
+            if (typeof subConvId !== 'string' || !subConvId) return null;
+            return (
+              <button
+                type="button"
+                onClick={() => openSubConversation(meta)}
+                className="group/task w-full ml-3 border-l border-zinc-700/50 pl-3 pr-1.5 py-1.5 text-left transition-colors"
+              >
+                <span className="flex items-center gap-1.5 text-xs font-medium text-sky-400 group-hover/task:text-sky-300">
+                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
+                  </svg>
+                  查看实时调研过程 →
+                </span>
+              </button>
+            );
+          })()
+        )}
+        {/* Model approval phase — distinct from execution progress */}
+        <TransientReveal show={message.modelApproval?.status === 'checking'}>
+          <div className="ml-3 border-l border-zinc-700/50 pl-3 pr-1.5 py-1.5">
+            <div className="flex items-center gap-2 text-xs text-indigo-400">
+              <svg className="animate-spin h-3 w-3 flex-shrink-0" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+              </svg>
+              <span>模型审批中…</span>
+            </div>
+          </div>
+        </TransientReveal>
+        {message.modelApproval?.status === 'done' && message.modelApproval.decision === 'route_to_human' && (
+          <div className="ml-3 border-l border-zinc-700/50 pl-3 pr-1.5 py-1.5">
+            <div className="text-xs text-amber-400 font-medium mb-0.5">模型建议人工审批</div>
+            <ApprovalMeta
+              engine={message.modelApproval.engine}
+              confidence={message.modelApproval.confidence}
+            />
+            {message.modelApproval.reasons && message.modelApproval.reasons.length > 0 && (
+              <ul className="text-xs text-amber-300/80 space-y-0.5 list-disc list-inside">
+                {message.modelApproval.reasons.map((r, i) => <li key={i}>{r}</li>)}
+              </ul>
+            )}
+          </div>
+        )}
+        {message.modelApproval?.status === 'done' && message.modelApproval.decision === 'block' && (
+          <div className="ml-3 border-l border-zinc-700/50 pl-3 pr-1.5 py-1.5">
+            <div className="text-xs text-red-400 font-medium mb-0.5">模型阻止</div>
+            <ApprovalMeta
+              engine={message.modelApproval.engine}
+              confidence={message.modelApproval.confidence}
+            />
+            {message.modelApproval.reasons && message.modelApproval.reasons.length > 0 && (
+              <ul className="text-xs text-red-300/80 space-y-0.5 list-disc list-inside">
+                {message.modelApproval.reasons.map((r, i) => <li key={i}>{r}</li>)}
+              </ul>
+            )}
+          </div>
+        )}
+        {/* 联网工具的异常说明：被网站拦截 / 无正文。
+            放在正文之前，先解释「发生了什么」再看内容，避免用户把验证页正文
+            当成真实页面。正常情况不渲染，不占版面。 */}
+        {webNotice && !isExecuting && (
+          <div className="ml-3 border-l border-zinc-700/50 pl-3 pr-1.5 py-2">
+            <div
+              className={`rounded-lg border px-3 py-2 ${
+                webNotice.tone === 'danger'
+                  ? 'border-red-700/60 bg-red-950/40'
+                  : 'border-amber-700/60 bg-amber-950/40'
+              }`}
+            >
+              <div
+                className={`text-xs font-medium mb-0.5 ${
+                  webNotice.tone === 'danger' ? 'text-red-300' : 'text-amber-300'
+                }`}
+              >
+                {webNotice.title}
+              </div>
+              <ul
+                className={`text-xs space-y-0.5 list-disc list-inside ${
+                  webNotice.tone === 'danger' ? 'text-red-200/90' : 'text-amber-200/90'
+                }`}
+              >
+                {webNotice.lines.map((line, i) => (
+                  <li key={i} className="break-all">{line}</li>
+                ))}
+              </ul>
+            </div>
+          </div>
+        )}
+        {expanded && !isExecuting && webDetails.length > 0 && (
+          <details className="ml-3 border-l border-zinc-700/50 pl-3 pr-1.5 text-xs text-zinc-400">
+            <summary className="min-h-11 py-3 cursor-pointer rounded-sm hover:text-zinc-300 active:text-zinc-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-indigo-400 touch-manipulation">
+              获取详情
+            </summary>
+            <div className="pb-3 space-y-1 leading-relaxed">
+              {webDetails.map((line, i) => <p key={i} className="break-words [overflow-wrap:anywhere]">{line}</p>)}
+            </div>
+          </details>
+        )}
+        {/* 执行中的实时输出：连续有输出满 400ms 才露出，高度长出来；命令结束后收回去
+            再卸载。不能条件渲染——那样第一行输出一到整块瞬间顶出来、结束又瞬间消失，
+            快命令就是「弹起来又突然没了」。 */}
+        <TransientReveal show={!!isExecuting && hasOutput}>
+          <LiveOutputPanel text={tr.result || ''} executing={!!isExecuting} />
+        </TransientReveal>
+        {expanded && !isExecuting && (
+          tr.success && fileChangeTool ? (
+            <FileChangeView toolName={fileChangeTool} arguments={tr.arguments || {}} metadata={tr.metadata} />
+          ) : (
+            <div className="min-w-0 ml-3 border-l border-zinc-700/50 pl-3 pr-1.5 py-1.5">
+              {isSubagentTool(tr.toolName) && tr.success && (
+                <button
+                  onClick={() => openSubConversation(tr.metadata)}
+                  className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-sky-400 hover:text-sky-300 transition-colors"
+                >
+                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
+                  </svg>
+                  查看完整调研过程 →
+                </button>
+              )}
+              <pre className="text-xs text-zinc-400 whitespace-pre max-h-64 max-w-full overflow-x-auto overflow-y-auto font-mono leading-relaxed">
+                {tr.result || 'no output'}
+              </pre>
+            </div>
+          )
+        )}
+      </ToolCardFrame>
+    );
+  }
+
+  // Handle assistant messages with toolCall (live streaming tool call info)
+  if (message.toolCall) {
+    const tc = message.toolCall;
+    const { display: displayName } = toolDisplayName(tc.name);
+    const preview = toolPreview(tc.name, tc.arguments);
+    const timeoutSecs = toolSpec(tc.name)?.payload === 'command' ? commandTimeoutSecs : 0;
+    // 多机操控：发起瞬间即显示目标机器（参数 host）。此分支无结果 metadata，
+    // 只能从参数读；真正执行/完成后由 toolResult 分支的权威 label 接管。
+    const tcHost =
+      asArgString((tc.arguments as Record<string, unknown> | undefined)?.host) ?? '';
+    // 子agent 模型：发起瞬间即显示（参数 model）；完成后由 metadata.modelLabel
+    // 的权威值接管（含选错回落情形）。
+    const tcModel =
+      isSubagentTool(tc.name)
+        ? asArgString((tc.arguments as Record<string, unknown> | undefined)?.model) ?? ''
+        : '';
+    // 按码点截断（机器名可能含中文/emoji）；tooltip 给全名。
+    const tcHostChars = Array.from(tcHost);
+    const tcDisplayHost =
+      tcHostChars.length > 12 ? `${tcHostChars.slice(0, 12).join('')}…` : tcHost;
+
+    return (
+      <ToolCardFrame
+        toolName={tc.name}
+        label={displayName}
+        preview={preview}
+        busy={message.isExecuting}
+        chips={
+          <>
+            {tcHost && (
+              <ToolChip
+                title={`目标机器：${tcHost}`}
+                className="flex items-center gap-1 max-w-[160px]"
+                shrinkable
+              >
+                <svg className="w-3 h-3 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 12h14M12 5l7 7-7 7" />
+                </svg>
+                <span className="truncate">{tcDisplayHost}</span>
+              </ToolChip>
+            )}
+            {tcModel && (
+              <ToolChip
+                title={`子agent 模型：${tcModel}`}
+                className="flex items-center gap-1 max-w-[140px]"
+                shrinkable
+              >
+                <svg className="w-3 h-3 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <rect x="7" y="7" width="10" height="10" rx="1.5" />
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 3v2M14 3v2M10 19v2M14 19v2M3 10h2M3 14h2M19 10h2M19 14h2" />
+                </svg>
+                <span className="truncate">{tcModel}</span>
+              </ToolChip>
+            )}
+          </>
+        }
+        trailing={
+            timeoutSecs > 0 && (
+              <span className="flex items-center gap-1 flex-shrink-0 text-xs text-amber-400">
+                <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+                {timeoutSecs}s
+              </span>
+            )
+        }
+      />
+    );
+  }
+
+  return null;
+}
+
+export default memo(ToolCallCard);

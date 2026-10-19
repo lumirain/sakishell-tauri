@@ -1,0 +1,395 @@
+import { beforeEach, describe, it, expect, vi } from 'vitest';
+import { useSettingsStore } from '@/stores/settingsStore';
+import type { AppSettings } from '@/lib/types';
+
+vi.mock('@/lib/tauri', () => ({
+  getSettings: vi.fn(),
+  saveSettings: vi.fn(),
+}));
+
+describe('settingsStore', () => {
+  beforeEach(() => {
+    useSettingsStore.setState({
+      settings: useSettingsStore.getInitialState().settings,
+      loaded: false,
+      hasApiKey: false,
+      hasWebSearchApiKey: false,
+      hasDeepseekToolsApiKey: false,
+      hasCustomSearchApiKey: false,
+      hasCustomFetchApiKey: false,
+      hasTavilyFetchApiKey: false,
+      hasJevApiKey: false,
+      preview: null,
+    });
+  });
+
+  it('has correct default settings', () => {
+    const s = useSettingsStore.getState().settings;
+    expect(s.fontSize).toBe(14);
+    expect(s.defaultAgentMode).toBe('agent');
+    expect(s.panelHeight).toBe(256);
+    expect(s.fileManagerShowHidden).toBe(false);
+    expect(s.fileManagerPath).toBe('/');
+    expect(s.fileManagerPaths).toEqual({});
+    expect(s.fileManagerTreeWidth).toBe(200);
+    expect(s.fileManagerTreeUserHidden).toBe(false);
+    expect(s.folderUploadCompressionLevel).toBe(6);
+    expect(s.hideThinkingDisplay).toBe(false);
+    expect(s.privacyMode).toBe(false);
+    expect(s.workspaceLayout).toEqual({
+      sidebarBaseWidth: 280,
+      agentBaseWidth: 460,
+      terminalBaseWidth: 460,
+      sidebarOpen: true,
+      agentOpen: true,
+      agentPrimary: false,
+    });
+  });
+
+  it('default agent mode settings are correct', () => {
+    const am = useSettingsStore.getState().settings.agentModeSettings;
+    expect(am.listMode).toBe('denylist');
+    expect(am.commandList).toContain('rm');
+    expect(am.confirmEachCommand).toBe(true);
+    expect(am.planModeRequiresApproval).toBe(false);
+    expect(am.enableModelCommandApproval).toBe(false);
+    expect(am.modelApprovalPrompt).toBe('');
+    expect(am.confirmEditFile).toBe(true);
+  });
+
+  it('default llm registry is empty (channels/models/slots)', () => {
+    const r = useSettingsStore.getState().settings.llmRegistry;
+    expect(r).toBeDefined();
+    expect(r.channels).toEqual([]);
+    expect(r.models).toEqual([]);
+    expect(r.slots).toEqual({
+      modelApprovalModelId: '',
+      summarizerModelId: '',
+    });
+    expect(r.lastUsedModelId).toBeUndefined();
+  });
+
+  it('normalizes a partial llmRegistry (missing fields get defaults)', () => {
+    useSettingsStore.getState().hydrateFromBootstrap({
+      settings: {
+        ...useSettingsStore.getState().settings,
+        llmRegistry: {
+          channels: [],
+          models: [],
+          // slots 缺失 → 默认空槽位（兼容旧数据）
+        } as never,
+      },
+      hasApiKey: false,
+      hasWebSearchApiKey: false,
+      hasDeepseekToolsApiKey: false,
+      hasCustomSearchApiKey: false,
+      hasCustomFetchApiKey: false,
+      hasTavilyFetchApiKey: false,
+      hasJevApiKey: false,
+    });
+    const r = useSettingsStore.getState().settings.llmRegistry;
+    expect(r.slots).toEqual({
+      modelApprovalModelId: '',
+      summarizerModelId: '',
+    });
+  });
+
+  it('normalizeRegistry dedupes same-id model entries on hydrate (heal old bug)', () => {
+    const ch = { id: 'ch-1', name: '默认渠道', baseUrl: 'https://x/v1', enabled: true };
+    const m = {
+      id: 'm-1',
+      channelId: 'ch-1',
+      modelName: 'gemini-3.7-flash',
+      displayName: '',
+      temperature: 0.1,
+      vision: false,
+      contextWindow: 0,
+      extraBody: null,
+      reasoningEfforts: [],
+    };
+    // 历史「保存渠道」合并 bug 的产物：同 id 两条
+    useSettingsStore.getState().hydrateFromBootstrap({
+      settings: {
+        ...useSettingsStore.getState().settings,
+        llmRegistry: {
+          channels: [ch],
+          models: [m, { ...m }],
+          slots: { modelApprovalModelId: '', summarizerModelId: '' },
+        } as never,
+      },
+      hasApiKey: false,
+      hasWebSearchApiKey: false,
+      hasDeepseekToolsApiKey: false,
+      hasCustomSearchApiKey: false,
+      hasCustomFetchApiKey: false,
+      hasTavilyFetchApiKey: false,
+      hasJevApiKey: false,
+    });
+    const models = useSettingsStore.getState().settings.llmRegistry.models;
+    expect(models).toHaveLength(1);
+    expect(models[0].id).toBe('m-1');
+  });
+
+  it('hydrate preserves a valid lastUsedModelId (global last-used survives restart)', () => {
+    const ch = { id: 'ch-1', name: '默认渠道', baseUrl: 'https://x/v1', enabled: true };
+    const m = {
+      id: 'm-1',
+      channelId: 'ch-1',
+      modelName: 'gemini-3.7-flash',
+      displayName: '',
+      temperature: 0.1,
+      vision: false,
+      contextWindow: 0,
+      extraBody: null,
+      reasoningEfforts: [],
+    };
+    useSettingsStore.getState().hydrateFromBootstrap({
+      settings: {
+        ...useSettingsStore.getState().settings,
+        llmRegistry: {
+          channels: [ch],
+          models: [m],
+          slots: { modelApprovalModelId: '', summarizerModelId: '' },
+          lastUsedModelId: 'm-1',
+        } as never,
+      },
+      hasApiKey: false,
+      hasWebSearchApiKey: false,
+      hasDeepseekToolsApiKey: false,
+      hasCustomSearchApiKey: false,
+      hasCustomFetchApiKey: false,
+      hasTavilyFetchApiKey: false,
+      hasJevApiKey: false,
+    });
+    expect(useSettingsStore.getState().settings.llmRegistry.lastUsedModelId).toBe('m-1');
+  });
+
+  it('hydrate drops a dangling lastUsedModelId (points to deleted model)', () => {
+    const ch = { id: 'ch-1', name: '默认渠道', baseUrl: 'https://x/v1', enabled: true };
+    const m = {
+      id: 'm-1',
+      channelId: 'ch-1',
+      modelName: 'gemini-3.7-flash',
+      displayName: '',
+      temperature: 0.1,
+      vision: false,
+      contextWindow: 0,
+      extraBody: null,
+      reasoningEfforts: [],
+    };
+    useSettingsStore.getState().hydrateFromBootstrap({
+      settings: {
+        ...useSettingsStore.getState().settings,
+        llmRegistry: {
+          channels: [ch],
+          models: [m],
+          slots: { modelApprovalModelId: '', summarizerModelId: '' },
+          lastUsedModelId: 'ghost-deleted-model',
+        } as never,
+      },
+      hasApiKey: false,
+      hasWebSearchApiKey: false,
+      hasDeepseekToolsApiKey: false,
+      hasCustomSearchApiKey: false,
+      hasCustomFetchApiKey: false,
+      hasTavilyFetchApiKey: false,
+      hasJevApiKey: false,
+    });
+    expect(useSettingsStore.getState().settings.llmRegistry.lastUsedModelId).toBeUndefined();
+  });
+
+  it('default experimental settings are correct', () => {
+    const es = useSettingsStore.getState().settings.experimentalSettings;
+    expect(es).toBeDefined();
+    expect(es?.enableWebSearch).toBe(true);
+    expect(es?.enableHttpFetch).toBe(true);
+    expect(es?.enableCloudPage).toBe(false);
+    expect(es?.webSearchMode).toBe('browser');
+    expect(es?.webSearchApiProvider).toBe('brave');
+    expect(es?.webSearchEndpoint).toBe('cn');
+    expect(es?.httpFetchMode).toBe('browser');
+  });
+
+
+
+  it('default terminal colors are defined', () => {
+    const c = useSettingsStore.getState().settings.terminalColors;
+    expect(c.background).toBeTruthy();
+    expect(c.foreground).toBeTruthy();
+    expect(c.red).toBeTruthy();
+  });
+
+  it('setPreview updates preview state', () => {
+    useSettingsStore.getState().setPreview({ fontSize: 18 });
+    expect(useSettingsStore.getState().preview).toEqual({ fontSize: 18 });
+  });
+
+  it('clearPreview clears preview state', () => {
+    useSettingsStore.getState().setPreview({ fontSize: 18 });
+    useSettingsStore.getState().clearPreview();
+    expect(useSettingsStore.getState().preview).toBeNull();
+  });
+
+  it('warning starts null and clearWarning is idempotent', () => {
+    expect(useSettingsStore.getState().warning).toBeNull();
+    useSettingsStore.setState({ warning: 'something went wrong' });
+    expect(useSettingsStore.getState().warning).toBe('something went wrong');
+    useSettingsStore.getState().clearWarning();
+    expect(useSettingsStore.getState().warning).toBeNull();
+  });
+
+  it('disabledPlugins defaults to empty array', () => {
+    expect(useSettingsStore.getState().settings.disabledPlugins).toEqual([]);
+  });
+
+  it('disabledPlugins survives setState round-trip', () => {
+    useSettingsStore.setState({
+      settings: { ...useSettingsStore.getState().settings, disabledPlugins: ['a', 'b'] },
+    });
+    expect(useSettingsStore.getState().settings.disabledPlugins).toEqual(['a', 'b']);
+  });
+
+  it('hydrates from bootstrap snapshot correctly', () => {
+    useSettingsStore.getState().hydrateFromBootstrap({
+      settings: {
+        ...useSettingsStore.getState().settings,
+        fontSize: 18,
+      },
+      hasApiKey: true,
+      hasWebSearchApiKey: false,
+      hasDeepseekToolsApiKey: false,
+      hasCustomSearchApiKey: false,
+      hasCustomFetchApiKey: false,
+      hasTavilyFetchApiKey: false,
+      hasJevApiKey: false,
+      warning: 'test-warning',
+    });
+
+    const state = useSettingsStore.getState();
+    expect(state.loaded).toBe(true);
+    expect(state.hasApiKey).toBe(true);
+    expect(state.settings.fontSize).toBe(18);
+    expect(state.warning).toBe('test-warning');
+  });
+
+  it('审批引擎默认是 model 引擎，且不预设 Jev 型号与根地址', () => {
+    const am = useSettingsStore.getState().settings.agentModeSettings;
+    expect(am.commandApprovalEngine).toBe('model');
+    expect(am.jevModelId).toBe('');
+    expect(am.jevBaseUrl).toBe('');
+    expect(am.jevApprovalPrompt).toBe('');
+  });
+
+  /**
+   * 「兼容旧数据 = 保持原样」在前端这一层的硬护栏。
+   *
+   * 旧 settings.json 里没有审批引擎这三个键。一旦这里被误判成 Jev，用户会在
+   * 毫无察觉的情况下把所有 bash 审批切到一个他还没配 Key 的引擎上——而且旧配置
+   * 里的 chat 提示词会被当成 Jev 判据，判定质量静默劣化。
+   */
+  it('旧配置缺审批引擎字段时落回 model，其余字段原样保留', () => {
+    const legacyAgent = {
+      listMode: 'denylist',
+      commandList: ['rm'],
+      confirmEachCommand: true,
+      enableModelCommandApproval: true,
+      modelApprovalPrompt: '老提示词',
+      systemPrompt: '',
+      maxToolRounds: 500,
+      contextWindow: 0,
+      confirmEditFile: true,
+      // 刻意不含 commandApprovalEngine / jevModelId / jevApprovalPrompt
+    } as unknown as AppSettings['agentModeSettings'];
+
+    useSettingsStore.getState().hydrateFromBootstrap({
+      settings: {
+        ...useSettingsStore.getState().settings,
+        agentModeSettings: legacyAgent,
+      },
+      hasApiKey: false,
+      hasWebSearchApiKey: false,
+      hasDeepseekToolsApiKey: false,
+      hasCustomSearchApiKey: false,
+      hasCustomFetchApiKey: false,
+      hasTavilyFetchApiKey: false,
+      hasJevApiKey: false,
+    });
+
+    const am = useSettingsStore.getState().settings.agentModeSettings;
+    expect(am.commandApprovalEngine).toBe('model');
+    expect(am.jevModelId).toBe('');
+    expect(am.jevBaseUrl).toBe('');
+    expect(am.jevApprovalPrompt).toBe('');
+    // 旧字段一个都没被新字段挤掉。
+    expect(am.enableModelCommandApproval).toBe(true);
+    expect(am.modelApprovalPrompt).toBe('老提示词');
+    expect(am.commandList).toEqual(['rm']);
+  });
+
+  it('自定义根地址在 hydrate 后保留（不能被默认值覆盖回空）', () => {
+    useSettingsStore.getState().hydrateFromBootstrap({
+      settings: {
+        ...useSettingsStore.getState().settings,
+        agentModeSettings: {
+          ...useSettingsStore.getState().settings.agentModeSettings,
+          enableModelCommandApproval: true,
+          commandApprovalEngine: 'jev',
+          jevBaseUrl: 'https://jev-gw.corp.example.com',
+        },
+      },
+      hasApiKey: false,
+      hasWebSearchApiKey: false,
+      hasDeepseekToolsApiKey: false,
+      hasCustomSearchApiKey: false,
+      hasCustomFetchApiKey: false,
+      hasTavilyFetchApiKey: false,
+      hasJevApiKey: false,
+    });
+    expect(
+      useSettingsStore.getState().settings.agentModeSettings.jevBaseUrl,
+    ).toBe('https://jev-gw.corp.example.com');
+  });
+
+  it('已配置的 Jev 引擎与型号在 hydrate 后保留', () => {
+    useSettingsStore.getState().hydrateFromBootstrap({
+      settings: {
+        ...useSettingsStore.getState().settings,
+        agentModeSettings: {
+          ...useSettingsStore.getState().settings.agentModeSettings,
+          enableModelCommandApproval: true,
+          commandApprovalEngine: 'jev',
+          jevModelId: 'jev-1.13.0',
+          jevApprovalPrompt: '我的判据',
+        },
+      },
+      hasApiKey: false,
+      hasWebSearchApiKey: false,
+      hasDeepseekToolsApiKey: false,
+      hasCustomSearchApiKey: false,
+      hasCustomFetchApiKey: false,
+      hasTavilyFetchApiKey: false,
+      hasJevApiKey: true,
+    });
+
+    const state = useSettingsStore.getState();
+    const am = state.settings.agentModeSettings;
+    expect(am.commandApprovalEngine).toBe('jev');
+    expect(am.jevModelId).toBe('jev-1.13.0');
+    expect(am.jevApprovalPrompt).toBe('我的判据');
+    expect(state.hasJevApiKey).toBe(true);
+  });
+
+  it('启动快照说没配 Key 时，store 如实反映（不乐观推断）', () => {
+    useSettingsStore.getState().hydrateFromBootstrap({
+      settings: useSettingsStore.getState().settings,
+      hasApiKey: false,
+      hasWebSearchApiKey: false,
+      hasDeepseekToolsApiKey: false,
+      hasCustomSearchApiKey: false,
+      hasCustomFetchApiKey: false,
+      hasTavilyFetchApiKey: false,
+      hasJevApiKey: false,
+    });
+    expect(useSettingsStore.getState().hasJevApiKey).toBe(false);
+  });
+});

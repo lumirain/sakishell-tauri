@@ -1,0 +1,995 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { writeText } from "@tauri-apps/plugin-clipboard-manager";
+import { ArrowUp, ChevronDown, Plus, Square, X } from "lucide-react";
+import { Pencil, Pin, Trash2 } from "lucide-react";
+import { useAgent } from "@/hooks/useAgent";
+import { useAgentAttachments } from "@/hooks/useAgentAttachments";
+import { useAgentDraftActions } from "@/hooks/useAgentDraftActions";
+import { EMPTY_DRAFT, useAgentDraftStore } from "@/stores/agentDraftStore";
+import DraftAttachments from "@/components/agent/DraftAttachments";
+import { useTaskStore } from "@/stores/taskStore";
+import { useJobStore } from "@/stores/jobStore";
+import { getConversationAgentStatus, taskCenterEntry } from "@/stores/agentStatusSelectors";
+import { AgentStatusIndicator } from "@/components/agent/AgentStatusIndicator";
+import MobileActiveAgentsSheet from "./MobileActiveAgentsSheet";
+import { useAnimatedPresence } from "@/hooks/useAnimatedPresence";
+import { useConnectionStore } from "@/stores/connectionStore";
+import { useSessionStore } from "@/stores/sessionStore";
+import {
+  useConversationStore,
+  conversationIsBusy,
+} from "@/stores/conversationStore";
+import { sessionConversationBindingManager } from "@/stores/sessionConversationBindingManager";
+import { groupConversationsWithPinned } from "@/lib/dateGrouping";
+import { getErrorMessage } from "@/lib/errors";
+import {
+  canOpenCommandMenu,
+  compactingSelectorOf,
+  deriveSubAgentDispatch,
+} from "@/lib/agentPanelDerived";
+import { AGENT_MODES } from "@/lib/constants";
+import { currentVision } from "@/lib/llmRegistry";
+import { useSettingsStore } from "@/stores/settingsStore";
+import type { AgentMessage, AgentMode } from "@/lib/types";
+import AgentTranscript from "@/components/agent/AgentTranscript";
+import { AgentDraft, AgentTextarea } from "@/components/agent/AgentDraft";
+import { isCommandDraft } from "@/components/agent/agentCommandEntries";
+import PlanList from "@/components/agent/PlanList";
+import AgentCommandMenu from "@/components/agent/AgentCommandMenu";
+import { ContextMeterRing } from "@/components/agent/ContextMeterRing";
+import { TokenUsagePanel } from "@/components/agent/TokenUsagePanel";
+import { contextMeterView, formatPercent } from "@/lib/tokenUsage";
+import { ReasoningEffortPicker } from "@/components/agent/ReasoningEffortPicker";
+import {
+  DEBUG_REASONING_EFFORTS,
+  useDebugStore,
+} from "@/stores/debugStore";
+import { effectiveModel, modelLabel, modelReasoningEfforts } from "@/lib/llmRegistry";
+import { registerBackHandler } from "./backHandler";
+import MobileApprovalSheet from "./MobileApprovalSheet";
+import MobileQuestionSheet from "./MobileQuestionSheet";
+import MobileChatHistorySheet from "./MobileChatHistorySheet";
+import MobileMultiHostPicker from "./MobileMultiHostPicker";
+import MobileSheet from "./ui/MobileSheet";
+import {
+  agentEmptyStateReason,
+  canSendAgentPrompt,
+  resolveAgentIds,
+  type AgentEmptyStateReason,
+} from "./agentUi";
+import { resolveSessionDisplayName, sessionStatusLabel } from "./sessionUi";
+
+interface MobileAgentHostProps {
+  /** When false, host stays mounted but hidden (tab keep-alive). */
+  visible?: boolean;
+}
+
+const EMPTY_STATE_COPY: Record<
+  Exclude<AgentEmptyStateReason, "ready">,
+  { title: string; body: string }
+> = {
+  "no-session": {
+    title: "未选择会话",
+    body: "请先在终端页连接 SSH 服务器。",
+  },
+  connecting: {
+    title: "正在连接…",
+    body: "连接完成后可使用智能助手。",
+  },
+  disconnected: {
+    title: "连接已断开",
+    body: "请在终端页重新连接后再使用。",
+  },
+  error: {
+    title: "连接失败",
+    body: "请在终端页检查连接后重试。",
+  },
+  "no-config": {
+    title: "无法使用助手",
+    body: "当前会话未绑定已保存连接，请从连接列表重新连接。",
+  },
+};
+
+export default function MobileAgentHost({
+  visible = true,
+}: MobileAgentHostProps) {
+  const activeSession = useSessionStore((s) => {
+    const id = s.activeSessionId;
+    return id ? (s.sessions[id] ?? null) : null;
+  });
+  const connections = useConnectionStore((s) => s.connections);
+  const ids = resolveAgentIds(activeSession);
+  /** Connected + bound saved connection — required for conversation/task IPC. */
+  const canInteract = !!ids && activeSession?.status === "connected";
+  const forceReasoningEffortPicker = useDebugStore(
+    (s) => s.forceReasoningEffortPicker,
+  );
+  const emptyReason = agentEmptyStateReason(activeSession);
+
+  const {
+    stopActiveTask,
+    mode,
+    setMode,
+    setInputDraft,
+    isRunning,
+    conversations,
+    activeConversationId,
+    draftKey,
+    draftConversationId,
+    draftSendUnavailableReason,
+    newConversation,
+    switchConversation,
+    loadConversation,
+    renameConversation,
+    deleteConversation,
+    setConversationPinned,
+    setConversationModel,
+    setConversationEffort,
+    syncActiveToConnection,
+    activeUsageView,
+  } = useAgent({ subscribeMessages: false, subscribeDraft: false });
+
+  // 当前会话（含会话级模型记忆 overlay）：提前到 vision 依赖之前
+  const activeConversation = activeConversationId
+    ? (conversations[activeConversationId] ?? null)
+    : null;
+  const isSubConversation = !!activeConversation?.parentConversationId;
+  const parentConversationId = activeConversation?.parentConversationId ?? null;
+  // 图片支持按「当前会话实际生效模型」判定（会话记忆 → 全局最近使用）
+  const registry = useSettingsStore((s) => s.settings.llmRegistry);
+  const visionEnabled = currentVision(registry, activeConversation?.modelId ?? null);
+  const attachments = useAgentAttachments({
+    conversationId: draftConversationId,
+    sessionId: activeSession?.id ?? null,
+    visionEnabled,
+    canInteract,
+    subscribeText: false,
+    sendUnavailableReason: draftSendUnavailableReason,
+  });
+  // 本会话是否正在手动压缩上下文（订阅而非直接读：压缩一开始就要禁用发送并
+  // 显示原因，不能等第一条压缩事件把它带出来）
+  const isCompacting = useTaskStore(compactingSelectorOf(activeConversationId));
+  // 「会话忙」= 任务在跑或正在压缩 —— 发送、`/` 菜单、撤回共用这一个判定
+  // （与桌面同源，见 conversationStore.conversationIsBusy）。
+  const conversationBusy = isRunning || isCompacting;
+
+  // 占用环读数（百分比、未配置窗口的降级都由 `lib/tokenUsage.ts` 定，与桌面端同一份）
+  const meter = contextMeterView(activeUsageView?.usage, activeUsageView?.windowTokens);
+
+  const [modeOpen, setModeOpen] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const modePresence = useAnimatedPresence(modeOpen);
+  const historyPresence = useAnimatedPresence(historyOpen);
+  /** 未连接时的只读历史浏览面板（对齐桌面 AgentPanel 的 ChatHistoryModal 分支） */
+  const [historyBrowserOpen, setHistoryBrowserOpen] = useState(false);
+  const [activeAgentsSheetOpen, setActiveAgentsSheetOpen] = useState(false);
+  /** Token 用量面板（输入框行那个占用环点开）。 */
+  const [usageSheetOpen, setUsageSheetOpen] = useState(false);
+  const [deleteTargetId, setDeleteTargetId] = useState<string | null>(null);
+  const [rollbackHint, setRollbackHint] = useState<string | null>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const rollbackHintTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
+  const userJustSentRef = useRef(false);
+
+  const [renameTargetId, setRenameTargetId] = useState<string | null>(null);
+  const [renameTitleInput, setRenameTitleInput] = useState("");
+
+  const tasks = useTaskStore((s) => s.tasks);
+  const unreadCompletedConversations = useTaskStore(
+    (s) => s.unreadCompletedConversations,
+  );
+  /**
+   * 当前子对话的派发信息：
+   * - `mode`（plan 只读调研 / agent 读写执行）驱动输入区文案；
+   * - `isLocal` 判定它是不是**本机**子任务 —— 横条据此标「本机」，否则用户
+   *   会以为这条子对话跑在某台服务器上。
+   *
+   * 派生逻辑与桌面 `AgentPanel` 共用 `lib/agentPanelDerived` 的
+   * `deriveSubAgentDispatch`（哨兵值口径等细节见其注释）。
+   */
+  const subAgentDispatch = useMemo(
+    () => deriveSubAgentDispatch(tasks, activeConversationId),
+    [tasks, activeConversationId],
+  );
+  const { mode: subAgentMode, isLocal: subAgentIsLocal } = subAgentDispatch;
+  // 后台作业（跨会话）：header 胶囊与任务/作业中心的显示入口依赖它——
+  // 「有需要用户知道结局的作业」（重启恢复出来的 interrupted）同样要给入口：
+  // 那种状态下没有任何 running，只看 running 的话抽屉就永远打不开。
+  // 判定与桌面 AgentPanel 共用 `taskCenterEntry`（见其注释）。
+  const jobs = useJobStore((s) => s.jobs);
+  // interrupted 作业的已读表：读过结局说明的不再触发警示胶囊（口径见 taskCenterEntry）
+  const readInterrupted = useJobStore((s) => s.readInterrupted);
+  const taskCenter = useMemo(
+    () => taskCenterEntry(tasks, jobs, activeConversationId ?? null, readInterrupted),
+    [tasks, jobs, activeConversationId, readInterrupted],
+  );
+  const [agentsSheetTab, setAgentsSheetTab] = useState<"agents" | "jobs">("agents");
+
+  const sessionConversations = useMemo(
+    () =>
+      Object.values(conversations).filter(
+        (c) =>
+          ids?.configId != null &&
+          c.connectionId === ids.configId &&
+          // 子agent对话不在会话列表展示：只通过主对话的 task 卡片进入/返回
+          !c.parentConversationId,
+      ),
+    [conversations, ids?.configId],
+  );
+
+  const groupedSessionConversations = useMemo(
+    () => groupConversationsWithPinned(sessionConversations),
+    [sessionConversations],
+  );
+
+  const handleStartRename = (convId: string, currentTitle: string) => {
+    setRenameTargetId(convId);
+    setRenameTitleInput(currentTitle);
+  };
+
+  const handleConfirmRename = async () => {
+    if (!renameTargetId) return;
+    const trimmed = renameTitleInput.trim();
+    if (trimmed) {
+      try {
+        await renameConversation(renameTargetId, trimmed);
+      } catch (err) {
+        console.error("Failed to rename conversation:", err);
+      }
+    }
+    setRenameTargetId(null);
+    setRenameTitleInput("");
+  };
+
+  const currentModeInfo =
+    AGENT_MODES.find((m) => m.value === mode) ?? AGENT_MODES[1];
+
+  useEffect(() => {
+    if (!ids?.configId || !ids?.sessionId) return;
+    void syncActiveToConnection(ids.configId, ids.sessionId);
+  }, [ids?.configId, ids?.sessionId, syncActiveToConnection]);
+
+  const handleStop = useCallback(() => {
+    void stopActiveTask();
+  }, [stopActiveTask]);
+
+  // 子agent对话：输入区替换为"返回主对话"条（子agent由主 Agent 停止，停止主 Agent 级联停止）
+  // （activeConversation / isSubConversation / parentConversationId 已在顶部派生）
+
+  const handleBackToParent = useCallback(() => {
+    if (parentConversationId) {
+      void switchConversation(parentConversationId);
+    }
+  }, [parentConversationId, switchConversation]);
+
+  const handleNewConversation = useCallback(async () => {
+    if (!canInteract || !ids) return;
+    try {
+      await newConversation(ids.sessionId, ids.configId);
+      setHistoryOpen(false);
+    } catch (err) {
+      console.error("Failed to create conversation:", err);
+    }
+  }, [canInteract, ids, newConversation]);
+
+  const handleSelectConversation = useCallback(
+    async (conversationId: string) => {
+      try {
+        await sessionConversationBindingManager.selectOrJumpToConversation(
+          conversationId,
+          ids?.sessionId ?? null,
+        );
+        setHistoryOpen(false);
+      } catch (err) {
+        console.error("Failed to switch conversation:", err);
+      }
+    },
+    [ids?.sessionId],
+  );
+
+  const handleDeleteConversation = useCallback(async () => {
+    if (!deleteTargetId) return;
+    const id = deleteTargetId;
+    setDeleteTargetId(null);
+    try {
+      await deleteConversation(id);
+    } catch (err) {
+      console.error("Failed to delete conversation:", err);
+    }
+  }, [deleteTargetId, deleteConversation]);
+
+  const deleteTargetTitle = deleteTargetId
+    ? (conversations[deleteTargetId]?.title ?? "该会话")
+    : "";
+
+  const showRollbackHint = useCallback((text: string) => {
+    setRollbackHint(text);
+    if (rollbackHintTimerRef.current)
+      clearTimeout(rollbackHintTimerRef.current);
+    rollbackHintTimerRef.current = setTimeout(
+      () => setRollbackHint(null),
+      3200,
+    );
+  }, []);
+
+  useEffect(() => () => {
+    if (rollbackHintTimerRef.current) clearTimeout(rollbackHintTimerRef.current);
+  }, []);
+
+  const onRollbackRestored = useCallback((removedCount: number) => {
+    showRollbackHint(`已撤回 ${removedCount} 条消息，文字与附件已恢复到草稿`);
+  }, [showRollbackHint]);
+
+  const { send: handleSend, rollback: handleRollbackMessage, sending } = useAgentDraftActions({
+    attachments,
+    sessionId: ids?.sessionId ?? null,
+    connectionId: ids?.configId,
+    conversationId: draftConversationId,
+    canInteract,
+    userJustSentRef,
+    onRollback: onRollbackRestored,
+  });
+
+  const handleCopyMessage = useCallback(async (message: AgentMessage) => {
+    try {
+      await writeText(message.content);
+    } catch (err) {
+      console.error("Failed to copy message:", err);
+    }
+  }, []);
+
+  // 任务收尾条的复制（与桌面同一契约：失败抛出，由收尾条提示「复制失败」）。
+  const handleCopyText = useCallback(async (text: string) => {
+    await writeText(text);
+  }, []);
+
+  // ── `/` 命令面板（与桌面同款组件）：输入以 "/" 开头时在输入框上方弹出，
+  // 手机端以触摸点选为主；软键盘回车/发送语义不变。
+  // 唤出门控（任务运行中/压缩中不唤出，理由见共享函数注释）与桌面
+  // `AgentPanel` 共用 `canOpenCommandMenu`。
+  const commandDraft = useAgentDraftStore((s) => isCommandDraft((s.drafts[draftKey] ?? EMPTY_DRAFT).text));
+  const commandMenuOpen = canOpenCommandMenu(
+    commandDraft,
+    activeConversationId,
+    conversationIsBusy,
+  );
+
+  const handleCompact = useCallback(() => {
+    if (!activeConversationId) return;
+    // 压缩结果/失败以消息卡片形式出现在会话列表里（compactConversation 内部处理）
+    useConversationStore
+      .getState()
+      .compactConversation(activeConversationId)
+      .catch((err) => {
+        console.error("Failed to compact conversation:", err);
+      });
+  }, [activeConversationId]);
+
+  // 「取消压缩」：中断正在跑的摘要调用（后端置位取消通道），随后走既有的
+  // Skipped 分支把进行中的卡片转成「未完成：已取消」，会话占位随之释放。
+  // 解锁交给 compactConversation 的 finally —— 这里提前放行会让「取消晚于摘要
+  // 完成」的那次落库和新消息撞在一起。
+  const handleCancelCompaction = useCallback(() => {
+    if (!activeConversationId) return;
+    void useConversationStore
+      .getState()
+      .cancelCompaction(activeConversationId)
+      .catch((err) => {
+        console.error("Failed to cancel compaction:", err);
+      });
+  }, [activeConversationId]);
+
+  const handleInsertSkill = useCallback(
+    (prompt: string) => {
+      setInputDraft(prompt);
+    },
+    [setInputDraft],
+  );
+
+  // 菜单打开时系统返回键 = 关闭（清空命令输入）
+  useEffect(() => {
+    if (!commandMenuOpen) return;
+    return registerBackHandler(() => setInputDraft(""));
+  }, [commandMenuOpen, setInputDraft]);
+
+  const hostLabel =
+    resolveSessionDisplayName(activeSession, connections) || "智能助手";
+  const statusText = activeSession
+    ? sessionStatusLabel(activeSession.status)
+    : "无会话";
+
+  return (
+    <div
+      className="marcel-viz-surface-page relative flex h-full min-h-0 flex-col bg-zinc-950"
+      data-region="mobile-agent"
+    >
+      <header
+        className="flex flex-shrink-0 items-center gap-2 border-b border-zinc-800 bg-zinc-950 px-3 py-2"
+        style={{ paddingTop: "max(0.5rem, env(safe-area-inset-top, 0px))" }}
+      >
+        <div className="min-w-0 flex-1 overflow-hidden">
+          <div className="truncate whitespace-nowrap text-sm font-semibold text-zinc-100">
+            {hostLabel}
+          </div>
+          <div
+            className={`truncate whitespace-nowrap text-[11px] ${
+              activeSession?.status === "connected"
+                ? "text-emerald-400"
+                : activeSession?.status === "connecting"
+                  ? "text-amber-400"
+                  : activeSession?.status === "error"
+                    ? "text-red-400"
+                    : "text-zinc-500"
+            }`}
+          >
+            {statusText}
+            {isRunning ? " · 运行中" : ""}
+          </div>
+        </div>
+        <MobileMultiHostPicker disabled={!canInteract || !ids} />
+        {taskCenter.visible && (
+          <button
+            type="button"
+            onClick={() => {
+              setAgentsSheetTab(taskCenter.initialTab);
+              setActiveAgentsSheetOpen(true);
+            }}
+            className={`flex flex-shrink-0 items-center gap-1 whitespace-nowrap px-2 py-1 active:scale-95 border rounded-full text-xs font-medium transition-all ${
+              taskCenter.runningTasks.length === 0 && taskCenter.runningJobs.length === 0
+                ? "bg-amber-500/10 border-amber-500/30 text-amber-300"
+                : taskCenter.runningJobs.length > 0
+                  ? "bg-sky-500/10 border-sky-500/30 text-sky-300"
+                  : "bg-indigo-500/10 border-indigo-500/30 text-indigo-300"
+            }`}
+            title={
+              taskCenter.runningTasks.length === 0 && taskCenter.runningJobs.length === 0
+                ? "有上次运行留下的作业：结局未知，点开查看"
+                : "查看所有运行中的任务与后台作业"
+            }
+          >
+            {taskCenter.runningTasks.length === 0 && taskCenter.runningJobs.length === 0 ? (
+              <svg
+                className="h-3 w-3 flex-shrink-0"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={2}
+                  d="M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"
+                />
+              </svg>
+            ) : (
+              <AgentStatusIndicator status="running" size="xs" />
+            )}
+            <span>
+              {taskCenter.runningTasks.length > 0 && `${taskCenter.runningTasks.length} 任务`}
+              {taskCenter.runningTasks.length > 0 && taskCenter.runningJobs.length > 0 && " · "}
+              {taskCenter.runningJobs.length > 0 && `${taskCenter.runningJobs.length} 作业`}
+              {taskCenter.runningTasks.length === 0 && taskCenter.runningJobs.length === 0 &&
+                `${taskCenter.attentionJobs.length} 作业中断`}
+            </span>
+          </button>
+        )}
+        <button
+          type="button"
+          onClick={() => void handleNewConversation()}
+          disabled={!canInteract || !ids}
+          className="rounded-lg bg-indigo-600 px-2.5 py-1.5 text-xs font-medium text-white transition-transform duration-100 active:scale-95 active:bg-indigo-500 disabled:opacity-40"
+        >
+          新对话
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            // 对齐桌面 AgentPanel：已连接切会话，未连接只读浏览全部历史
+            if (canInteract) {
+              setHistoryOpen((v) => !v);
+            } else {
+              setHistoryBrowserOpen(true);
+            }
+          }}
+          className="rounded-lg bg-zinc-800 px-2.5 py-1.5 text-xs text-zinc-200 transition-transform duration-100 active:scale-95 active:bg-zinc-700"
+        >
+          历史
+        </button>
+      </header>
+
+      {rollbackHint && (
+        <div className="flex-shrink-0 border-b border-zinc-700 bg-zinc-900 px-3 py-1.5 text-center text-xs text-zinc-300">
+          {rollbackHint}
+        </div>
+      )}
+
+      <AgentTranscript
+        conversationId={activeConversationId}
+        canInteract={canInteract}
+        rollbackDisabled={conversationBusy || sending}
+        userJustSentRef={userJustSentRef}
+        onRollback={handleRollbackMessage}
+        onCopy={handleCopyMessage}
+        onCopyText={handleCopyText}
+        mobile
+        visible={visible}
+        emptyState={<>
+          {emptyReason !== "ready" && (
+            <div className="mt-10 text-center text-sm text-zinc-500">
+              <p className="font-medium text-zinc-400">
+                {EMPTY_STATE_COPY[emptyReason].title}
+              </p>
+              <p className="mt-1">{EMPTY_STATE_COPY[emptyReason].body}</p>
+            </div>
+          )}
+          {emptyReason === "ready" && (
+            <div className="mt-10 text-center text-sm text-zinc-500">
+              <p className="font-medium text-zinc-400">
+                {activeConversationId ? "暂无消息" : "暂无会话"}
+              </p>
+              <p className="mt-1">
+                {activeConversationId
+                  ? "描述您想做的事，智能助手会协助您。"
+                  : "点击「新对话」开始，或直接输入发送。"}
+              </p>
+            </div>
+          )}
+        </>}
+      />
+
+      <PlanList />
+
+      {historyPresence.mounted && canInteract && (
+        <>
+          <div
+            className={`absolute inset-0 z-20 bg-black/40 ${
+              historyPresence.phase === "exit"
+                ? "mobile-backdrop-exit"
+                : "mobile-backdrop-enter"
+            }`}
+            onClick={() => setHistoryOpen(false)}
+          />
+          <div
+            onAnimationEnd={historyPresence.onAnimationEnd}
+            className={`absolute inset-x-0 bottom-0 z-30 max-h-[55%] overflow-y-auto rounded-t-2xl border-t border-zinc-700 bg-zinc-900 p-3 shadow-2xl ${
+              historyPresence.phase === "exit"
+                ? "mobile-sheet-exit"
+                : "mobile-sheet-enter"
+            }`}
+          >
+            <div className="mb-2 flex items-center justify-between">
+              <h3 className="text-sm font-semibold text-zinc-100">历史会话</h3>
+              <button
+                type="button"
+                onClick={() => setHistoryOpen(false)}
+                className="text-xs text-zinc-400"
+              >
+                关闭
+              </button>
+            </div>
+            {sessionConversations.length === 0 ? (
+              <p className="py-6 text-center text-sm text-zinc-500">
+                暂无历史会话
+              </p>
+            ) : (
+              <div className="space-y-3">
+                {groupedSessionConversations.map((group) => (
+                  <div key={group.key} className="space-y-1">
+                    <div className="px-1 text-[11px] font-semibold uppercase tracking-wider text-zinc-500">
+                      {group.label}
+                    </div>
+                    <ul className="space-y-1">
+                      {group.items.map((conv) => {
+                        const active = conv.id === activeConversationId;
+                        return (
+                          <li
+                            key={conv.id}
+                            className={`flex items-center gap-1 rounded-lg ${
+                              active
+                                ? "bg-indigo-600/20 text-indigo-200"
+                                : "bg-zinc-800/60 text-zinc-300"
+                            }`}
+                          >
+                            <button
+                              type="button"
+                              onClick={() => void handleSelectConversation(conv.id)}
+                              className="min-w-0 flex-1 px-3 py-2 text-left text-sm active:opacity-80 flex items-center justify-between gap-2"
+                            >
+                              <div className="min-w-0 flex-1">
+                                <div className="truncate font-medium leading-snug">{conv.title}</div>
+                                <div className="mt-0.5 text-[11px] text-zinc-500">
+                                  {new Date(conv.updatedAt).toLocaleString()}
+                                </div>
+                              </div>
+                              <AgentStatusIndicator
+                                status={getConversationAgentStatus(
+                                  conv.id,
+                                  tasks,
+                                  unreadCompletedConversations,
+                                )}
+                                size="xs"
+                              />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                // 失败就原地不动 —— 必须接住，否则是未处理拒绝
+                                setConversationPinned(conv.id, !conv.pinned).catch((err) =>
+                                  console.error('Failed to toggle pin:', getErrorMessage(err)),
+                                )
+                              }
+                              className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg text-zinc-400 active:bg-zinc-800 active:text-zinc-200"
+                              aria-label={conv.pinned ? `取消置顶 ${conv.title}` : `置顶 ${conv.title}`}
+                            >
+                              <Pin className="h-3.5 w-3.5" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleStartRename(conv.id, conv.title)}
+                              className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg text-zinc-400 active:bg-zinc-800 active:text-zinc-200"
+                              aria-label={`重命名 ${conv.title}`}
+                            >
+                              <Pencil className="h-3.5 w-3.5" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setDeleteTargetId(conv.id)}
+                              className="mr-1 flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg text-zinc-400 active:bg-zinc-800 active:text-red-400"
+                              aria-label={`删除 ${conv.title}`}
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </button>
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </>
+      )}
+
+      <MobileSheet
+        open={renameTargetId != null}
+        onClose={() => setRenameTargetId(null)}
+        title="重命名会话"
+      >
+        <div className="flex flex-col gap-3 px-4 pb-4">
+          <input
+            type="text"
+            value={renameTitleInput}
+            onChange={(e) => setRenameTitleInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                void handleConfirmRename();
+              }
+            }}
+            placeholder="请输入会话名称"
+            className="w-full rounded-xl border border-zinc-700 bg-zinc-800 px-3.5 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 focus:border-indigo-500 focus:outline-none"
+            autoFocus
+          />
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={() => setRenameTargetId(null)}
+              className="flex-1 rounded-xl bg-zinc-800 px-4 py-2.5 text-sm font-medium text-zinc-300 active:bg-zinc-700"
+            >
+              取消
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleConfirmRename()}
+              disabled={!renameTitleInput.trim()}
+              className="flex-1 rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-medium text-white disabled:opacity-50 active:bg-indigo-500"
+            >
+              保存
+            </button>
+          </div>
+        </div>
+      </MobileSheet>
+
+      <MobileSheet
+        open={deleteTargetId != null}
+        onClose={() => setDeleteTargetId(null)}
+        title="确认删除"
+      >
+        <div className="flex flex-col gap-2 px-4 pb-4">
+          <p className="pb-1 text-sm text-zinc-400">
+            删除会话「{deleteTargetTitle}」？此操作不可撤销。
+          </p>
+          <button
+            type="button"
+            onClick={() => void handleDeleteConversation()}
+            className="rounded-xl bg-red-600 px-4 py-3 text-sm font-medium text-white active:bg-red-500"
+          >
+            删除
+          </button>
+          <button
+            type="button"
+            onClick={() => setDeleteTargetId(null)}
+            className="rounded-xl px-4 py-3 text-sm text-zinc-400 active:bg-zinc-800"
+          >
+            取消
+          </button>
+        </div>
+      </MobileSheet>
+
+      <MobileSheet
+        open={usageSheetOpen}
+        onClose={() => setUsageSheetOpen(false)}
+        title="Token 用量"
+      >
+        <div className="px-4 pb-4 text-sm">
+          <TokenUsagePanel
+            usage={activeUsageView?.usage}
+            windowTokens={activeUsageView?.windowTokens ?? 0}
+          />
+        </div>
+      </MobileSheet>
+
+      <MobileChatHistorySheet
+        open={historyBrowserOpen}
+        onClose={() => setHistoryBrowserOpen(false)}
+      />
+
+      <MobileActiveAgentsSheet
+        open={activeAgentsSheetOpen}
+        onClose={() => setActiveAgentsSheetOpen(false)}
+        initialTab={agentsSheetTab}
+      />
+
+      {isSubConversation ? (
+        <div className="flex-shrink-0 border-t border-zinc-800 p-3">
+          <div className="flex items-center gap-3 rounded-xl border border-zinc-700/60 bg-zinc-900/70 px-3 py-3">
+            <button
+              type="button"
+              onClick={handleBackToParent}
+              className="flex flex-shrink-0 items-center gap-1 rounded-lg bg-indigo-600/20 px-2.5 py-2 text-xs font-medium text-indigo-300 transition-transform duration-100 active:scale-95 active:bg-indigo-600/30"
+            >
+              <svg
+                className="h-3.5 w-3.5"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={2}
+                  d="M10 19l-7-7m0 0l7-7m-7 7h18"
+                />
+              </svg>
+              返回主对话
+            </button>
+            <div className="min-w-0 flex-1 border-l border-zinc-700/50 pl-3">
+              <div className="flex min-w-0 items-center gap-1.5 text-xs text-zinc-400">
+                {/* 本机子任务（local_subagent）：这条子对话在用户这台电脑上跑，
+                    没有 SSH 会话。不标的话用户会以为它跑在某台服务器上。
+                    措辞与桌面一致（任务/作业中心的 `本机`、本机工具审批横幅）。 */}
+                {subAgentIsLocal && (
+                  <span className="flex-shrink-0 rounded border border-sky-500/30 bg-sky-500/10 px-1.5 py-0.5 text-[10px] font-semibold text-sky-300">
+                    本机
+                  </span>
+                )}
+                <span className="min-w-0 truncate">
+                  {subAgentMode === "agent" ? "子agent执行" : "子agent调研"} ·{" "}
+                  {activeConversation?.title ?? "子agent对话"}
+                </span>
+              </div>
+              <div className="mt-0.5 text-[11px] text-zinc-600">
+                {subAgentMode === "agent"
+                  ? "由主 Agent 派发的读写执行，不支持输入"
+                  : "由主 Agent 派发的只读调研，不支持输入"}
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : (
+        <AgentDraft draftKey={draftKey}>{(inputDraft) => (
+        <div className="relative flex-shrink-0 border-t border-zinc-800 p-3">
+          {/* `/` 命令面板：锚定输入框上方，触摸点选执行；遮罩点击/返回键关闭 */}
+          {commandMenuOpen && (
+            <div
+              className="fixed inset-0 z-40"
+              onClick={() => setInputDraft("")}
+              aria-hidden
+            />
+          )}
+          <AgentCommandMenu
+            open={commandMenuOpen}
+            query={commandMenuOpen ? inputDraft.slice(1) : ""}
+            currentMode={mode}
+            onSelectMode={setMode}
+            onInsertSkill={handleInsertSkill}
+            onCompact={handleCompact}
+            onClose={() => setInputDraft("")}
+          />
+          {/* 压缩中常驻的原因说明（与桌面同文案）：发送键这时是「取消压缩」，
+              回车也发不出去，没有这一行用户只会觉得输入框坏了。 */}
+          {isCompacting && (
+            <div className="mb-2 flex items-center gap-2 rounded-lg border border-violet-800/50 bg-violet-950/50 px-2.5 py-1.5 text-xs text-violet-200">
+              <span className="h-2 w-2 shrink-0 rounded-full bg-violet-400/90" />
+              正在压缩上下文，完成后即可发送（可点右下角取消）
+            </div>
+          )}
+          <DraftAttachments attachments={attachments} mobile />
+          <div className="agent-input rounded-2xl border border-zinc-700 bg-zinc-900 focus-within:border-indigo-500">
+            {/* 移动端不拦截回车：软键盘/IME 的「换行」键走 textarea 原生行为插入换行
+                （含拼音组合中确认候选词的回车，不会误发）；发送只走右侧按钮——
+                手机上没有 shift+Enter，若拦截回车则多行输入无法换行。桌面端语义不受影响。 */}
+            <AgentTextarea
+              draftKey={draftKey}
+              ref={inputRef}
+              rows={1}
+              maxHeight={120}
+              onPaste={attachments.handlePaste}
+              placeholder={
+                !canInteract
+                  ? "请先连接服务器…"
+                  : !ids
+                    ? "请从连接列表重新连接…"
+                    : "描述您想要做的事情，输入 / 可查看命令…"
+              }
+              disabled={!canInteract || !ids}
+              className="w-full min-h-[2.5rem] max-h-[7.5rem] resize-none bg-transparent px-3.5 pt-3 pb-1 text-sm text-zinc-100 placeholder:text-zinc-500 outline-none focus:outline-none focus-visible:outline-none disabled:opacity-50"
+            />
+            <div className="flex items-center px-1.5 pb-1.5">
+              {/* 附件按钮：图片/文本文件导入 */}
+              <button
+                type="button"
+                onClick={() => void attachments.handleAttach()}
+                disabled={!canInteract || !ids}
+                className="flex h-11 w-11 flex-shrink-0 items-center justify-center -ml-0.5 text-zinc-400 active:text-zinc-200 active:bg-zinc-800 rounded-full transition-transform duration-150 active:scale-90 disabled:opacity-40"
+                title="添加图片或文本文件"
+                aria-label="添加图片或文本文件"
+              >
+                <Plus className="h-[18px] w-[18px]" />
+              </button>
+              <div className="relative flex-shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setModeOpen((v) => !v)}
+                  className="flex items-center gap-1 rounded-full px-2 py-1.5 text-xs font-medium text-zinc-300 active:bg-zinc-800 transition-transform duration-150 active:scale-95"
+                  title={currentModeInfo.description}
+                >
+                  {currentModeInfo.label}
+                  <ChevronDown className="h-3 w-3" />
+                </button>
+              {modeOpen && (
+                <div
+                  className="fixed inset-0 z-20"
+                  onClick={() => setModeOpen(false)}
+                  aria-hidden
+                />
+              )}
+              {modePresence.mounted && (
+                <div
+                  onAnimationEnd={modePresence.onAnimationEnd}
+                  className={`absolute bottom-full left-0 z-30 mb-2 w-56 rounded-xl border border-zinc-700 bg-zinc-800 py-1 shadow-2xl ${
+                    modePresence.phase === "exit"
+                      ? "mobile-popover-exit"
+                      : "mobile-popover-enter"
+                  }`}
+                >
+                  {AGENT_MODES.map((m) => {
+                    const active = m.value === mode;
+                    return (
+                      <button
+                        key={m.value}
+                        type="button"
+                        onClick={() => {
+                          setMode(m.value as AgentMode);
+                          setModeOpen(false);
+                        }}
+                        className={`w-full px-3 py-2 text-left text-sm ${
+                          active
+                            ? "bg-indigo-600/20 text-indigo-200"
+                            : "text-zinc-200 active:bg-zinc-700"
+                        }`}
+                      >
+                        <div className="font-semibold">
+                          {m.label}
+                        </div>
+                        <div className="mt-0.5 text-[11px] text-zinc-400">
+                          {m.description}
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+            {/* 模型设置：模型切换与思考强度合并为一个紧凑入口。 */}
+            {(() => {
+              const effModel = effectiveModel(registry, activeConversation?.modelId);
+              const declaredEfforts = modelReasoningEfforts(effModel);
+              const efforts = declaredEfforts.length > 0
+                ? declaredEfforts
+                : forceReasoningEffortPicker
+                  ? DEBUG_REASONING_EFFORTS
+                  : [];
+              return (
+                <ReasoningEffortPicker
+                  key={`${activeConversationId}:${effModel?.id}`}
+                  value={activeConversation?.reasoningEffort}
+                  efforts={efforts}
+                  modelName={modelLabel(effModel)}
+                  registry={registry}
+                  modelId={activeConversation?.modelId}
+                  onModelChange={(modelId) => {
+                    if (!activeConversationId) return;
+                    void setConversationModel(activeConversationId, modelId);
+                  }}
+                  onChange={(effort) => {
+                    if (!activeConversationId) return;
+                    return setConversationEffort(activeConversationId, effort);
+                  }}
+                  disabled={!canInteract || !ids || !activeConversationId}
+                  compact
+                />
+              );
+            })()}
+            <div className="flex-1 min-w-2" />
+            {/* 上下文占用环：与桌面端同一个组件（未配置窗口时不画弧）。
+                放在输入框行、发送键左侧 —— 手机顶栏已经很挤，且这里拇指够得着。
+                点开是底部面板，明细与桌面弹层共用同一份字段表。 */}
+            <button
+              type="button"
+              onClick={() => setUsageSheetOpen(true)}
+              className="mr-0.5 flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-lg text-zinc-400 transition-transform duration-150 active:scale-95 active:bg-zinc-800"
+              title={
+                meter.percent != null
+                  ? `上下文占用 ${formatPercent(meter.percent)}%`
+                  : meter.windowTokens === 0
+                    ? 'Token 用量（未配置上下文窗口）'
+                    : 'Token 用量'
+              }
+              aria-label="Token 用量"
+            >
+              <ContextMeterRing percent={meter.percent} size={18} />
+            </button>
+            {/* 三态（与桌面同款）：任务运行中 = 停止（红）；正在压缩上下文 =
+                取消压缩（紫，压缩不能暂停，这是它唯一的出路）；否则 = 发送。 */}
+            <button
+              type="button"
+              onClick={() =>
+                isRunning
+                  ? handleStop()
+                  : isCompacting
+                    ? handleCancelCompaction()
+                    : void handleSend()
+              }
+              disabled={!isRunning && !isCompacting && (sending || !!attachments.sendBlockedReason || !(!!ids && canSendAgentPrompt(
+                activeSession, conversationBusy, inputDraft, attachments.items.length > 0,
+              )))}
+              className={`mr-0.5 flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-lg text-white transition-transform duration-150 active:scale-95 disabled:opacity-40 ${
+                isRunning
+                  ? "bg-red-600 active:bg-red-500"
+                  : isCompacting
+                    ? "bg-violet-600 active:bg-violet-500"
+                    : "bg-indigo-600 active:bg-indigo-500"
+              }`}
+              title={isRunning ? "停止" : isCompacting ? "取消压缩" : "发送"}
+              aria-label={isRunning ? "停止" : isCompacting ? "取消压缩" : "发送"}
+            >
+              {isRunning ? (
+                <Square className="h-4 w-4 fill-current" />
+              ) : isCompacting ? (
+                <X className="h-4 w-4" />
+              ) : (
+                <ArrowUp className="h-[18px] w-[18px]" />
+              )}
+            </button>
+            </div>
+          </div>
+        </div>
+        )}</AgentDraft>
+      )}
+    </div>
+  );
+}

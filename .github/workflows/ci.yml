@@ -1,0 +1,143 @@
+# 持续集成：每次推送到 main、每个 PR，都在云端干净的 Windows 机器上把项目拉下来，
+# 自动跑一遍平时手动执行的检查，并在提交旁标出 ✅ / ❌。它只报告结果，不拦截推送，也不参与发版。
+#
+# 两个 job 并行：
+#   frontend —— tsc + vite 构建 + markdown worker 自检 + vitest + eslint（只拦 error）
+#   rust     —— cargo test + clippy（只拦 error）+ rustfmt（仅提示，不拦）
+#
+# 目标平台是 Windows 与 Android；这里只跑 Windows。Android 原生构建不在 CI 里，
+# 移动端的 TS 代码（src/mobile）已经包含在 vitest 里。
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "image/**"
+      - "latest.json" # 发版时才改，更新源文件，不需要再跑一遍测试
+      - "LICENSE"
+  pull_request:
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "image/**"
+      - "latest.json"
+      - "LICENSE"
+  workflow_dispatch: # 允许在 GitHub 的 Actions 页面手动重跑，不用造一个空提交
+
+# 同一分支 / PR 有新推送时，取消还在跑的旧运行，只关心最新一次
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# CI 只读代码，不需要任何写权限，也不使用任何 secret
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # 钉死工具链保证可复现；升级 Rust 时手动改这里，别用 stable 随波逐流
+  # （新版 clippy 常常凭空多出新的 lint）
+  RUST_TOOLCHAIN: 1.95.0
+
+jobs:
+  frontend:
+    name: 前端（tsc / 构建 / vitest / eslint）
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # 第三方 action 全部钉到 commit SHA（注释里是对应的版本），防止上游被篡改后悄悄进到我们的流水线
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # 不写 version：自动读 package.json 里钉死的 packageManager（pnpm@11.15.1）
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: pnpm
+
+      # --frozen-lockfile：pnpm-lock.yaml 与 package.json 对不上就直接失败，而不是悄悄改 lock
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      # `pnpm build` = tsc（含 *.test.ts 的类型检查）+ vite build，同时产出 dist/
+      - name: 类型检查 + 构建
+        if: ${{ !cancelled() }}
+        run: pnpm build
+
+      # 这个脚本直接跑构建出来的 markdown worker 产物，必须在 build 之后
+      - name: Markdown worker 产物自检
+        if: ${{ !cancelled() }}
+        run: pnpm test:markdown-worker
+
+      - name: 单元测试（vitest）
+        if: ${{ !cancelled() }}
+        run: pnpm test
+
+      # --quiet 只看 error。存量的 warning 不拦，避免一上线就满屏红
+      - name: ESLint（仅 error）
+        if: ${{ !cancelled() }}
+        run: pnpm exec eslint src --quiet
+
+  rust:
+    name: Rust（cargo test / clippy / rustfmt）
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+        working-directory: src-tauri
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # 仓库里入库的 .cargo/config.toml 把 crates.io 指向了国内 USTC 镜像，
+      # GitHub 的海外机器上用它会变慢甚至不通，CI 里直接去掉，走官方源。
+      # Cargo.lock 记录的是源无关的版本与校验和，所以这样做依赖不会变。
+      - name: 去掉国内 cargo 镜像配置
+        working-directory: .
+        run: rm -f .cargo/config.toml
+
+      # tauri 的 generate_context! 在编译期要求 frontendDist（../dist）目录存在，
+      # 但 Rust 测试用不到前端产物，放个占位页即可，这样不用等前端构建，两个 job 能并行。
+      - name: 放置占位 dist
+        working-directory: .
+        run: |
+          mkdir -p dist
+          printf '<!doctype html><title>ci</title>' > dist/index.html
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable 分支；实际版本由 toolchain 决定
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: src-tauri
+
+      # debug 档（不要 --release：release 档编译慢得多，也没必要）。
+      # --locked：Cargo.lock 与 Cargo.toml 不一致就失败，防止依赖悄悄漂移
+      - name: cargo test
+        run: cargo test --locked
+
+      # 不加 -D warnings：只在出现 deny 级 error 时才失败。
+      # 存量有一批风格类 warning，先不卡，以免红灯常亮、真正的失败反而被淹没
+      - name: cargo clippy（仅 error）
+        if: ${{ !cancelled() }}
+        run: cargo clippy --locked --all-targets
+
+      # 目前有一批文件还没按 rustfmt 排版，所以只提示、不让整个流水线变红。
+      # 步骤会标出失败，但整个 job 仍然是绿的
+      - name: rustfmt 排版检查（仅提示，不拦）
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: cargo fmt --check

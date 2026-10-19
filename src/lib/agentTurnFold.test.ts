@@ -1,0 +1,469 @@
+import { describe, expect, it } from 'vitest';
+import type { AgentMessage, TurnState } from '@/lib/types';
+import {
+  segmentTurns,
+  turnFoldLabel,
+  turnStopVetoed,
+  withTailTurnState,
+  TOOL_FOLD_MIN,
+  type TurnSegment,
+} from '@/lib/agentTurnFold';
+
+function user(id: string, content = `user ${id}`): AgentMessage {
+  return { id, role: 'user', content, timestamp: new Date().toISOString() };
+}
+function assistantText(id: string, content: string): AgentMessage {
+  return { id, role: 'assistant', content, timestamp: new Date().toISOString() };
+}
+function assistantThinking(id: string, reasoningContent: string): AgentMessage {
+  return { id, role: 'assistant', content: '', reasoningContent, timestamp: new Date().toISOString() };
+}
+function assistantToolCalls(id: string, n: number): AgentMessage {
+  return {
+    id, role: 'assistant', content: '', timestamp: new Date().toISOString(),
+    toolCalls: Array.from({ length: n }, (_, i) => ({
+      id: `${id}-c${i}`, name: 'bash',
+      arguments: { command: 'ls' }, disposition: 'Approval' as const,
+    })),
+  };
+}
+function tool(
+  id: string,
+  toolName = 'bash',
+  opts: { subagent?: boolean; success?: boolean; blocked?: boolean } = {},
+): AgentMessage {
+  return {
+    id, role: 'tool', content: 'ok', timestamp: new Date().toISOString(),
+    toolResult: {
+      toolName, summary: '', result: 'ok',
+      success: opts.success ?? true, blocked: opts.blocked ?? false,
+      toolCallId: `${id}-call`,
+      ...(opts.subagent ? { metadata: { __subagent: true } } : {}),
+    },
+  };
+}
+
+describe('segmentTurns', () => {
+  it('把 user 到 user 切成独立回合，短回合不可折叠', () => {
+    const u1 = user('u1');
+    const a1 = assistantText('a1', 'hi');
+    const u2 = user('u2');
+    const a2 = assistantText('a2', 'ok');
+    const segs = segmentTurns([u1, a1, u2, a2]);
+    expect(segs).toHaveLength(2);
+    expect(segs[0].messages.map((m) => m.id)).toEqual(['u1', 'a1']);
+    expect(segs[1].messages.map((m) => m.id)).toEqual(['u2', 'a2']);
+    expect(segs[0].foldable).toBe(false);
+    expect(segs[1].foldable).toBe(false);
+  });
+
+  it('长回合（tool 数 >= 阈值）折叠，并正确计数', () => {
+    const u = user('u');
+    const calls = assistantToolCalls('a-tc', 5);
+    const tools = Array.from({ length: 5 }, (_, i) => tool(`t${i}`));
+    const answer = assistantText('a', '完成');
+    const segs = segmentTurns([u, calls, ...tools, answer]);
+    expect(segs).toHaveLength(1);
+    const seg = segs[0];
+    expect(seg.foldable).toBe(true);
+    expect(seg.answerIndex).toBe(7);
+    expect(seg.toolCallCount).toBe(5);
+    // assistant(tool_calls) 有 toolCalls 且无正文 → 算 1 条消息
+    expect(seg.messageCount).toBe(1);
+    expect(seg.subagentCount).toBe(0);
+    // 折叠成员 = tool 5 条 + 该 assistant 1 条
+    expect(seg.foldMembers).toHaveLength(6);
+  });
+
+  it('tool 数小于阈值不折叠', () => {
+    const u = user('u');
+    const tools = [tool('t0'), tool('t1')];
+    const answer = assistantText('a', 'done');
+    const segs = segmentTurns([u, ...tools, answer]);
+    expect(segs[0].foldable).toBe(false);
+  });
+
+  it('成功的 render_html 是交付物：不计入步数，折叠豁免但仍留在折叠区（展开按时间序）', () => {
+    const u = user('u');
+    const calls = assistantToolCalls('a-tc', 3);
+    const answer = assistantText('a', '如图所示');
+    const seg = segmentTurns([
+      u, calls, tool('t0'), tool('viz', 'render_html'), tool('t1'), tool('t2'), answer,
+    ])[0];
+    expect(seg.foldable).toBe(true);
+    // 3 步 bash 过程 + 1 张图：计数只算过程
+    expect(seg.toolCallCount).toBe(3);
+    expect(seg.deliverableMembers.map((m) => m.id)).toEqual(['viz']);
+    // 折叠区（展开态渲染）仍含图表，保持时间序
+    expect(seg.foldMembers.map((m) => m.id)).toContain('viz');
+  });
+
+  it('多张交付物按原顺序排列，计数不含它们', () => {
+    const u = user('u');
+    const answer = assistantText('a', '两张图都画好了');
+    const seg = segmentTurns([
+      u,
+      tool('t0'),
+      tool('viz1', 'render_html'),
+      tool('t1'),
+      tool('viz2', 'render_html'),
+      tool('t2'),
+      answer,
+    ])[0];
+    expect(seg.foldable).toBe(true);
+    expect(seg.toolCallCount).toBe(3);
+    expect(seg.deliverableMembers.map((m) => m.id)).toEqual(['viz1', 'viz2']);
+  });
+
+  it('失败或被拦的 render_html 照旧算过程步、不豁免', () => {
+    const u = user('u');
+    const answer = assistantText('a', '完成');
+    const seg = segmentTurns([
+      u,
+      tool('t0'),
+      tool('viz-fail', 'render_html', { success: false }),
+      tool('t1'),
+      tool('viz-blocked', 'render_html', { blocked: true }),
+      tool('t2'),
+      answer,
+    ])[0];
+    expect(seg.foldable).toBe(true);
+    expect(seg.toolCallCount).toBe(5);
+    expect(seg.deliverableMembers).toHaveLength(0);
+  });
+
+  it('过程步不足阈值时即使带交付物也不折叠（本来全程可见）', () => {
+    const u = user('u');
+    const answer = assistantText('a', 'done');
+    const seg = segmentTurns([u, tool('t0'), tool('viz', 'render_html'), answer])[0];
+    expect(seg.foldable).toBe(false);
+    expect(seg.toolCallCount).toBe(1);
+  });
+
+  it('回合以交付物收尾、无纯文本答案 → 半截回合照旧不可折叠', () => {
+    const u = user('u');
+    const seg = segmentTurns([
+      u, tool('t0'), tool('t1'), tool('t2'), tool('viz', 'render_html'),
+    ])[0];
+    expect(seg.foldable).toBe(false);
+    expect(seg.deliverableMembers).toHaveLength(0);
+  });
+
+  it('跨语言契约：半截回合展开渲染、补全后即可折叠 —— 后端翻页必须对齐回合边界', () => {
+    // 复现「上翻折叠突变」的形态：load_earlier_messages 若把回合从中间切开，
+    // 先到的后半段（无 user 开头）走 lone 分支完整展开、无控制行；下一页把
+    // 回合头补进来后回合变完整 → foldable → turnFoldStore 缺省收起，用户正
+    // 看着的过程当场折叠。因此后端 load_earlier_messages 的页缝必须落在回合
+    // 边界（conversation.rs 的 earlier_messages_pages_never_split_a_turn 是
+    // 这条契约的权威护栏，本用例钉住前端的突变形态本身）。
+    const tail = [tool('t0'), tool('t1'), tool('t2'), assistantText('a', '完成')];
+    const half = segmentTurns(tail);
+    expect(half).toHaveLength(4); // 每条各自成 lone 段
+    expect(half.every((s) => !s.foldable)).toBe(true); // 半截 = 全部展开
+    const u = user('u');
+    const calls = assistantToolCalls('a-tc', 3);
+    const whole = segmentTurns([u, calls, ...tail]);
+    expect(whole[0].foldable).toBe(true); // 补全后即可折叠 → 突变
+    expect(whole[0].toolCallCount).toBe(3);
+  });
+
+  it('subagent（subagent 工具）单独计数，且不计入普通工具数', () => {
+    const u = user('u');
+    const tasks = [tool('s0', 'subagent', { subagent: true }), tool('s1', 'subagent', { subagent: true })];
+    const bash = tool('b0', 'bash');
+    const answer = assistantText('a', 'done');
+    const seg = segmentTurns([u, ...tasks, bash, answer])[0];
+    expect(seg.toolCallCount).toBe(3); // 普通工具数不含 subagent
+    expect(seg.subagentCount).toBe(2);
+  });
+
+  it('兼容历史 task 工具名：仍计为 subagent', () => {
+    const u = user('u');
+    const legacy = tool('s0', 'task', { subagent: true });
+    const bash = tool('b0', 'bash');
+    const answer = assistantText('a', 'done');
+    const seg = segmentTurns([u, legacy, bash, answer])[0];
+    expect(seg.subagentCount).toBe(1);
+  });
+
+  it('纯 thinking 过程（无 tool）只算消息数', () => {
+    const u = user('u');
+    const think1 = assistantThinking('th1', '推理一');
+    const think2 = assistantThinking('th2', '推理二');
+    const answer = assistantText('a', '结论');
+    const seg = segmentTurns([u, think1, think2, answer])[0];
+    expect(seg.foldable).toBe(false); // tool 0 条
+    expect(seg.messageCount).toBe(2);
+    expect(seg.foldMembers).toHaveLength(2);
+  });
+
+  it('半截回合（无纯文本答案）不可折叠', () => {
+    const u = user('u');
+    const calls = assistantToolCalls('a-tc', 3);
+    const tools = Array.from({ length: 3 }, (_, i) => tool(`t${i}`));
+    // 回合以 tool 收尾，没有纯文本 assistant → 正在流/被打断
+    const seg = segmentTurns([u, calls, ...tools])[0];
+    expect(seg.answerIndex).toBeNull();
+    expect(seg.foldable).toBe(false);
+  });
+
+  it('带 tool_calls 的 assistant 不算答案；其后的纯文本才算', () => {
+    const u = user('u');
+    const calls = assistantToolCalls('a-tc', 1);
+    const t = tool('t0');
+    const final = assistantText('a', '收尾');
+    const seg = segmentTurns([u, calls, t, final])[0];
+    expect(seg.answerIndex).toBe(3);
+    expect(seg.toolCallCount).toBe(1);
+    expect(seg.foldMembers.map((m) => m.id)).toEqual(['a-tc', 't0']);
+  });
+
+  it('compaction / system 并入其前 user 回合；无答案则该回合不可折叠（不被隐藏）', () => {
+    const u1 = user('u1');
+    const comp = {
+      id: 'comp', role: 'system' as const, content: '摘要…',
+      timestamp: new Date().toISOString(),
+      compaction: { status: 'done' as const, summary: 'x' },
+    };
+    const u2 = user('u2');
+    const a2 = assistantText('a2', 'ok');
+    const segs = segmentTurns([u1, comp, u2, a2]);
+    // u1 + comp 无纯文本答案 → 1 段（不可折叠，comp 不会被隐藏）
+    expect(segs).toHaveLength(2);
+    expect(segs[0].messages.map((m) => m.id)).toEqual(['u1', 'comp']);
+    expect(segs[0].foldable).toBe(false);
+  });
+
+  it('长回合中间夹 compaction：该回合不折叠（comp 锚点永显）', () => {
+    const u = user('u');
+    const calls1 = assistantToolCalls('a-tc1', 2);
+    const tools1 = [tool('t0'), tool('t1')];
+    const comp = {
+      id: 'comp', role: 'system' as const, content: '摘要…',
+      timestamp: new Date().toISOString(),
+      compaction: { status: 'done' as const, summary: 'x' },
+    };
+    const calls2 = assistantToolCalls('a-tc2', 2);
+    const tools2 = [tool('t2'), tool('t3')];
+    const answer = assistantText('a', '最终答复');
+    const seg = segmentTurns([u, calls1, ...tools1, comp, calls2, ...tools2, answer])[0];
+    // tool 数 >= 阈值，但因过程夹 system → 放弃折叠，完整可见
+    expect(seg.foldable).toBe(false);
+    expect(seg.toolCallCount).toBe(4);
+  });
+
+  it('连续多个长回合各自独立分段', () => {
+    const mkTurn = (uid: string, aid: string, toolN: number) => {
+      const u = user(uid);
+      const calls = assistantToolCalls(`${aid}-tc`, toolN);
+      const tools = Array.from({ length: toolN }, (_, i) => tool(`${aid}-t${i}`));
+      const answer = assistantText(aid, `answer ${aid}`);
+      return [u, calls, ...tools, answer] as AgentMessage[];
+    };
+    const segs = segmentTurns([...mkTurn('u1', 'a1', 4), ...mkTurn('u2', 'a2', 3)]);
+    expect(segs).toHaveLength(2);
+    expect(segs[0].foldable).toBe(true);
+    expect(segs[1].foldable).toBe(true);
+    expect(segs[0].toolCallCount).toBe(4);
+    expect(segs[1].toolCallCount).toBe(3);
+  });
+
+  it('任务运行中：尾回合（最后 user 之后）即使有纯文本也不折叠 —— 不“干一半收起”', () => {
+    // 模型在 tool 之间输出了纯文本前言（独立 assistant 消息），任务仍在跑
+    // （无后续 user 封顶）。此时最后一条是纯文本 assistant，但 tailActive=true
+    // → 不能折叠 —— 模型可能继续输出 tool。
+    const u = user('u');
+    const calls = assistantToolCalls('a-tc', 3);
+    const tools = Array.from({ length: 3 }, (_, i) => tool(`t${i}`));
+    const midText = assistantText('mid', '我先看看，这一步完成了，继续…'); // 任务中途插话
+    const segs = segmentTurns([u, calls, ...tools, midText], { tailActive: true });
+    expect(segs).toHaveLength(1);
+    expect(segs[0].toolCallCount).toBe(3);
+    // 关键：任务在跑 → 尾回合不可折叠
+    expect(segs[0].foldable).toBe(false);
+  });
+
+  it('任务结束后：同一尾回合才可折叠', () => {
+    const u = user('u');
+    const calls = assistantToolCalls('a-tc', 3);
+    const tools = Array.from({ length: 3 }, (_, i) => tool(`t${i}`));
+    const midText = assistantText('mid', '我先看看，这一步完成了，继续…');
+    // 任务已结束（isRunning=false）→ 尾回合按正常规则（tool 数达标）折叠
+    const segs = segmentTurns([u, calls, ...tools, midText], { tailActive: false });
+    expect(segs[0].foldable).toBe(true);
+  });
+
+  it('任务运行中只影响尾回合；被后续 user 封顶的旧回合照常可折叠', () => {
+    const mkTurn = (uid: string, aid: string, toolN: number) => {
+      const u = user(uid);
+      const calls = assistantToolCalls(`${aid}-tc`, toolN);
+      const tools = Array.from({ length: toolN }, (_, i) => tool(`${aid}-t${i}`));
+      const answer = assistantText(aid, `answer ${aid}`);
+      return [u, calls, ...tools, answer] as AgentMessage[];
+    };
+    // 回合1（完成、被 user2 封顶）+ 回合2（当前任务在跑、只有过程无答案）
+    const r1 = mkTurn('u1', 'a1', 4);
+    const r2start = [user('u2'), assistantToolCalls('a2-tc', 3)];
+    const tools2 = Array.from({ length: 3 }, (_, i) => tool(`u2-t${i}`));
+    const segs = segmentTurns([...r1, ...r2start, ...tools2], { tailActive: true });
+    expect(segs).toHaveLength(2);
+    // 回合1 已封顶 → 折叠不受运行态影响
+    expect(segs[0].foldable).toBe(true);
+    // 回合2 是尾回合且任务在跑 → 不折叠（半截也无答案）
+    expect(segs[1].foldable).toBe(false);
+  });
+});
+
+/** 长回合骨架（tool 数达标、以纯文本答案收尾），可选给首条 user 挂收尾状态。 */
+function longTurn(
+  uid: string,
+  aid: string,
+  turnState?: TurnState,
+): AgentMessage[] {
+  const u: AgentMessage = { ...user(uid), ...(turnState ? { turnState } : {}) };
+  const calls = assistantToolCalls(`${aid}-tc`, 4);
+  const tools = Array.from({ length: 4 }, (_, i) => tool(`${aid}-t${i}`));
+  const answer = assistantText(aid, `answer ${aid}`);
+  return [u, calls, ...tools, answer];
+}
+
+describe('回合收尾状态（停止原因）否决折叠', () => {
+  it('completed = 模型自然结束 → 正常折叠', () => {
+    const seg = segmentTurns(longTurn('u', 'a', 'completed'))[0];
+    expect(seg.foldable).toBe(true);
+  });
+
+  it('非正常结束（手动停止 / 失败 / 崩溃痕迹 / 进行中）一律不折叠', () => {
+    // running 也否决：重载时读到 running = 那次任务没有正常收尾
+    // （还活着的话由 tailActive 兜着，这里的 running 是崩溃留下的）
+    for (const state of ['cancelled', 'failed', 'interrupted', 'running'] as TurnState[]) {
+      const seg = segmentTurns(longTurn('u', 'a', state))[0];
+      expect(seg.foldable, `${state} 不该折叠`).toBe(false);
+      // 不折叠 ≠ 不计数：过程完整可见，控制行数据照旧算得出来
+      expect(seg.toolCallCount).toBe(4);
+      expect(seg.answerIndex).not.toBeNull();
+    }
+  });
+
+  it('没有记录（旧会话 / 未锚定）= 不否决，维持按形态判定的既有行为', () => {
+    const seg = segmentTurns(longTurn('u', 'a'))[0];
+    expect(seg.foldable).toBe(true);
+  });
+
+  it('被后续 user 封顶的中间回合同样受否决约束（不止尾回合）', () => {
+    const first = longTurn('u1', 'a1', 'cancelled');
+    const second = longTurn('u2', 'a2', 'completed');
+    const segs = segmentTurns([...first, ...second]);
+    expect(segs).toHaveLength(2);
+    expect(segs[0].foldable).toBe(false);
+    expect(segs[1].foldable).toBe(true);
+  });
+
+  it('否决只看回合首条 user 上的状态（别处的同名字段不生效）', () => {
+    // 状态只写在锚点行上：答案上带了同名值不该影响判定
+    const turn = longTurn('u', 'a');
+    turn[turn.length - 1] = { ...turn[turn.length - 1], turnState: 'cancelled' };
+    expect(segmentTurns(turn)[0].foldable).toBe(true);
+  });
+});
+
+describe('turnStopVetoed', () => {
+  it('只有 completed 与「没有记录」放行', () => {
+    expect(turnStopVetoed(undefined)).toBe(false);
+    expect(turnStopVetoed('completed')).toBe(false);
+    expect(turnStopVetoed('running')).toBe(true);
+    expect(turnStopVetoed('cancelled')).toBe(true);
+    expect(turnStopVetoed('failed')).toBe(true);
+    expect(turnStopVetoed('interrupted')).toBe(true);
+  });
+});
+
+describe('withTailTurnState', () => {
+  const conv = () => [user('u1'), assistantText('a1', 'x'), user('u2'), tool('t1')];
+
+  it('写在最后一条 user（尾回合锚点）上，不改动别的消息', () => {
+    const base = conv();
+    const next = withTailTurnState(base, 'cancelled');
+    expect(next).not.toBe(base);
+    expect(next[2].turnState).toBe('cancelled');
+    expect(next[0].turnState).toBeUndefined();
+    expect(next[1]).toBe(base[1]); // 其余消息保持同一对象引用
+  });
+
+  it('已是同一状态 → 原数组返回（不给 store/React 造无谓变更）', () => {
+    const base = withTailTurnState(conv(), 'failed');
+    expect(withTailTurnState(base, 'failed')).toBe(base);
+  });
+
+  it('没有 user 消息（未加载 / 空会话）→ 原样返回，不造空回合', () => {
+    const noUser = [assistantText('a1', 'x'), tool('t1')];
+    expect(withTailTurnState(noUser, 'failed')).toBe(noUser);
+  });
+
+  it('覆盖式写入：running → completed 会被改成 completed', () => {
+    // 任务跑着的时候重载过会话（锚点从库里读到 running），自然结束后要能覆盖
+    const base = withTailTurnState(conv(), 'running');
+    expect(withTailTurnState(base, 'completed')[2].turnState).toBe('completed');
+  });
+
+  it('状态变化时一并记下结束时刻（任务用时的 live 终点）', () => {
+    const next = withTailTurnState(conv(), 'completed', '2026-01-01T00:00:10.000Z');
+    expect(next[2].turnFinishedAt).toBe('2026-01-01T00:00:10.000Z');
+    expect(next[0].turnFinishedAt).toBeUndefined();
+  });
+
+  it('同一状态再落一次：不覆盖已有的结束时刻（先到的信号为准）', () => {
+    const first = withTailTurnState(conv(), 'completed', '2026-01-01T00:00:10.000Z');
+    const again = withTailTurnState(first, 'completed', '2026-01-01T00:09:00.000Z');
+    expect(again).toBe(first);
+    expect(again[2].turnFinishedAt).toBe('2026-01-01T00:00:10.000Z');
+  });
+
+  it('从库里载回来已是该状态的回合：被再叫一次也不能把「现在」当成结束时间', () => {
+    // 重载后锚点有 turnState 但没有 turnFinishedAt（不落库）
+    const loaded = conv().map((m, i) => (i === 2 ? { ...m, turnState: 'completed' as const } : m));
+    const next = withTailTurnState(loaded, 'completed', '2026-06-01T12:00:00.000Z');
+    expect(next).toBe(loaded);
+    expect(next[2].turnFinishedAt).toBeUndefined();
+  });
+
+  it('不传结束时刻 → 与旧行为一致，不写 turnFinishedAt', () => {
+    expect(withTailTurnState(conv(), 'failed')[2].turnFinishedAt).toBeUndefined();
+  });
+});
+
+describe('turnFoldLabel', () => {
+  it('整个回合独立汇总步骤、中间消息和子任务', () => {
+    expect(turnFoldLabel({ toolCallCount: 4, messageCount: 2, subagentCount: 1 }))
+      .toBe('已执行 4 步 · 1 个任务 · 共 2 条消息');
+  });
+  it('不显示没有发生的消息或任务计数', () => {
+    expect(turnFoldLabel({ toolCallCount: 3, messageCount: 0, subagentCount: 0 }))
+      .toBe('已执行 3 步');
+    expect(turnFoldLabel({ toolCallCount: 0, messageCount: 2, subagentCount: 0 }))
+      .toBe('共 2 条消息');
+  });
+  it('计数沿用回合语义，交付物与最终答复不算过程', () => {
+    const segment = segmentTurns([
+      user('u'), assistantText('middle', '处理中'), tool('t1'),
+      tool('t2'), tool('t3'), tool('viz', 'render_html'), assistantText('answer', '完成'),
+    ])[0];
+    expect(turnFoldLabel(segment)).toBe('已执行 3 步 · 共 1 条消息');
+  });
+  it('无过程的旧数据保持查看文案', () => {
+    expect(turnFoldLabel({ toolCallCount: 0, messageCount: 0, subagentCount: 0 }))
+      .toBe('查看过程');
+  });
+});
+
+describe('执行中工具的回合保护', () => {
+  it('即使有完成标记和末尾答案，执行中卡也不能被回合收起', () => {
+    const messages = [
+      { ...user('u'), turnState: 'completed' as const },
+      tool('t1'), tool('t2'), tool('t3'),
+      { ...tool('t4'), isExecuting: true },
+      assistantText('answer', 'done'),
+    ];
+    expect(segmentTurns(messages)[0].foldable).toBe(false);
+  });
+});

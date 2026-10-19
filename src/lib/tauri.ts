@@ -1,0 +1,1449 @@
+import { invoke } from "@tauri-apps/api/core";
+import { isDebugSession } from "@/lib/debugServer";
+import { getErrorMessage } from "./errors";
+import type { HistorySnapshot } from "./historySnapshot";
+import type {
+  ActiveMessagesResult,
+  AppBootstrapData,
+  ConnectionConfig,
+  SavedConnection,
+  StoredKeyMeta,
+  KeyOriginStatus,
+  AppSettings,
+  AgentConversation,
+  StoredMessage,
+  UserInputMetadata,
+  ConversationSearchResult,
+  AgentTaskPlan,
+  Skill,
+  QuickCommand,
+  QuickCommandInput,
+  QuickCommandPatch,
+  McpServer,
+  McpServerInput,
+  McpServerListResponse,
+  McpTool,
+  McpHttpRuntimeInfo,
+  McpClientConfig,
+  McpServerDefaults,
+  UpdateCheckResult,
+  UpdateState,
+  UpdateCapabilities,
+  ParsedSkill,
+  SkillResource,
+  SkillDiscovery,
+  CommandCheckResult,
+  SftpFileEntry,
+  ModelInfo,
+  ChannelKeyStatus,
+  PluginManifest,
+  PluginHttpRequest,
+  PluginHttpResponse,
+  ReloadDiff,
+  MarketIndex,
+  MarketDetail,
+  PluginInstallResult,
+  TruncateConversationResult,
+  JobInfo,
+} from "./types";
+
+// SSH commands
+
+export async function sshConnect(config: ConnectionConfig): Promise<string> {
+  return invoke<string>("ssh_connect", { config });
+}
+
+export async function sshDisconnect(sessionId: string): Promise<void> {
+  return invoke("ssh_disconnect", { sessionId });
+}
+
+export async function sshSendInput(
+  sessionId: string,
+  data: string,
+): Promise<void> {
+  if (isDebugSession(sessionId)) return;
+  return invoke("ssh_send_input", { sessionId, data });
+}
+
+export async function sshResize(
+  sessionId: string,
+  cols: number,
+  rows: number,
+): Promise<void> {
+  if (isDebugSession(sessionId)) return;
+  return invoke("ssh_resize", { sessionId, cols, rows });
+}
+
+export async function sshListSessions(): Promise<string[]> {
+  return invoke<string[]>("ssh_list_sessions");
+}
+
+export async function sshExec(
+  sessionId: string,
+  command: string,
+): Promise<string> {
+  return invoke<string>("ssh_exec", { sessionId, command });
+}
+
+export async function sshListProcesses(sessionId: string): Promise<string> {
+  return invoke<string>("ssh_exec", {
+    sessionId,
+    command:
+      "ps -eo pid,user,pcpu,pmem,etime,comm,args --no-headers 2>/dev/null || ps -eo pid,user,pcpu,pmem,etime,comm,args --no-headers",
+  });
+}
+
+export async function sshListNetwork(sessionId: string): Promise<string> {
+  return invoke<string>("ssh_exec", {
+    sessionId,
+    command:
+      '(ss -Htlnp 2>/dev/null || ss -tlnp 2>/dev/null); echo "---CONNECTIONS---"; (ss -Htnp 2>/dev/null || ss -tnp 2>/dev/null)',
+  });
+}
+
+export async function sshListInterfaces(sessionId: string): Promise<string> {
+  return invoke<string>("ssh_exec", {
+    sessionId,
+    command:
+      "ip -j addr 2>/dev/null || ip addr 2>/dev/null || ifconfig 2>/dev/null",
+  });
+}
+
+// Agent commands
+
+export async function agentStartTask(
+  sessionId: string,
+  prompt: string,
+  mode: string,
+  conversationId: string,
+  historySnapshot: HistorySnapshot,
+  taskId?: string,
+  modelId?: string | null,
+  /**
+   * 这一轮 prompt 的来源：省略 = 用户自己打的字；`"job_notice"` = 后台作业的
+   * 结算告知（自动继续）。决定这条消息在会话里的身份与「算不算用户输入」。
+   */
+  origin?: 'job_notice',
+  userInput?: UserInputMetadata,
+): Promise<string> {
+  return invoke<string>("agent_start_task", {
+    sessionId,
+    prompt,
+    mode,
+    conversationId,
+    historySnapshot,
+    taskId,
+    modelId: modelId ?? null,
+    origin: origin ?? null,
+    userInput: userInput ?? null,
+  });
+}
+
+/** 设置会话级模型记忆（**仅内存**，后端 AppState.session_models）。
+ *  llmRegistry 模型条目 id；null/空 = 清除本会话记忆，回落全局最近使用。 */
+export async function agentSetSessionModel(
+  conversationId: string,
+  modelId: string | null,
+): Promise<void> {
+  return invoke("agent_set_session_model", {
+    conversationId,
+    modelId: modelId ?? null,
+  });
+}
+
+/** 读取会话级模型记忆（内存）。null = 无记忆，跟随全局最近使用。 */
+export async function agentGetSessionModel(
+  conversationId: string,
+): Promise<string | null> {
+  return invoke<string | null>("agent_get_session_model", {
+    conversationId,
+  });
+}
+
+/** 设置会话级思考强度记忆（内存 + 落盘：后端 session_efforts +
+ *  conversations.efforts_json，**重启后记住**）。
+ *  `modelId` = 档位归属的模型 id（传当前生效模型）；档位按「会话 × 模型」
+ *  双维记忆，切到别的模型互不污染。reasoningEffort 档位字符串
+ *  （low/medium/high/max 等）；null/空 = 清除该 (会话, 模型) 的记忆。 */
+export async function agentSetSessionEffort(
+  conversationId: string,
+  modelId: string,
+  reasoningEffort: string | null,
+): Promise<void> {
+  return invoke("agent_set_session_effort", {
+    conversationId,
+    modelId,
+    reasoningEffort: reasoningEffort ?? null,
+  });
+}
+
+/** 读取会话级思考强度记忆（内存）。`modelId` 无记忆 → null = 跟随模型默认。 */
+export async function agentGetSessionEffort(
+  conversationId: string,
+  modelId: string,
+): Promise<string | null> {
+  return invoke<string | null>("agent_get_session_effort", {
+    conversationId,
+    modelId,
+  });
+}
+
+/** Save compressed images for a user message; returns relative paths under images/. */
+export async function agentSaveMessageImages(
+  conversationId: string,
+  messageId: string,
+  imagesBase64: string[],
+): Promise<string[]> {
+  return invoke<string[]>("agent_save_message_images", {
+    conversationId,
+    messageId,
+    imagesBase64,
+  });
+}
+
+/** Persist a user message when start_task failed after images were saved. */
+export async function agentSaveUserMessage(
+  conversationId: string,
+  content: string,
+  timestamp: string,
+  imagePaths?: string[],
+  userInput?: UserInputMetadata,
+): Promise<void> {
+  return invoke("agent_save_user_message", {
+    conversationId,
+    content,
+    timestamp,
+    imagePaths: imagePaths ?? null,
+    userInput: userInput ?? null,
+  });
+}
+
+/** Resolve absolute path for asset protocol display. */
+export async function agentResolveImagePath(
+  relativePath: string,
+): Promise<string> {
+  return invoke<string>("agent_resolve_image_path", { relativePath });
+}
+
+/** Read a persisted message image as data URL (rollback restore). */
+export async function agentReadMessageImage(
+  relativePath: string,
+): Promise<string> {
+  return invoke<string>("agent_read_message_image", { relativePath });
+}
+
+/** Delete a single persisted message image (idempotent). */
+export async function agentDeleteMessageImage(
+  relativePath: string,
+): Promise<void> {
+  return invoke("agent_delete_message_image", { relativePath });
+}
+
+/** 读取本地文件用于附件导入（普通路径 / Android SAF content:// URI）。 */
+export interface LocalFilePayload {
+  name: string;
+  base64: string;
+  size: number;
+}
+
+export async function agentReadLocalFile(
+  path: string,
+): Promise<LocalFilePayload> {
+  return invoke<LocalFilePayload>("agent_read_local_file", { path });
+}
+
+/**
+ * 仅查询本地文件展示名（不读内容）。
+ *
+ * 用途：前端在「按扩展名/文件名分拣图片/文本附件」之前调用，拿到真实文件名。
+ * Android SAF content:// URI 必须经 ContentResolver 查 DISPLAY_NAME，
+ * 简单按 `/` 切最后一段只能拿到 document id（无扩展名），会把 .jpg 当成文本塞进输入框 → 乱码。
+ * 桌面普通路径走 Path::file_name 兜底，行为不变。
+ */
+export async function agentGetLocalFileName(path: string): Promise<string> {
+  return invoke<string>("agent_get_local_file_name", { path });
+}
+
+export async function agentStopTask(taskId: string): Promise<void> {
+  return invoke("agent_stop_task", { taskId });
+}
+
+/** 手动压缩上下文的结果。 */
+export interface AgentCompactResult {
+  compacted: boolean;
+  summary: string | null;
+  shadowedMessages: number;
+  shadowedTokens: number;
+  /** 被压区间末条消息的 DB row id（统一 id 指针，前端按 dbId 定位插卡）。 */
+  tailDbId: string | null;
+  reason: string | null;
+  /** 是否已进入摘要阶段（false=未开始就跳过，前端不留痕；true=摘要已跑但失败） */
+  attempted: boolean;
+}
+
+/** 手动压缩指定会话的上下文（命令面板「压缩上下文」）。
+ *  historySnapshot 只携带当前消息事实，由后端按与 agent_start_task 相同规则投影；
+ *  taskId 由前端生成，作为 `agent://stream/{taskId}` 事件通道（压缩事件
+ *  实时转发，前端复用 attachStreamListener 显示卡片）。 */
+export async function agentCompactConversation(
+  conversationId: string,
+  historySnapshot: HistorySnapshot,
+  taskId: string,
+): Promise<AgentCompactResult> {
+  return invoke<AgentCompactResult>("agent_compact_conversation", {
+    conversationId,
+    taskId,
+    historySnapshot,
+  });
+}
+
+/** 取消该会话正在跑的手动压缩（压缩中的「取消压缩」按钮）。
+ *
+ *  返回「确实取消了一次在册压缩」：false 只说明这次点晚了（事件已到、命令已
+ *  返回），不是错误。取消后后端会发 `Skipped{attempted:true}`，进行中的卡片转成
+ *  「上下文压缩未完成：已取消」，原文与库都不动。 */
+export async function agentCancelCompaction(conversationId: string): Promise<boolean> {
+  return invoke<boolean>("agent_cancel_compaction", { conversationId });
+}
+
+export async function agentApproveOperation(
+  taskId: string,
+  operationId: string,
+): Promise<void> {
+  return invoke("agent_approve_operation", { taskId, operationId });
+}
+
+/// 拒绝一次待审批的操作。`reason` 可选，会原样转达给模型 —— 不说理由时模型
+/// 只知道"被拒了"，于是换个写法再试，用户被迫反复拒绝。
+export async function agentRejectOperation(
+  taskId: string,
+  operationId: string,
+  reason?: string,
+): Promise<void> {
+  return invoke("agent_reject_operation", { taskId, operationId, reason: reason ?? null });
+}
+
+export async function agentAnswerQuestion(
+  taskId: string,
+  questionId: string,
+  answers: { selected: string[]; custom: string }[],
+): Promise<void> {
+  return invoke("agent_answer_question", { taskId, questionId, answers });
+}
+
+// Conversation management commands
+
+export async function agentCreateConversation(
+  sessionId: string,
+  title?: string,
+): Promise<string> {
+  return invoke<string>("agent_create_conversation", { sessionId, title });
+}
+
+export async function agentRenameConversation(
+  conversationId: string,
+  title: string,
+): Promise<void> {
+  return invoke("agent_rename_conversation", { conversationId, title });
+}
+
+/** 置顶/取消置顶会话（只改列表视图元数据，后端不动 updatedAt）。 */
+export async function agentSetConversationPinned(
+  conversationId: string,
+  pinned: boolean,
+): Promise<void> {
+  return invoke("agent_set_conversation_pinned", { conversationId, pinned });
+}
+
+export async function agentListConversations(
+  sessionId: string,
+): Promise<AgentConversation[]> {
+  return invoke<AgentConversation[]>("agent_list_conversations", { sessionId });
+}
+
+export async function agentGetConversation(
+  conversationId: string,
+): Promise<AgentConversation> {
+  return invoke<AgentConversation>("agent_get_conversation", {
+    conversationId,
+  });
+}
+
+export async function agentListConversationsByConnection(
+  connectionId: string,
+): Promise<AgentConversation[]> {
+  return invoke<AgentConversation[]>("agent_list_conversations_by_connection", {
+    connectionId,
+  });
+}
+
+export async function agentSearchConversations(
+  keyword: string,
+  connectionId?: string,
+): Promise<ConversationSearchResult[]> {
+  return invoke<ConversationSearchResult[]>("agent_search_conversations", {
+    keyword,
+    connectionId: connectionId ?? null,
+  });
+}
+
+export async function agentLoadConversation(
+  conversationId: string,
+): Promise<StoredMessage[]> {
+  return invoke<StoredMessage[]>("agent_load_conversation", { conversationId });
+}
+
+export async function agentLoadActiveMessages(
+  conversationId: string,
+): Promise<ActiveMessagesResult> {
+  return invoke<ActiveMessagesResult>("agent_load_active_messages", { conversationId });
+}
+
+export async function agentLoadEarlierMessages(
+  conversationId: string,
+  beforeMessageId: string,
+  limit: number,
+): Promise<{ messages: StoredMessage[]; hasMore: boolean }> {
+  return invoke<{ messages: StoredMessage[]; hasMore: boolean }>(
+    "agent_load_earlier_messages",
+    { conversationId, beforeMessageId, limit },
+  );
+}
+
+export async function agentLoadPlansByConversation(
+  conversationId: string,
+): Promise<{ taskId: string; plan: AgentTaskPlan; updatedAt: string }[]> {
+  return invoke<{ taskId: string; plan: AgentTaskPlan; updatedAt: string }[]>(
+    "agent_load_plans_by_conversation",
+    { conversationId },
+  );
+}
+
+export async function agentDeleteConversation(
+  conversationId: string,
+): Promise<void> {
+  return invoke("agent_delete_conversation", { conversationId });
+}
+
+export async function agentTruncateConversation(
+  conversationId: string,
+  fromTimestamp: string,
+): Promise<TruncateConversationResult> {
+  return invoke<TruncateConversationResult>("agent_truncate_conversation", {
+    conversationId,
+    fromTimestamp,
+  });
+}
+
+export async function agentDeleteConversationsBySession(
+  sessionId: string,
+): Promise<void> {
+  return invoke("agent_delete_conversations_by_session", { sessionId });
+}
+
+export async function agentCheckCommand(
+  command: string,
+  mode: "plan" | "agent" | "auto",
+): Promise<CommandCheckResult> {
+  return invoke<CommandCheckResult>("agent_check_command", { command, mode });
+}
+
+/** 内置的命令审批系统提示词（设置页默认值展示 / 「恢复默认」用，不在前端自带副本）。 */
+export async function agentDefaultApprovalPrompt(): Promise<string> {
+  return invoke<string>("agent_default_approval_prompt");
+}
+
+// Config commands
+
+export async function getConnections(): Promise<SavedConnection[]> {
+  return invoke<SavedConnection[]>("config_get_connections");
+}
+
+export async function saveConnection(
+  connection: SavedConnection,
+): Promise<string> {
+  return invoke<string>("config_save_connection", { connection });
+}
+
+export async function deleteConnection(id: string): Promise<void> {
+  return invoke("config_delete_connection", { id });
+}
+
+/** 一条连接的落位（拖拽排序用）：id + 目标分组；group 为 null = 未分组。 */
+export interface ConnectionOrderEntry {
+  id: string;
+  group: string | null;
+}
+
+/**
+ * 应用拖拽后的连接顺序（组内重排 / 跨组移入 / 拖动整个分组都表达为一次全量顺序）。
+ * 数组顺序即展示顺序；后端会补齐请求里缺失的连接、忽略不存在的 id。
+ */
+export async function applyConnectionOrder(
+  order: ConnectionOrderEntry[],
+): Promise<void> {
+  return invoke("config_apply_connection_order", { order });
+}
+
+export async function getSettings(): Promise<{
+  settings: AppSettings;
+  hasApiKey: boolean;
+  hasWebSearchApiKey?: boolean;
+  /** DeepSeek 工具类（搜索 + 网页获取）API Key 是否存在。原始 Key 永不回传前端。 */
+  hasDeepseekToolsApiKey?: boolean;
+  /** 自定义搜索 API 的 Key 是否存在（Key 可选）。原始 Key 永不回传前端。 */
+  hasCustomSearchApiKey?: boolean;
+  /** 自定义网页获取服务的 Key 是否存在（Key 可选）。原始 Key 永不回传前端。 */
+  hasCustomFetchApiKey?: boolean;
+  /** Tavily 网页获取的 Key 是否存在。原始 Key 永不回传前端。 */
+  hasTavilyFetchApiKey?: boolean;
+  /** TypeSafe（Jev）API Key 是否存在。原始 Key 永不回传前端。 */
+  hasJevApiKey?: boolean;
+  /** 各渠道密钥是否存在（多渠道模型服务）。 */
+  channelKeyStatus?: ChannelKeyStatus[];
+  warning?: string;
+}> {
+  return invoke("config_get_settings");
+}
+
+export async function saveSettings(settings: AppSettings): Promise<void> {
+  return invoke("config_save_settings", { settings });
+}
+
+export async function validateCustomProtectedPaths(
+  paths: string[],
+): Promise<string | null> {
+  try {
+    await invoke("config_validate_custom_protected_paths", { paths });
+    return null;
+  } catch (e) {
+    // 返回值直接被设置页当错误文案显示（AgentPolicySection / MobileAgentPolicySection），
+    // 所以必须走统一的取文案入口：结构化 AppError 是 `{kind, message}` 对象，
+    // `String(e)` 会渲染成字面量 "[object Object]"。
+    return getErrorMessage(e);
+  }
+}
+
+// Password / keychain commands
+
+export async function savePassword(
+  connectionId: string,
+  password: string,
+): Promise<void> {
+  return invoke("config_save_password", { connectionId, password });
+}
+
+export async function hasPassword(connectionId: string): Promise<boolean> {
+  return invoke<boolean>("config_has_password", { connectionId });
+}
+
+export async function connectWithSavedPassword(
+  connectionId: string,
+  trustNewHostKey = false,
+): Promise<string> {
+  return invoke<string>("ssh_connect_with_saved_password", {
+    connectionId,
+    trustNewHostKey,
+  });
+}
+
+export async function connectWithSavedPassphrase(
+  connectionId: string,
+  trustNewHostKey = false,
+): Promise<string> {
+  return invoke<string>("ssh_connect_with_saved_passphrase", {
+    connectionId,
+    trustNewHostKey,
+  });
+}
+
+export async function deletePassword(connectionId: string): Promise<void> {
+  return invoke("config_delete_password", { connectionId });
+}
+
+export async function sshReconnect(
+  sessionId: string,
+  connectionId: string,
+  trustNewHostKey = false,
+): Promise<void> {
+  return invoke("ssh_reconnect", { sessionId, connectionId, trustNewHostKey });
+}
+
+export async function savePassphrase(
+  connectionId: string,
+  passphrase: string,
+): Promise<void> {
+  return invoke("config_save_passphrase", { connectionId, passphrase });
+}
+
+export async function hasPassphrase(connectionId: string): Promise<boolean> {
+  return invoke<boolean>("config_has_passphrase", { connectionId });
+}
+
+export async function deletePassphrase(connectionId: string): Promise<void> {
+  return invoke("config_delete_passphrase", { connectionId });
+}
+
+// 私钥库（已导入的私钥）
+//
+// 安全：这些命令只进出元数据（名字 / 算法 / 指纹 / 是否带密码），私钥正文只在
+// Rust 侧存在——导入时进去一次，连接时由后端自行取用，从不回读给前端。
+
+/**
+ * 导入一把私钥文件。`path` 是系统文件对话框给的结果：桌面上是真实路径，
+ * Android 上是 `content://` 取件凭据（由 Rust 侧经 ContentResolver 读）。
+ */
+export async function importKeyFile(
+  path: string,
+  name?: string,
+  passphrase?: string,
+): Promise<StoredKeyMeta> {
+  return invoke<StoredKeyMeta>("ssh_key_import_file", {
+    path,
+    name,
+    passphrase,
+  });
+}
+
+/** 导入用户粘贴的私钥文本。 */
+export async function importKeyText(
+  content: string,
+  name?: string,
+  passphrase?: string,
+): Promise<StoredKeyMeta> {
+  return invoke<StoredKeyMeta>("ssh_key_import_text", {
+    content,
+    name,
+    passphrase,
+  });
+}
+
+export async function listKeys(): Promise<StoredKeyMeta[]> {
+  return invoke<StoredKeyMeta[]>("ssh_key_list");
+}
+
+export async function renameKey(id: string, name: string): Promise<StoredKeyMeta> {
+  return invoke<StoredKeyMeta>("ssh_key_rename", { id, name });
+}
+
+export async function deleteKey(id: string): Promise<void> {
+  return invoke("ssh_key_delete", { id });
+}
+
+/** 这把私钥的导入来源现在什么样（`null` = 没有来源可比，例如粘贴导入的）。 */
+export async function keyOriginStatus(
+  id: string,
+): Promise<KeyOriginStatus | null> {
+  return invoke<KeyOriginStatus | null>("ssh_key_origin_status", { id });
+}
+
+/**
+ * 用来源文件的当前内容刷新库里那一份（同一个条目原地换掉，连接不用改）。
+ * 新内容带密码时要把密码一起给。
+ */
+export async function refreshKeyFromOrigin(
+  id: string,
+  passphrase?: string,
+): Promise<StoredKeyMeta | null> {
+  return invoke<StoredKeyMeta | null>("ssh_key_refresh_from_origin", {
+    id,
+    passphrase,
+  });
+}
+
+// Jump host keychain
+
+export async function saveJumpPassword(
+  connectionId: string,
+  password: string,
+): Promise<void> {
+  return invoke("config_save_jump_password", { connectionId, password });
+}
+
+export async function hasJumpPassword(connectionId: string): Promise<boolean> {
+  return invoke<boolean>("config_has_jump_password", { connectionId });
+}
+
+export async function deleteJumpPassword(connectionId: string): Promise<void> {
+  return invoke("config_delete_jump_password", { connectionId });
+}
+
+export async function saveJumpPassphrase(
+  connectionId: string,
+  passphrase: string,
+): Promise<void> {
+  return invoke("config_save_jump_passphrase", { connectionId, passphrase });
+}
+
+export async function hasJumpPassphrase(
+  connectionId: string,
+): Promise<boolean> {
+  return invoke<boolean>("config_has_jump_passphrase", { connectionId });
+}
+
+export async function deleteJumpPassphrase(
+  connectionId: string,
+): Promise<void> {
+  return invoke("config_delete_jump_passphrase", { connectionId });
+}
+
+// Quick command commands
+
+export async function quickCommandList(
+  sessionKey?: string | null,
+): Promise<QuickCommand[]> {
+  return invoke<QuickCommand[]>("quick_command_list", {
+    sessionKey: sessionKey ?? null,
+  });
+}
+
+export async function quickCommandAdd(
+  command: QuickCommandInput,
+): Promise<QuickCommand> {
+  return invoke<QuickCommand>("quick_command_add", { command });
+}
+
+export async function quickCommandUpdate(
+  id: string,
+  patch: QuickCommandPatch,
+): Promise<void> {
+  return invoke("quick_command_update", { id, patch });
+}
+
+export async function quickCommandDelete(id: string): Promise<void> {
+  return invoke("quick_command_delete", { id });
+}
+
+// MCP commands
+
+// MCP server（对外服务，与上面的 mcp* client 函数方向相反）
+
+export async function mcpServerStatus(): Promise<McpHttpRuntimeInfo | null> {
+  return invoke<McpHttpRuntimeInfo | null>("mcp_server_status");
+}
+
+export async function mcpServerStartHttp(
+  bind: string,
+  port: number,
+  token?: string,
+): Promise<McpHttpRuntimeInfo> {
+  return invoke<McpHttpRuntimeInfo>("mcp_server_start_http", {
+    bind,
+    port,
+    token: token ?? null,
+  });
+}
+
+/** 停止服务。返回「之前是否在跑」。 */
+export async function mcpServerStopHttp(): Promise<boolean> {
+  return invoke<boolean>("mcp_server_stop_http");
+}
+
+export async function mcpServerRegenerateToken(): Promise<string> {
+  return invoke<string>("mcp_server_regenerate_token");
+}
+
+export async function mcpServerClientConfig(): Promise<McpClientConfig> {
+  return invoke<McpClientConfig>("mcp_server_client_config");
+}
+
+export async function mcpServerDefaults(): Promise<McpServerDefaults> {
+  return invoke<McpServerDefaults>("mcp_server_defaults");
+}
+
+export async function mcpListServers(): Promise<McpServerListResponse> {
+  return invoke<McpServerListResponse>("mcp_list_servers");
+}
+
+export async function mcpAddServer(input: McpServerInput): Promise<McpServer> {
+  return invoke<McpServer>("mcp_add_server", { input });
+}
+
+export async function mcpUpdateServer(
+  id: string,
+  input: McpServerInput,
+): Promise<void> {
+  return invoke("mcp_update_server", { id, input });
+}
+
+export async function mcpDeleteServer(id: string): Promise<void> {
+  return invoke("mcp_delete_server", { id });
+}
+
+export async function mcpToggleServer(id: string): Promise<void> {
+  return invoke("mcp_toggle_server", { id });
+}
+
+export async function mcpRefreshTools(id: string): Promise<McpTool[]> {
+  return invoke<McpTool[]>("mcp_refresh_tools", { id });
+}
+
+// LLM API Key management（多渠道：每个渠道独立密钥）
+
+export async function saveLlmChannelApiKey(
+  channelId: string,
+  apiKey: string,
+): Promise<void> {
+  return invoke("config_save_llm_channel_api_key", { channelId, apiKey });
+}
+
+export async function deleteLlmChannelApiKey(channelId: string): Promise<void> {
+  return invoke("config_delete_llm_channel_api_key", { channelId });
+}
+
+export async function saveWebSearchApiKey(apiKey: string): Promise<void> {
+  return invoke("config_save_web_search_api_key", { apiKey });
+}
+
+export async function deleteWebSearchApiKey(): Promise<void> {
+  return invoke("config_delete_web_search_api_key");
+}
+
+/** 保存 DeepSeek 工具类 API Key（网页搜索 + 网页获取共用，独立于搜索 Key 槽位）。 */
+export async function saveDeepseekToolsApiKey(apiKey: string): Promise<void> {
+  return invoke("config_save_deepseek_tools_api_key", { apiKey });
+}
+
+export async function deleteDeepseekToolsApiKey(): Promise<void> {
+  return invoke("config_delete_deepseek_tools_api_key");
+}
+
+/** 保存「自定义搜索 API」的 Key（独立槽位，绝不会被发给 Brave/Tavily/DeepSeek 官方）。 */
+export async function saveCustomSearchApiKey(apiKey: string): Promise<void> {
+  return invoke("config_save_custom_search_api_key", { apiKey });
+}
+
+export async function deleteCustomSearchApiKey(): Promise<void> {
+  return invoke("config_delete_custom_search_api_key");
+}
+
+/** 保存「自定义网页获取」服务的 Key（独立槽位，只会发给用户填的那个地址）。 */
+export async function saveCustomFetchApiKey(apiKey: string): Promise<void> {
+  return invoke("config_save_custom_fetch_api_key", { apiKey });
+}
+
+export async function deleteCustomFetchApiKey(): Promise<void> {
+  return invoke("config_delete_custom_fetch_api_key");
+}
+
+/** 保存「Tavily 网页获取」的 Key（独立槽位；留空时后端沿用 Tavily 搜索的 Key）。 */
+export async function saveTavilyFetchApiKey(apiKey: string): Promise<void> {
+  return invoke("config_save_tavily_fetch_api_key", { apiKey });
+}
+
+export async function deleteTavilyFetchApiKey(): Promise<void> {
+  return invoke("config_delete_tavily_fetch_api_key");
+}
+
+/** 保存 TypeSafe（Jev）API Key 到系统密钥链。原始 Key 不回传前端。 */
+export async function saveJevApiKey(apiKey: string): Promise<void> {
+  return invoke("config_save_jev_api_key", { apiKey });
+}
+
+export async function deleteJevApiKey(): Promise<void> {
+  return invoke("config_delete_jev_api_key");
+}
+
+// Background Jobs（统一命令执行体系：job_list / job_kill）
+
+/**
+ * 列出后台作业。
+ * @param sessionId 会话 ID；空 / null = 拉取全部会话的作业（启动恢复用）。
+ * @param status 可选状态过滤（running / completed / killed / failed）。
+ */
+export async function jobList(
+  sessionId?: string | null,
+  status?: string | null,
+): Promise<JobInfo[]> {
+  return invoke<JobInfo[]>("job_list", {
+    sessionId: sessionId ?? null,
+    status: status ?? null,
+  });
+}
+
+/** 一条待交给模型的作业结算告知：文本 + 它覆盖的作业 id（确认时要回传）。 */
+export interface JobNotice {
+  text: string;
+  jobIds: string[];
+}
+
+/**
+ * 取某会话「作业跑完了、但还没告诉过模型」的结局；没有则 null。
+ *
+ * **只读**：调它不会消费结局 —— 真的把告知交给模型之后要调
+ * `jobAckNotice` 确认（会话已关、应用正要退出时不能把结局吞掉）。
+ */
+export async function jobPendingNotice(
+  conversationId: string,
+): Promise<JobNotice | null> {
+  return invoke<JobNotice | null>("job_pending_notice", { conversationId });
+}
+
+/** 确认这些作业的结局已经交给模型（此后不再播报）。返回真的被确认的条数。 */
+export async function jobAckNotice(jobIds: string[]): Promise<number> {
+  return invoke<number>("job_ack_notice", { jobIds });
+}
+
+// LLM model discovery
+
+/**
+ * Fetch the list of models available on the configured provider.
+ * Pass the current draft channelId/baseUrl/apiKey so the request reflects
+ * the UI state; the backend falls back to that channel's keychain entry
+ * when apiKey is empty or masked.
+ */
+export async function llmListModels(
+  channelId?: string | null,
+  baseUrl?: string | null,
+  apiKey?: string | null,
+): Promise<ModelInfo[]> {
+  return invoke<ModelInfo[]>("llm_list_models", {
+    channelId: channelId ?? null,
+    baseUrl: baseUrl ?? null,
+    apiKey: apiKey ?? null,
+  });
+}
+
+// Skill commands
+
+export async function skillList(): Promise<Skill[]> {
+  return invoke<Skill[]>("skill_list");
+}
+
+export async function skillAdd(
+  name: string,
+  description: string,
+  prompt: string,
+  resources?: SkillResource[],
+): Promise<Skill> {
+  return invoke<Skill>("skill_add", { name, description, prompt, resources });
+}
+
+export async function skillUpdate(
+  id: string,
+  name?: string,
+  description?: string,
+  prompt?: string,
+  resources?: SkillResource[],
+): Promise<void> {
+  return invoke("skill_update", { id, name, description, prompt, resources });
+}
+
+export async function skillToggle(id: string): Promise<void> {
+  return invoke("skill_toggle", { id });
+}
+
+export async function skillDelete(id: string): Promise<void> {
+  return invoke("skill_delete", { id });
+}
+
+/** 用户 skill 手动排序：ids 为完整的用户 skill id 顺序 */
+export async function skillReorder(ids: string[]): Promise<void> {
+  return invoke("skill_reorder", { ids });
+}
+
+export async function importSkillFile(
+  fileData: string,
+  fileName: string,
+): Promise<ParsedSkill> {
+  return invoke<ParsedSkill>("import_skill_file", { fileData, fileName });
+}
+
+/** 列出 GitHub 仓库（或其中某个子目录）里的所有 skill，供多选导入。
+ *  `mirror` 为空时后端使用内置镜像。 */
+export async function skillDiscoverFromUrl(
+  url: string,
+  mirror?: string,
+  importId?: string,
+): Promise<SkillDiscovery> {
+  return invoke<SkillDiscovery>("skill_discover_from_url", {
+    url,
+    mirror: mirror ?? null,
+    importId: importId ?? null,
+  });
+}
+
+/** 从 GitHub 地址拉取指定 skill 并解析（不入库，前端预览确认后再保存）。
+ *  `subpath` 省略时用地址里的子路径。 */
+export async function skillImportFromUrl(
+  url: string,
+  subpath?: string,
+  mirror?: string,
+  importId?: string,
+): Promise<ParsedSkill> {
+  return invoke<ParsedSkill>("skill_import_from_url", {
+    url,
+    subpath: subpath ?? null,
+    mirror: mirror ?? null,
+    importId: importId ?? null,
+  });
+}
+
+/** 中断 `importId` 对应的 GitHub 下载（进度经 `skill-import-progress` 事件推送）。 */
+export async function skillImportCancel(importId: string): Promise<void> {
+  return invoke("skill_import_cancel", { importId });
+}
+
+// App lifecycle
+
+/** 移动端同步前后台；桌面端 no-op。前台时不发 Agent 系统通知。 */
+export async function mobileSetAppForeground(
+  inForeground: boolean,
+): Promise<void> {
+  return invoke("mobile_set_app_foreground", { inForeground });
+}
+
+/** 获取聚合启动快照数据包 */
+export async function getBootstrapData(): Promise<AppBootstrapData> {
+  return invoke<AppBootstrapData>("app_get_bootstrap");
+}
+
+export async function appReady(): Promise<void> {
+  return invoke("app_ready");
+}
+
+// Update check
+
+export async function checkUpdate(): Promise<UpdateCheckResult> {
+  return invoke<UpdateCheckResult>("check_update");
+}
+
+// Silent updater（桌面 Windows + Android 共用同一套状态机与 command）
+
+/** 本机平台支持的更新能力（Windows exe / Android apk / 其他桌面平台 none）。 */
+export async function updateCapabilities(): Promise<UpdateCapabilities> {
+  return invoke<UpdateCapabilities>("update_capabilities");
+}
+
+export async function getUpdateState(): Promise<UpdateState> {
+  return invoke<UpdateState>("get_update_state");
+}
+
+/**
+ * 立即安装已就绪的更新。
+ * Windows：退出应用并静默安装（装完自动重启）；Android：拉起系统安装器（系统界面确认）。
+ */
+export async function installUpdateNow(): Promise<void> {
+  return invoke("install_update_now");
+}
+
+/** 手动触发后台下载（设置页/药丸「后台下载」；手机端绕过「仅非计量网络」限制）。 */
+export async function startUpdateDownload(): Promise<void> {
+  return invoke("start_update_download");
+}
+
+// SFTP commands
+
+export async function sftpListDir(
+  sessionId: string,
+  path: string,
+): Promise<SftpFileEntry[]> {
+  return invoke<SftpFileEntry[]>("sftp_list_dir", { sessionId, path });
+}
+
+export async function sftpMkdir(
+  sessionId: string,
+  path: string,
+): Promise<void> {
+  return invoke("sftp_mkdir", { sessionId, path });
+}
+
+export async function sftpRemove(
+  sessionId: string,
+  path: string,
+  isDir: boolean,
+): Promise<void> {
+  return invoke("sftp_remove", { sessionId, path, isDir });
+}
+
+export async function sftpRemoveViaShell(
+  sessionId: string,
+  path: string,
+  isDir: boolean,
+): Promise<void> {
+  return invoke("sftp_remove_via_shell", { sessionId, path, isDir });
+}
+
+export async function sftpRename(
+  sessionId: string,
+  oldPath: string,
+  newPath: string,
+): Promise<void> {
+  return invoke("sftp_rename", { sessionId, oldPath, newPath });
+}
+
+/**
+ * 读取文件内容（编辑器用）。`hasBom` 表示原文带 UTF-8 BOM（后端已剥掉 BOM 再给
+ * content），保存时必须原样回传，否则会静默丢掉 BOM。旧后端没有该字段，按无 BOM 处理。
+ */
+export async function sftpReadFile(
+  sessionId: string,
+  path: string,
+): Promise<{ content: string; mtime: number; hasBom: boolean }> {
+  const result = await invoke<{
+    content: string;
+    mtime: number;
+    hasBom?: boolean;
+  }>("sftp_read_file", {
+    sessionId,
+    path,
+  });
+  return { ...result, hasBom: result.hasBom === true };
+}
+
+export async function sftpGetMtime(
+  sessionId: string,
+  path: string,
+): Promise<number> {
+  return invoke<number>("sftp_get_mtime", { sessionId, path });
+}
+
+/** 写回文件。`bom` 为 true 时后端会在内容前补回 UTF-8 BOM（缺省 false，向后兼容）。 */
+export async function sftpWriteFile(
+  sessionId: string,
+  path: string,
+  content: string,
+  bom = false,
+): Promise<void> {
+  return invoke("sftp_write_file", { sessionId, path, content, bom });
+}
+
+export async function sftpDownloadStream(
+  sessionId: string,
+  remotePath: string,
+  localPath: string,
+  downloadId: string,
+): Promise<void> {
+  return invoke("sftp_download_stream", {
+    sessionId,
+    remotePath,
+    localPath,
+    downloadId,
+  });
+}
+
+export async function sftpUploadStream(
+  sessionId: string,
+  remotePath: string,
+  localPath: string,
+  uploadId: string,
+): Promise<void> {
+  return invoke("sftp_upload_stream", {
+    sessionId,
+    remotePath,
+    localPath,
+    uploadId,
+  });
+}
+
+export async function sftpCancelUpload(uploadId: string): Promise<void> {
+  return invoke("sftp_cancel_upload", { uploadId });
+}
+
+/**
+ * 解析本地文件的展示名。
+ * Android SAF content:// URI 无法从最后一段取文件名（是编码后的 document id），
+ * 后端经 ContentResolver 查询 DISPLAY_NAME；普通路径取 basename。
+ */
+export async function sftpLocalFileName(path: string): Promise<string> {
+  return invoke<string>("sftp_local_file_name", { path });
+}
+
+/** Android SAF 返回的 content:// URI（文件选择器/保存对话框产物）。 */
+export function isContentUri(path: string): boolean {
+  return path.startsWith("content://");
+}
+
+export async function sftpCancelDownload(downloadId: string): Promise<void> {
+  return invoke("sftp_cancel_download", { downloadId });
+}
+
+// ──────────── 图片预览（下载到临时目录后由 WebView 通过 asset 协议加载） ────────────
+
+export interface SftpPreviewImageResult {
+  localPath: string;
+  syncUploadId?: string;
+}
+
+/** 下载远程图片到 marcel-previews/{previewId}/ 临时目录，返回本地路径。 */
+export async function sftpPreviewImage(
+  sessionId: string,
+  remotePath: string,
+  previewId: string,
+): Promise<SftpPreviewImageResult> {
+  return invoke<SftpPreviewImageResult>("sftp_preview_image", {
+    sessionId,
+    remotePath,
+    previewId,
+  });
+}
+
+/** sysopen 任务阶段，与后端 SysopenPhase 对应（serde tag=kind, rename camelCase）。
+ *  前端据此更新传输中心「下载」与「监视回传」两张卡片的状态与文案。 */
+export type SysopenPhase =
+  | { kind: "downloading"; written: number; total: number }
+  | { kind: "opened" }
+  | { kind: "monitoring" }
+  | { kind: "syncing"; written: number; total: number }
+  | { kind: "synced" }
+  | { kind: "cancelled" }
+  | { kind: "failed"; message: string };
+
+export interface SysopenStateEvent {
+  taskId: string;
+  downloadId: string;
+  uploadId: string;
+  phase: SysopenPhase;
+}
+
+export interface SysopenResult {
+  taskId: string;
+  localPath: string;
+  /** true = 复用了已存在任务（仅再次唤起系统应用打开本地副本）；前端不应新建监视卡片。 */
+  reused: boolean;
+}
+
+/** 下载远程文件到 marcel-sysopen/ 临时目录，用系统默认应用打开；
+ *  本地文件改动后自动回传到远程。状态经 `sftp-sysopen-state` 事件统一推送。 */
+export async function sftpOpenWithSystem(
+  sessionId: string,
+  remotePath: string,
+  taskId: string,
+  downloadId: string,
+  uploadId: string,
+): Promise<SysopenResult> {
+  return invoke<SysopenResult>("sftp_open_with_system", {
+    sessionId,
+    remotePath,
+    taskId,
+    downloadId,
+    uploadId,
+  });
+}
+
+/** 取消 sysopen 任务（下载阶段与监视阶段均可中止）。 */
+export async function sftpCancelSysopen(taskId: string): Promise<void> {
+  return invoke("sftp_cancel_sysopen", { taskId });
+}
+
+/**
+ * 清理预览临时文件。
+ * - 传入 localPath：仅清理该文件及其所在 {uuid} 目录
+ * - 不传：扫描整个 marcel-previews 根（应用启动时调用）
+ */
+export async function sftpPreviewCleanup(localPath?: string): Promise<void> {
+  return invoke("sftp_preview_cleanup", { localPath: localPath ?? null });
+}
+
+export async function sftpUploadFolderStream(
+  sessionId: string,
+  localPath: string,
+  remotePath: string,
+  uploadId: string,
+  flat: boolean,
+): Promise<void> {
+  return invoke("sftp_upload_folder_stream", {
+    sessionId,
+    localPath,
+    remotePath,
+    uploadId,
+    flat,
+  });
+}
+
+/**
+ * 拖拽上传预备：后端把拖入的本地文件/目录复制进临时目录。
+ *
+ * 返回临时目录与**复制失败清单**（每条形如 `路径: 原因`）。部分失败不算命令失败——
+ * 调用方要继续上传能复制的那部分，同时把 failures 显眼地告诉用户，不能显示成
+ * 「上传完成」了事。兼容旧后端（直接返回 tempDir 字符串）：failures 视为空。
+ */
+export async function sftpPrepareDragUpload(
+  filePaths: string[],
+): Promise<{ tempDir: string; failures: string[] }> {
+  const result = await invoke<
+    string | { tempDir: string; failures?: string[] }
+  >("sftp_prepare_drag_upload", { filePaths });
+  if (typeof result === "string") return { tempDir: result, failures: [] };
+  return { tempDir: result.tempDir, failures: result.failures ?? [] };
+}
+
+export async function sftpCleanupTempDir(tempDir: string): Promise<void> {
+  return invoke("sftp_cleanup_temp_dir", { tempDir });
+}
+
+export async function sftpExtractArchive(
+  sessionId: string,
+  remotePath: string,
+  targetDir: string,
+): Promise<void> {
+  return invoke("sftp_extract_archive", { sessionId, remotePath, targetDir });
+}
+
+/**
+ * 压缩远程目录为 tar.gz 或 zip 归档。
+ * 进度通过 `ssh-long-output` 事件实时透传，取消调 `sshExecLongCancel(taskId)`。
+ */
+export async function sftpCompressArchive(
+  sessionId: string,
+  remoteDir: string,
+  format: "tar.gz" | "zip",
+  targetPath: string,
+  overwrite: boolean,
+  taskId: string,
+): Promise<void> {
+  return invoke("sftp_compress_archive", {
+    sessionId,
+    remoteDir,
+    format,
+    targetPath,
+    overwrite,
+    taskId,
+  });
+}
+
+/** 取消正在运行的 ssh_exec_long / sftp_compress_archive 任务。 */
+export async function sshExecLongCancel(taskId: string): Promise<void> {
+  return invoke("ssh_exec_long_cancel", { taskId });
+}
+
+// Plugin webview commands
+
+export async function pluginWebviewCreate(
+  label: string,
+  pluginId: string,
+  entry: string,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+): Promise<void> {
+  return invoke("plugin_webview_create", {
+    params: { label, pluginId, entry, x, y, width, height },
+  });
+}
+
+export async function pluginWebviewSetBounds(
+  label: string,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+): Promise<void> {
+  return invoke("plugin_webview_set_bounds", { label, x, y, width, height });
+}
+
+export async function pluginWebviewClose(label: string): Promise<void> {
+  return invoke("plugin_webview_close", { label });
+}
+
+export async function pluginList(): Promise<PluginManifest[]> {
+  return invoke<PluginManifest[]>("plugin_list");
+}
+
+/** Fetch the command→capability map from the Rust single source of truth.
+ *  Used by `pluginIpc.ts` to build `COMMAND_TO_CAPABILITY` at init time. */
+export async function pluginCapabilityMap(): Promise<Record<string, string>> {
+  return invoke<Record<string, string>>("plugin_capability_map");
+}
+
+/** Trigger a registry reload on the backend. Returns the diff so the caller
+ *  can react to per-plugin changes (destroy/recreate only changed webviews +
+ *  injections). The backend also emits `plugin-registry-changed` separately. */
+export async function pluginReload(): Promise<ReloadDiff> {
+  return invoke<ReloadDiff>("plugin_reload");
+}
+
+export async function getPluginDir(): Promise<string> {
+  return invoke<string>("get_plugin_dir");
+}
+
+export async function openPluginDir(): Promise<void> {
+  return invoke("open_plugin_dir");
+}
+
+export async function pluginFsRead(
+  pluginId: string,
+  path: string,
+): Promise<string> {
+  return invoke<string>("plugin_fs_read", { pluginId, path });
+}
+
+export async function pluginFsWrite(
+  pluginId: string,
+  path: string,
+  content: string,
+): Promise<void> {
+  return invoke("plugin_fs_write", { pluginId, path, content });
+}
+
+export async function pluginHttpRequest(
+  request: PluginHttpRequest,
+): Promise<PluginHttpResponse> {
+  return invoke<PluginHttpResponse>("plugin_http_request", { request });
+}
+
+export async function pluginSendNotification(
+  pluginId: string,
+  title: string,
+  body: string,
+): Promise<void> {
+  return invoke("plugin_send_notification", { pluginId, title, body });
+}
+
+/** Fetch the plugin market index. `indexUrl` carries the user-configured
+ *  GitHub mirror (empty = built-in defaults: jsDelivr index + raw fallback). */
+export async function marketList(indexUrl?: string): Promise<MarketIndex> {
+  return invoke<MarketIndex>("market_list", { indexUrl: indexUrl ?? null });
+}
+
+/** Fetch a plugin's plugin.json + README from its GitHub repo, routed
+ *  through the configured mirror (empty = built-in defaults). */
+export async function marketDetail(
+  repoUrl: string,
+  mirror?: string,
+): Promise<MarketDetail> {
+  return invoke<MarketDetail>("market_detail", {
+    repoUrl,
+    mirror: mirror ?? null,
+  });
+}
+
+/** One-click install: download the plugin archive (mirror-first), extract it
+ *  into the plugins directory. Takes effect after an app restart. Progress is
+ *  pushed via `plugin-install-progress` events keyed by `installId`; the task
+ *  can be aborted via `pluginInstallCancel(installId)`. */
+export async function pluginInstall(
+  repoUrl: string,
+  installId: string,
+  mirror?: string,
+): Promise<PluginInstallResult> {
+  return invoke<PluginInstallResult>("plugin_install", {
+    repoUrl,
+    installId,
+    mirror: mirror ?? null,
+  });
+}
+
+/** Abort a running plugin install (download or extraction). */
+export async function pluginInstallCancel(installId: string): Promise<void> {
+  return invoke("plugin_install_cancel", { installId });
+}
+
+/** Update an installed plugin (mirror-first, preserve user data). */
+export async function pluginUpdate(
+  repoUrl: string,
+  installId: string,
+  mirror?: string,
+): Promise<PluginInstallResult> {
+  return invoke<PluginInstallResult>("plugin_update", {
+    repoUrl,
+    installId,
+    mirror: mirror ?? null,
+  });
+}
+
+/** Remove an installed plugin (directory + settings residue). */
+export async function pluginUninstall(pluginId: string): Promise<void> {
+  return invoke("plugin_uninstall", { pluginId });
+}

@@ -1,0 +1,1549 @@
+@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+@import 'highlight.js/styles/github-dark.css';
+
+/* xterm.js styles */
+@import "@xterm/xterm/css/xterm.css";
+
+/*
+ * 内置 Nerd Fonts 图标字体（JetBrainsMono Nerd Font Mono，随包分发，字体与许可见 public/fonts/）。
+ * 终端字体栈用它补图标字形，用户不需要自己装 Nerd Font；
+ * font-display: block —— 图标宁可短暂不显示，也不要先用缺字的兜底字形画出来（会被缓存进纹理图集）。
+ * 字体栈构造与加载见 src/lib/terminalFont.ts。
+ */
+@font-face {
+  font-family: "SakiShell Nerd Font Mono";
+  src: url("/fonts/JetBrainsMonoNerdFontMono-Regular.ttf") format("truetype");
+  font-weight: 400;
+  font-style: normal;
+  font-display: block;
+}
+
+/* Spring animation timing functions */
+:root {
+  --spring-bounce: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --spring-smooth: cubic-bezier(0.22, 1, 0.36, 1);
+  --spring-snappy: cubic-bezier(0.68, -0.6, 0.32, 1.6);
+
+  /* Apple-style border radius */
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+  --radius-full: 9999px;
+
+  /* Theme bridge for sandboxed in-conversation visualizations. */
+  --marcel-viz-background: #18181b;
+  --marcel-viz-surface: rgb(255 255 255 / 6%);
+  --marcel-viz-text: #f4f4f5;
+  --marcel-viz-muted: #a1a1aa;
+  --marcel-viz-border: #52525b;
+  --marcel-viz-accent: #818cf8;
+  --marcel-viz-accentText: #ffffff;
+}
+
+/*
+ * 可视化的底色要等于它所在那一层「面」的底色，否则在面上就是一块偏亮/偏暗的方块。
+ * 默认值（zinc-900）是桌面对话面板和手机底部面板的底色；手机对话页是更深的
+ * zinc-950（MobileAgentHost 根节点的 bg-zinc-950），这一层覆盖它。变量沿 DOM 继承，
+ * 可视化容器从自己的位置读（resolveVisualizationTheme 的 host 参数）。
+ * 改手机对话页底色时同步改这里。
+ */
+.marcel-viz-surface-page {
+  --marcel-viz-background: #09090b;
+}
+
+/* Spring keyframes for toggle/button animations */
+@keyframes spring-pop {
+  0% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(1.1);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
+/* 数字角标入场（如传输中心的红色失败角标）：弹一下出现 */
+@keyframes badge-pop-in {
+  0% {
+    transform: scale(0.4);
+    opacity: 0;
+  }
+  60% {
+    transform: scale(1.15);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+.badge-pop-in {
+  animation: badge-pop-in 180ms ease-out both;
+}
+
+@keyframes spring-toggle-on {
+  0% {
+    transform: translateX(0);
+  }
+  45% {
+    transform: translateX(calc(100% + 4px));
+  }
+  70% {
+    transform: translateX(calc(100% - 1px));
+  }
+  100% {
+    transform: translateX(calc(100% + 0px));
+  }
+}
+
+@keyframes spring-toggle-off {
+  0% {
+    transform: translateX(calc(100% + 0px));
+  }
+  45% {
+    transform: translateX(-4px);
+  }
+  70% {
+    transform: translateX(1px);
+  }
+  100% {
+    transform: translateX(0);
+  }
+}
+
+/* 工具调用「撰写中」气泡：从状态条（左下）向上分裂出来，带一点果冻回弹 */
+/* 工具调用「撰写中」：卡片标题行先是一枚胶囊，从状态条（左下）向上"分裂"出来，
+   参数写完后**同一个元素**褪成普通卡片行（宽度/底色/圆角/前缀全是 CSS 过渡，
+   没有卸载重挂，所以没有闪烁和跳动）。行高与卡片行一致，状态切换不改变布局高度。 */
+@keyframes compose-split {
+  0% {
+    opacity: 0;
+    transform: translate(-4px, 18px) scale(0.15, 0.3);
+  }
+  55% {
+    opacity: 1;
+    transform: translate(0, -3px) scale(1.04, 1.06);
+  }
+  80% {
+    transform: translate(0, 1px) scale(0.99, 0.98);
+  }
+  100% {
+    opacity: 1;
+    transform: translate(0, 0) scale(1);
+  }
+}
+.compose-split-enter {
+  transform-origin: 14px 100%;
+  animation: compose-split 420ms cubic-bezier(0.34, 1.56, 0.64, 1) both;
+}
+.tool-card-row-composing,
+.tool-card-row-settled {
+  border-radius: 9999px;
+  transition:
+    max-width 340ms cubic-bezier(0.22, 1, 0.36, 1),
+    padding 340ms ease,
+    background-color 340ms ease,
+    box-shadow 340ms ease,
+    border-radius 340ms ease;
+}
+.tool-card-row-composing {
+  max-width: 13rem;
+  padding-left: 8px;
+  padding-right: 8px;
+  background-color: rgb(39 39 42 / 0.5);
+  box-shadow: inset 0 0 0 1px rgb(63 63 70 / 0.6);
+}
+.tool-card-row-settled {
+  max-width: 100%;
+  padding-left: 4px;
+  padding-right: 4px;
+  background-color: rgb(39 39 42 / 0);
+  box-shadow: inset 0 0 0 1px rgb(63 63 70 / 0);
+  border-radius: 6px;
+}
+.compose-prefix {
+  display: inline-block;
+  max-width: 5rem;
+  overflow: hidden;
+  white-space: nowrap;
+  vertical-align: bottom;
+  transition: max-width 340ms cubic-bezier(0.22, 1, 0.36, 1), opacity 240ms ease;
+}
+.tool-card-row-settled .compose-prefix {
+  max-width: 0;
+  opacity: 0;
+}
+@media (prefers-reduced-motion: reduce) {
+  .compose-split-enter {
+    animation: none;
+  }
+  .tool-card-row-composing,
+  .tool-card-row-settled,
+  .compose-prefix {
+    transition: none;
+  }
+}
+
+/* 工具卡里的瞬态块（执行中的实时输出、「模型审批中」）：高度从 0 长出来、收回去。
+   用 grid-template-rows 0fr↔1fr 做高度动画——内容高度未知（输出最高 120px、审批行
+   一行）也不用量；内层 overflow:hidden + min-height:0 才能被压到 0。
+   时长与 `useToolFoldTransition` 的折叠接近（280ms），两个动画同时发生时节奏一致。 */
+@keyframes transient-reveal-in {
+  from {
+    grid-template-rows: 0fr;
+    opacity: 0;
+  }
+  to {
+    grid-template-rows: 1fr;
+    opacity: 1;
+  }
+}
+@keyframes transient-reveal-out {
+  from {
+    grid-template-rows: 1fr;
+    opacity: 1;
+  }
+  to {
+    grid-template-rows: 0fr;
+    opacity: 0;
+  }
+}
+.transient-reveal {
+  display: grid;
+}
+.transient-reveal > * {
+  min-height: 0;
+  overflow: hidden;
+}
+.transient-reveal-enter {
+  animation: transient-reveal-in 260ms var(--spring-smooth, cubic-bezier(0.22, 1, 0.36, 1)) both;
+}
+.transient-reveal-exit {
+  animation: transient-reveal-out 220ms var(--spring-smooth, cubic-bezier(0.22, 1, 0.36, 1)) both;
+}
+@media (prefers-reduced-motion: reduce) {
+  /* 保留 1ms 而不是 none：退场要靠 animationend 卸载 */
+  .transient-reveal-enter,
+  .transient-reveal-exit {
+    animation-duration: 1ms;
+  }
+}
+
+/* 任务运行状态条：三点依次起伏的波浪 */
+@keyframes run-dot-wave {
+  0%, 60%, 100% {
+    transform: translateY(0) scale(0.75);
+    opacity: 0.35;
+  }
+  30% {
+    transform: translateY(-3px) scale(1);
+    opacity: 1;
+  }
+}
+.run-dots > i {
+  display: block;
+  width: 5px;
+  height: 5px;
+  border-radius: 9999px;
+  background: rgb(129 140 248);
+  animation: run-dot-wave 1.1s ease-in-out infinite;
+}
+.run-dots > i:nth-child(2) {
+  animation-delay: 0.15s;
+}
+.run-dots > i:nth-child(3) {
+  animation-delay: 0.3s;
+}
+@media (prefers-reduced-motion: reduce) {
+  .run-dots > i {
+    animation: none;
+    opacity: 0.7;
+  }
+}
+
+/* 滚动文字：变了的位上滚替换，旧字模糊淡出、新字由糊变清 */
+.rolling-text {
+  display: inline-flex;
+  white-space: pre;
+}
+.rolling-slot {
+  display: inline-grid;
+  line-height: 1.25;
+}
+.rolling-slot > * {
+  grid-area: 1 / 1;
+}
+.rolling-sizer {
+  visibility: hidden;
+}
+@keyframes rolling-in {
+  from {
+    transform: translateY(65%);
+    filter: blur(4px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    filter: blur(0);
+    opacity: 1;
+  }
+}
+@keyframes rolling-out {
+  from {
+    transform: translateY(0);
+    filter: blur(0);
+    opacity: 1;
+  }
+  to {
+    transform: translateY(-65%);
+    filter: blur(4px);
+    opacity: 0;
+  }
+}
+.rolling-in {
+  animation: rolling-in 380ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+.rolling-out {
+  animation: rolling-out 280ms cubic-bezier(0.5, 0, 0.75, 0) both;
+  pointer-events: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .rolling-in,
+  .rolling-out {
+    animation-duration: 1ms;
+  }
+}
+
+/* Spring utility classes */
+.spring-bounce {
+  animation-timing-function: var(--spring-bounce);
+}
+
+/* Install overlay indeterminate progress bar */
+@keyframes indeterminate-slide {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(400%);
+  }
+}
+
+.indeterminate-bar {
+  animation: indeterminate-slide 1.4s ease-in-out infinite;
+}.spring-smooth {
+  animation-timing-function: var(--spring-smooth);
+}
+
+.spring-snappy {
+  animation-timing-function: var(--spring-snappy);
+}
+
+/* Toggle animation classes */
+.animate-toggle-on {
+  animation: spring-toggle-on 400ms var(--spring-bounce) forwards;
+}
+
+.animate-toggle-off {
+  animation: spring-toggle-off 400ms var(--spring-bounce) forwards;
+}
+
+.animate-slide-down {
+  animation: slideDown 200ms var(--spring-bounce) forwards;
+}
+
+/* Smooth transitions only where needed — avoid universal selector performance hit */
+button,
+a,
+[role="button"],
+[role="tab"],
+[role="option"],
+select {
+  transition-property: background-color, border-color, color, fill, stroke, opacity, box-shadow, transform;
+  transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+  transition-duration: 150ms;
+}
+
+/* Disable transitions for specific elements */
+input,
+textarea,
+[data-no-transition] {
+  transition: none;
+}
+
+/* Prevent text selection during drag */
+[data-tauri-drag-region] {
+  -webkit-app-region: drag;
+}
+
+[data-tauri-drag-region] button,
+[data-tauri-drag-region] input {
+  -webkit-app-region: no-drag;
+}
+
+/* Ensure full height and dark background (render-blocking CSS prevents white flash) */
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  background-color: #18181b;
+}
+
+/*
+ * Experimental light theme (debug page only).
+ *
+ * The application currently uses Tailwind's zinc palette directly on the
+ * shell and feature views. Mapping the palette at the root keeps this
+ * runtime experiment coherent across mounted panels without introducing a
+ * second persistent settings system. The debug switch adds
+ * `data-marcel-theme="light"` to <html> for the current run.
+ */
+html[data-marcel-theme='light'],
+html[data-marcel-theme='light'] body,
+html[data-marcel-theme='light'] #root {
+  color-scheme: light;
+  background-color: #f4f5f7;
+  color: #18181b;
+}
+
+/* Tailwind v4 zinc utilities resolve through these variables. Remapping the
+ * palette here covers utilities added by future views without a selector for
+ * every individual component. */
+html[data-marcel-theme='light'] {
+  --color-zinc-50: #111827;
+  --color-zinc-100: #18181b;
+  --color-zinc-200: #27272a;
+  --color-zinc-300: #3f3f46;
+  --color-zinc-400: #52525b;
+  --color-zinc-500: #71717a;
+  --color-zinc-600: #a1a1aa;
+  --color-zinc-700: #d4d4d8;
+  --color-zinc-800: #e4e4e7;
+  --color-zinc-900: #f4f4f5;
+  --color-zinc-950: #ffffff;
+  --color-indigo-50: #eef2ff;
+  --color-indigo-100: #312e81;
+  --color-indigo-200: #3730a3;
+  --color-indigo-300: #4338ca;
+  --color-indigo-400: #4f46e5;
+  --color-indigo-500: #6366f1;
+  --color-indigo-600: #4f46e5;
+  --color-indigo-700: #4338ca;
+  --color-indigo-800: #c7d2fe;
+  --color-indigo-900: #e0e7ff;
+  --color-indigo-950: #eef2ff;
+  --color-red-50: #450a0a;
+  --color-red-100: #7f1d1d;
+  --color-red-200: #991b1b;
+  --color-red-300: #b91c1c;
+  --color-red-400: #dc2626;
+  --color-red-500: #ef4444;
+  --color-red-600: #f87171;
+  --color-red-700: #fca5a5;
+  --color-red-800: #fecaca;
+  --color-red-900: #fee2e2;
+  --color-red-950: #fff1f2;
+}
+
+html[data-marcel-theme='light'] .bg-zinc-950,
+html[data-marcel-theme='light'] [class~='bg-zinc-950/95'],
+html[data-marcel-theme='light'] [class~='bg-zinc-950/90'],
+html[data-marcel-theme='light'] [class~='bg-zinc-950/80'],
+html[data-marcel-theme='light'] [class~='bg-zinc-950/60'],
+html[data-marcel-theme='light'] [class~='bg-zinc-950/50'],
+html[data-marcel-theme='light'] [class~='bg-zinc-950/40'] {
+  background-color: #ffffff !important;
+}
+
+html[data-marcel-theme='light'] .bg-zinc-900,
+html[data-marcel-theme='light'] [class~='bg-zinc-900/95'],
+html[data-marcel-theme='light'] [class~='bg-zinc-900/80'],
+html[data-marcel-theme='light'] [class~='bg-zinc-900/70'],
+html[data-marcel-theme='light'] [class~='bg-zinc-900/60'],
+html[data-marcel-theme='light'] [class~='bg-zinc-900/50'],
+html[data-marcel-theme='light'] [class~='bg-zinc-900/40'] {
+  background-color: #f8fafc !important;
+}
+
+html[data-marcel-theme='light'] .bg-zinc-800,
+html[data-marcel-theme='light'] [class~='bg-zinc-800/90'],
+html[data-marcel-theme='light'] [class~='bg-zinc-800/80'],
+html[data-marcel-theme='light'] [class~='bg-zinc-800/70'],
+html[data-marcel-theme='light'] [class~='bg-zinc-800/60'],
+html[data-marcel-theme='light'] [class~='bg-zinc-800/50'] {
+  background-color: #eef1f5 !important;
+}
+
+html[data-marcel-theme='light'] .bg-zinc-700,
+html[data-marcel-theme='light'] .bg-zinc-600 {
+  background-color: #e3e6eb !important;
+}
+
+html[data-marcel-theme='light'] .text-zinc-100,
+html[data-marcel-theme='light'] .text-zinc-200 {
+  color: #18181b !important;
+}
+
+html[data-marcel-theme='light'] .text-zinc-300,
+html[data-marcel-theme='light'] .text-zinc-400 {
+  color: #3f3f46 !important;
+}
+
+html[data-marcel-theme='light'] .text-zinc-500,
+html[data-marcel-theme='light'] .text-zinc-600 {
+  color: #71717a !important;
+}
+
+html[data-marcel-theme='light'] .border-zinc-800,
+html[data-marcel-theme='light'] .border-zinc-700,
+html[data-marcel-theme='light'] .border-zinc-600,
+html[data-marcel-theme='light'] [class~='border-zinc-800/80'],
+html[data-marcel-theme='light'] [class~='border-zinc-800/60'],
+html[data-marcel-theme='light'] [class~='border-zinc-800/50'],
+html[data-marcel-theme='light'] [class~='border-zinc-700/60'],
+html[data-marcel-theme='light'] [class~='border-zinc-700/50'] {
+  border-color: #d9dde5 !important;
+}
+
+html[data-marcel-theme='light'] ::-webkit-scrollbar-thumb {
+  background: #c4c9d3;
+}
+
+html[data-marcel-theme='light'] ::-webkit-scrollbar-thumb:hover {
+  background: #aeb5c1;
+}
+
+html[data-marcel-theme='light'] {
+  scrollbar-color: #c4c9d3 transparent;
+}
+
+/*
+ * Mobile IME + overlays-content: the browser may pan/scroll the document to
+ * keep a focused input above the keyboard. That creates a blank strip under
+ * the content and exposes the bottom tab bar. Pin the document so only in-app
+ * scroll containers move; content height still reacts via --ime-bottom.
+ */
+html[data-marcel-platform='mobile'],
+html[data-marcel-platform='mobile'] body {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  overscroll-behavior: none;
+  touch-action: manipulation;
+}
+
+html[data-marcel-platform='mobile'] #root {
+  height: 100%;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
+/* Custom scrollbar styles */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #3f3f46;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #52525b;
+}
+
+/* Firefox scrollbar */
+html {
+  scrollbar-width: thin;
+  scrollbar-color: #3f3f46 transparent;
+}
+
+/* ── Custom range slider ── */
+
+input[type='range']::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--color-bg-primary, #18181b);
+  border: 2px solid var(--color-accent, #a78bfa);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4);
+  cursor: pointer;
+}
+
+input[type='range']::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--color-bg-primary, #18181b);
+  border: 2px solid var(--color-accent, #a78bfa);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4);
+  cursor: pointer;
+}
+
+input[type='range']::-moz-range-track {
+  height: 6px;
+  border-radius: 999px;
+  background: transparent;
+}
+
+input[type='range']:focus-visible {
+  outline: none;
+}
+
+.layout-contained {
+  contain: layout paint;
+}
+
+[data-window-resizing="true"] *,
+[data-window-resizing="true"] *::before,
+[data-window-resizing="true"] *::after {
+  animation-play-state: paused !important;
+}
+
+.settings-layout-frame {
+  transition:
+    max-width 260ms var(--spring-smooth, cubic-bezier(0.22, 1, 0.36, 1)),
+    padding-left 260ms var(--spring-smooth, cubic-bezier(0.22, 1, 0.36, 1)),
+    padding-right 260ms var(--spring-smooth, cubic-bezier(0.22, 1, 0.36, 1));
+}
+
+.settings-section-grid {
+  transition: gap 220ms var(--spring-smooth, cubic-bezier(0.22, 1, 0.36, 1));
+}
+
+.settings-section-grid[data-columns="1"] {
+  animation: settingsLayoutShiftOne 220ms var(--spring-smooth, cubic-bezier(0.22, 1, 0.36, 1));
+}
+
+.settings-section-grid[data-columns="2"] {
+  animation: settingsLayoutShiftTwo 220ms var(--spring-smooth, cubic-bezier(0.22, 1, 0.36, 1));
+}
+
+.settings-sidebar,
+.settings-sidebar-padding,
+.settings-card-header,
+.settings-item,
+.settings-label-column {
+  transition:
+    width 260ms var(--spring-smooth, cubic-bezier(0.22, 1, 0.36, 1)),
+    padding 260ms var(--spring-smooth, cubic-bezier(0.22, 1, 0.36, 1)),
+    gap 220ms var(--spring-smooth, cubic-bezier(0.22, 1, 0.36, 1));
+}
+
+@keyframes settingsLayoutShiftOne {
+  from {
+    opacity: 0.86;
+    transform: translateY(5px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes settingsLayoutShiftTwo {
+  from {
+    opacity: 0.86;
+    transform: translateY(5px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Smooth scrolling only where explicitly requested */
+.smooth-scroll {
+  scroll-behavior: smooth;
+}
+
+/* Smooth animations for common interactions */
+button {
+  transition: background-color 200ms var(--spring-bounce, cubic-bezier(0.34, 1.56, 0.64, 1)),
+    border-color 200ms var(--spring-bounce, cubic-bezier(0.34, 1.56, 0.64, 1)),
+    color 200ms var(--spring-bounce, cubic-bezier(0.34, 1.56, 0.64, 1)),
+    opacity 200ms var(--spring-bounce, cubic-bezier(0.34, 1.56, 0.64, 1)),
+    transform 200ms var(--spring-bounce, cubic-bezier(0.34, 1.56, 0.64, 1));
+}
+
+button:active {
+  transform: scale(0.95);
+}
+
+/* Modal and dialog animations */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes slideUp {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-slide-up {
+  animation: slideUp 250ms var(--spring-smooth, cubic-bezier(0.22, 1, 0.36, 1)) both;
+}
+
+@keyframes slideDownOut {
+  to {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+}
+
+.animate-slide-down-out {
+  animation: slideDownOut 200ms ease-in both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-slide-down-out {
+    animation-duration: 1ms;
+  }
+}
+
+@keyframes slideDown {
+  from {
+    opacity: 0;
+    transform: translateY(-10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes scaleIn {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes settingsWorkspaceEnter {
+  from {
+    opacity: 0;
+    transform: translateX(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes settingsSidebarEnter {
+  from {
+    opacity: 0;
+    transform: translateX(-10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.animate-settings-workspace-enter {
+  animation: settingsWorkspaceEnter 320ms var(--spring-smooth, cubic-bezier(0.22, 1, 0.36, 1)) both;
+}
+
+.settings-shell > :first-child {
+  animation: settingsSidebarEnter 320ms var(--spring-smooth, cubic-bezier(0.22, 1, 0.36, 1)) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-settings-workspace-enter,
+  .settings-shell > :first-child {
+    animation: none;
+  }
+}
+
+/* ── Modal / dialog enter & exit（配合 useAnimatedPresence 延迟卸载） ── */
+@keyframes scaleOut {
+  to {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+}
+
+@keyframes fadeOut {
+  to {
+    opacity: 0;
+  }
+}
+
+.modal-panel-enter {
+  animation: scaleIn 200ms var(--spring-smooth, cubic-bezier(0.22, 1, 0.36, 1)) both;
+}
+
+.modal-panel-exit {
+  animation: scaleOut 180ms ease-in both;
+}
+
+.modal-backdrop-enter {
+  animation: fadeIn 200ms ease-out both;
+}
+
+.modal-backdrop-exit {
+  animation: fadeOut 180ms ease-in both;
+}
+
+/* Context menu：快进快出，退出直接卸载（贴近原生菜单行为） */
+.context-menu-enter {
+  animation: scaleIn 120ms var(--spring-smooth, cubic-bezier(0.22, 1, 0.36, 1)) both;
+  transform-origin: top left;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .modal-panel-enter,
+  .modal-panel-exit,
+  .modal-backdrop-enter,
+  .modal-backdrop-exit,
+  .context-menu-enter,
+  .badge-pop-in {
+    animation-duration: 1ms;
+  }
+}
+
+/* Dropdown animations（menu 由 .context-menu-enter 单独控制） */
+[role="listbox"] {
+  animation: slideDown 100ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* Smooth hover effects */
+a,
+button,
+[role="button"] {
+  transition: background-color 200ms var(--spring-bounce, cubic-bezier(0.34, 1.56, 0.64, 1)),
+    border-color 200ms var(--spring-bounce, cubic-bezier(0.34, 1.56, 0.64, 1)),
+    color 200ms var(--spring-bounce, cubic-bezier(0.34, 1.56, 0.64, 1)),
+    opacity 200ms var(--spring-bounce, cubic-bezier(0.34, 1.56, 0.64, 1)),
+    transform 200ms var(--spring-bounce, cubic-bezier(0.34, 1.56, 0.64, 1));
+}
+
+/* Focus ring animations */
+:focus-visible {
+  outline: 2px solid #6366f1;
+  outline-offset: 2px;
+  transition: outline-offset 200ms var(--spring-smooth, cubic-bezier(0.22, 1, 0.36, 1));
+}
+
+/* Disable focus ring for agent panel input — outer border is the only highlight */
+.agent-input input:focus-visible,
+.agent-input textarea:focus-visible {
+  outline: none;
+  outline-offset: 0;
+}
+
+/* Card hover effects */
+.card {
+  transition: background-color 200ms var(--spring-smooth, cubic-bezier(0.22, 1, 0.36, 1)),
+    border-color 200ms var(--spring-smooth, cubic-bezier(0.22, 1, 0.36, 1)),
+    box-shadow 200ms var(--spring-smooth, cubic-bezier(0.22, 1, 0.36, 1)),
+    transform 200ms var(--spring-smooth, cubic-bezier(0.22, 1, 0.36, 1));
+}
+
+/* Smooth opacity changes */
+.fade-enter {
+  opacity: 0;
+}
+
+.fade-enter-active {
+  opacity: 1;
+  transition: opacity 200ms ease-in;
+}
+
+.fade-exit {
+  opacity: 1;
+}
+
+.fade-exit-active {
+  opacity: 0;
+  transition: opacity 200ms ease-out;
+}
+
+/* Tighten Markdown spacing in Agent messages */
+.prose.prose-sm :where(p):not(:where([class~="not-prose"],[class~="not-prose"] *)) {
+  margin-top: 0.25rem;
+  margin-bottom: 0.25rem;
+}
+
+.prose.prose-sm :where(ul, ol):not(:where([class~="not-prose"],[class~="not-prose"] *)) {
+  margin-top: 0.25rem;
+  margin-bottom: 0.25rem;
+}
+
+.prose.prose-sm :where(li):not(:where([class~="not-prose"],[class~="not-prose"] *)) {
+  margin-top: 0.125rem;
+  margin-bottom: 0.125rem;
+}
+
+.prose.prose-sm :where(li p):not(:where([class~="not-prose"],[class~="not-prose"] *)) {
+  margin-top: 0;
+  margin-bottom: 0;
+}
+
+.prose.prose-sm :where(ul > li):not(:where([class~="not-prose"],[class~="not-prose"] *)) {
+  padding-left: 0.5rem;
+}
+
+/* Nested lists — even tighter */
+.prose.prose-sm :where(ul ul, ul ol, ol ul, ol ol):not(:where([class~="not-prose"],[class~="not-prose"] *)) {
+  margin-top: 0.125rem;
+  margin-bottom: 0.125rem;
+}
+
+.prose.prose-sm :where(h1, h2, h3, h4):not(:where([class~="not-prose"],[class~="not-prose"] *)) {
+  margin-top: 0.5rem;
+  margin-bottom: 0.25rem;
+}
+
+.prose.prose-sm :where(blockquote):not(:where([class~="not-prose"],[class~="not-prose"] *)) {
+  margin-top: 0.25rem;
+  margin-bottom: 0.25rem;
+}
+
+.prose.prose-sm :where(pre):not(:where([class~="not-prose"],[class~="not-prose"] *)) {
+  margin-top: 0.25rem;
+  margin-bottom: 0.25rem;
+}
+
+.prose.prose-sm :where(hr):not(:where([class~="not-prose"],[class~="not-prose"] *)) {
+  margin-top: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+
+/* Wide tables in Agent messages: keep native table layout, but scroll
+   horizontally inside the bubble instead of blowing out its width.
+   (typography only guards <pre>; <table> has no overflow handling.) */
+.prose.prose-sm :where(table):not(:where([class~="not-prose"],[class~="not-prose"] *)) {
+  display: block;
+  overflow-x: auto;
+  max-width: 100%;
+  margin-top: 0.25rem;
+  margin-bottom: 0.25rem;
+}
+
+/* Drawer animations */
+@keyframes slideInRight {
+  from {
+    transform: translateX(100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.animate-slideInRight {
+  animation: slideInRight 200ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.animate-fadeIn {
+  animation: fadeIn 200ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+@keyframes slideOutRight {
+  to {
+    transform: translateX(100%);
+  }
+}
+
+.animate-slideOutRight {
+  animation: slideOutRight 180ms ease-in both;
+}
+
+.animate-fadeOut {
+  animation: fadeOut 180ms ease-in both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-slideOutRight,
+  .animate-fadeOut {
+    animation-duration: 1ms;
+  }
+}
+
+/* ── Onboarding wizard step transitions ──
+   方向感知的入场动画：前进时新内容从右滑入，后退时从左滑入。
+   通过给容器加 key={step} 强制重挂载触发动画。 */
+@keyframes onboardingEnterForward {
+  from {
+    opacity: 0;
+    transform: translateX(16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes onboardingEnterBackward {
+  from {
+    opacity: 0;
+    transform: translateX(-16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.onboarding-step-forward {
+  animation: onboardingEnterForward 380ms var(--spring-smooth, cubic-bezier(0.22, 1, 0.36, 1)) both;
+}
+
+.onboarding-step-backward {
+  animation: onboardingEnterBackward 380ms var(--spring-smooth, cubic-bezier(0.22, 1, 0.36, 1)) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .onboarding-step-forward,
+  .onboarding-step-backward,
+  .onboarding-logo-enter,
+  .onboarding-title-slide,
+  .main-row-enter {
+    animation: none;
+  }
+}
+
+/* ── Onboarding 步骤页左上角 header 入场 ──
+   welcome 页 logo 居中显示；翻页后 logo 从下方划上去到左上角，
+   "新手引导"文字随后从 logo 位置向右滑出。
+   较大的垂直位移营造明显的"划上去"滑动轨迹。 */
+@keyframes onboardingLogoEnter {
+  from {
+    opacity: 0;
+    transform: translate(36px, 56px) scale(1.35);
+  }
+  to {
+    opacity: 1;
+    transform: translate(0, 0) scale(1);
+  }
+}
+
+@keyframes onboardingTitleSlideRight {
+  from {
+    opacity: 0;
+    transform: translateX(-40px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.onboarding-logo-enter {
+  animation: onboardingLogoEnter 720ms var(--spring-smooth, cubic-bezier(0.22, 1, 0.36, 1)) both;
+}
+
+.onboarding-title-slide {
+  animation: onboardingTitleSlideRight 620ms var(--spring-smooth, cubic-bezier(0.22, 1, 0.36, 1)) 280ms both;
+}
+
+/* ── 引导结束后主界面缓慢滑出 ──
+   用 animation（非 transition）确保仅在引导结束时触发一次，
+   首次加载 showOnboarding 由 false→true 时不产生无效淡出。 */
+@keyframes mainRowEnter {
+  from {
+    opacity: 0;
+    transform: translateY(16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.main-row-enter {
+  animation: mainRowEnter 900ms var(--spring-smooth, cubic-bezier(0.22, 1, 0.36, 1)) both;
+}
+
+/* ── Mobile shell animations ── */
+@keyframes mobileSheetEnter {
+  from {
+    transform: translateY(100%);
+  }
+  to {
+    transform: translateY(0);
+  }
+}
+
+.mobile-sheet-enter {
+  animation: mobileSheetEnter 320ms var(--spring-smooth, cubic-bezier(0.22, 1, 0.36, 1)) both;
+}
+
+@keyframes mobileSheetExit {
+  to {
+    transform: translateY(100%);
+  }
+}
+
+.mobile-sheet-exit {
+  animation: mobileSheetExit 240ms ease-in both;
+}
+
+@keyframes mobileBackdropEnter {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.mobile-backdrop-enter {
+  animation: mobileBackdropEnter 220ms ease-out both;
+}
+
+@keyframes mobileBackdropExit {
+  to {
+    opacity: 0;
+  }
+}
+
+.mobile-backdrop-exit {
+  animation: mobileBackdropExit 240ms ease-in both;
+}
+
+@keyframes mobilePanelEnter {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.mobile-panel-enter {
+  animation: mobilePanelEnter 260ms var(--spring-smooth, cubic-bezier(0.22, 1, 0.36, 1)) both;
+}
+
+@keyframes mobilePopoverEnter {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.mobile-popover-enter {
+  transform-origin: bottom left;
+  animation: mobilePopoverEnter 200ms var(--spring-bounce, cubic-bezier(0.34, 1.56, 0.64, 1)) both;
+}
+
+@keyframes mobileFullscreenEnter {
+  from {
+    opacity: 0;
+    transform: scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.mobile-fullscreen-enter {
+  animation: mobileFullscreenEnter 240ms var(--spring-smooth, cubic-bezier(0.22, 1, 0.36, 1)) both;
+}
+
+@keyframes mobileFullscreenExit {
+  to {
+    opacity: 0;
+    transform: scale(0.98);
+  }
+}
+
+.mobile-fullscreen-exit {
+  animation: mobileFullscreenExit 200ms ease-in both;
+}
+
+@keyframes mobileOverlayEnter {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.mobile-overlay-enter {
+  animation: mobileOverlayEnter 260ms var(--spring-smooth, cubic-bezier(0.22, 1, 0.36, 1)) both;
+}
+
+@keyframes mobileOverlayExit {
+  to {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+}
+
+.mobile-overlay-exit {
+  animation: mobileOverlayExit 200ms ease-in both;
+}
+
+@keyframes mobilePopoverExit {
+  to {
+    opacity: 0;
+    transform: translateY(6px) scale(0.96);
+  }
+}
+
+.mobile-popover-exit {
+  transform-origin: bottom left;
+  animation: mobilePopoverExit 160ms ease-in both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mobile-sheet-enter,
+  .mobile-backdrop-enter,
+  .mobile-panel-enter,
+  .mobile-popover-enter,
+  .mobile-fullscreen-enter,
+  .mobile-overlay-enter {
+    animation: none;
+  }
+
+  /* 退出动画保留 1ms：useAnimatedPresence 依赖 animationend 事件卸载 */
+  .mobile-sheet-exit,
+  .mobile-backdrop-exit,
+  .mobile-fullscreen-exit,
+  .mobile-overlay-exit,
+  .mobile-popover-exit {
+    animation-duration: 1ms;
+  }
+}
+
+/* ── 列表卡片入场（桌面连接列表与移动端共用，判定见 hooks/useCardReveal） ──
+   keyframes 只写 from：终点取元素自己的计算值（opacity 1 / 行内 transform）。
+   拖拽排序时卡片的让位位移就是行内 transform，若在 to 里写死 translateY(0)
+   并 fill forwards，会把它盖掉。
+   fill-mode 用 backwards：错开的延迟期间先停在起点，卡片不会"先露脸、再消失、再入场"。
+   --reveal-delay 由 hook 按序号写入。 */
+@keyframes cardReveal {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+}
+
+@keyframes cardRevealFade {
+  from {
+    opacity: 0;
+  }
+}
+
+.card-reveal {
+  animation: cardReveal 320ms var(--spring-smooth, cubic-bezier(0.22, 1, 0.36, 1))
+    var(--reveal-delay, 0ms) backwards;
+}
+
+/* 加载指示延后现身：数据在这段时间内回来，指示器就从未可见——几十毫秒的转圈
+   一闪而过比不转更打扰。backwards 让延迟期间保持透明。 */
+@keyframes loadIndicatorIn {
+  from {
+    opacity: 0;
+  }
+}
+
+.load-indicator-delayed {
+  animation: loadIndicatorIn 200ms ease-out 240ms backwards;
+}
+
+/* 减少动态效果：位移改成纯淡入，仍然保留"内容到了"的信号 */
+@media (prefers-reduced-motion: reduce) {
+  .card-reveal {
+    animation-name: cardRevealFade;
+    animation-duration: 160ms;
+  }
+}
+
+/*
+ * 拖动侧栏分隔条期间把光标钉死。
+ * cursor 是继承属性，但终端（.xterm 自带 cursor: text）、按钮等自己声明过 cursor 的元素
+ * 会盖掉 body 上的值；拖到夹紧位置、指针离开 4px 把手之后，光标就会在拖动中途变样。
+ */
+body.marcel-resizing-x,
+body.marcel-resizing-x * {
+  cursor: col-resize !important;
+  user-select: none;
+}
+
+/* ── Agent 聊天内容列（参考 DSH ui-chat 的 --dsh-chat-content-width）──
+   滚动器本身全宽，只有内容列限宽并水平居中；窄面板（dock ~460px）时
+   width:100% 自然钳制，max-width 不会撑破容器。cqw 以最近的
+   container-type: inline-size 祖先（transcript 滚动容器 / composer 根）
+   为基准，等价于 DSH 的「对话列宽度 × 0.64，680–920 封顶」。 */
+.agent-content-column {
+  width: 100%;
+  /* 数值由 AgentPanel 根发布（自适应 clamp 或拖拽偏好 px；dock 布局不限宽，
+     发布的是 none）。这里的 clamp 只是没有发布者时的兜底。 */
+  max-width: var(--agent-content-max, clamp(680px, 64cqw, 920px));
+  margin-inline: auto;
+}
+
+/* ── 内容列宽度把手（左右一对，参考 DSH ui-conversation 的 WidthHandle）──
+   只有 agentPrimary（Agent 占主区域）布局渲染：把手占住内容列两侧的留白，
+   拖拽对称改变内容列宽度（向外 1px = 内容列 +2px）。辉光条随指针 Y 滑动，
+   hover / 拖拽中点亮。top: 44px 避开面板头部的按钮区。 */
+.agent-width-handle {
+  position: absolute;
+  top: 44px;
+  bottom: 0;
+  z-index: 20;
+  width: min(
+    40px,
+    calc((100% - var(--agent-content-max, 0px)) / 2 - 24px - 24px)
+  );
+  cursor: col-resize;
+}
+
+.agent-width-handle[data-side='left'] {
+  right: calc(50% + var(--agent-content-max, 0px) / 2 + 24px);
+}
+
+.agent-width-handle[data-side='right'] {
+  left: calc(50% + var(--agent-content-max, 0px) / 2 + 24px);
+}
+
+/* 辉光：一条 3px 竖条随指针 Y 滑动，24px 实心核心向两侧 40px 渐隐——
+   实心核心而不是单峰，否则会在渐隐里洗掉。取滚动条 hover 的色调。 */
+.agent-width-handle::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  border-radius: 3px;
+  background: linear-gradient(
+    to bottom,
+    transparent calc(var(--agent-width-handle-pointer-y, 50%) - 52px),
+    rgba(161, 161, 170, 0.45) calc(var(--agent-width-handle-pointer-y, 50%) - 12px),
+    rgba(161, 161, 170, 0.45) calc(var(--agent-width-handle-pointer-y, 50%) + 12px),
+    transparent calc(var(--agent-width-handle-pointer-y, 50%) + 52px)
+  );
+  opacity: 0;
+  pointer-events: none;
+}
+
+.agent-width-handle[data-side='left']::after {
+  right: 16px;
+}
+
+.agent-width-handle[data-side='right']::after {
+  left: 16px;
+}
+
+.agent-width-handle:hover::after,
+.agent-width-handle[data-dragging]::after {
+  opacity: 1;
+}
+
+/* ── 不确定进度（连接中 / 总大小未知 / 解析中）──
+   一段向右流动的光带，一眼能看出「在动、但不知道走了多少」，不会被误读成
+   「已经完成了一部分」。只动 transform（合成器线程）。减少动态效果时改为整条
+   轻柔明暗呼吸，不再位移。 */
+@keyframes skill-progress-flow {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(250%);
+  }
+}
+
+@keyframes skill-progress-breathe {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 0.8;
+  }
+}
+
+.skill-progress-indeterminate {
+  width: 40%;
+  animation: skill-progress-flow 1.3s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skill-progress-indeterminate {
+    width: 100%;
+    animation: skill-progress-breathe 2.4s ease-in-out infinite;
+  }
+}
+
+/* ── 至尊无敌特效（关于页图标彩蛋）──
+   鹈鹕的车轮/脚踏/颠簸全部是 CSS 动画（合成线程），仪式里 .pelican-paused 一加上就定格。
+   腿与曲柄的 `d` 关键帧由 src/lib/pelicanPedal.ts 生成并内联在 SVG 里。 */
+@keyframes pelican-spin {
+  to {
+    transform: rotate(-360deg);
+  }
+}
+
+@keyframes pelican-bob {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-1.8px);
+  }
+}
+
+.pelican-wheel {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: pelican-spin 0.42s linear infinite;
+}
+
+.pelican-bob {
+  animation: pelican-bob 0.45s ease-in-out infinite;
+}
+
+.pelican-leg-a {
+  animation: pelican-leg-a 0.9s linear infinite;
+}
+
+.pelican-leg-b {
+  animation: pelican-leg-b 0.9s linear infinite;
+}
+
+.pelican-crank-a {
+  animation: pelican-crank-a 0.9s linear infinite;
+}
+
+.pelican-crank-b {
+  animation: pelican-crank-b 0.9s linear infinite;
+}
+
+.pelican-paused .pelican-wheel,
+.pelican-paused .pelican-bob,
+.pelican-paused .pelican-leg-a,
+.pelican-paused .pelican-leg-b,
+.pelican-paused .pelican-crank-a,
+.pelican-paused .pelican-crank-b {
+  animation-play-state: paused;
+}
+
+/* 解锁横幅：弹性入场，退场只淡出（退得比进得轻，不抢戏） */
+@keyframes supreme-banner-in {
+  0% {
+    opacity: 0;
+    transform: translateY(14px) scale(0.9);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes supreme-banner-out {
+  0% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+
+@keyframes supreme-banner-fade-in {
+  0% {
+    opacity: 0;
+  }
+  100% {
+    opacity: 1;
+  }
+}
+
+.supreme-banner {
+  animation: supreme-banner-in 460ms var(--spring-bounce) both;
+}
+
+.supreme-banner-leaving {
+  animation: supreme-banner-out 360ms ease-out both;
+}
+
+/* 解锁后开关那一行出现：从上方滑入并带一圈暖色底光，告诉用户「新东西在这儿」 */
+@keyframes supreme-reveal {
+  0% {
+    opacity: 0;
+    transform: translateY(-10px);
+    background-color: rgb(245 158 11 / 0.26);
+  }
+  35% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  100% {
+    background-color: rgb(245 158 11 / 0);
+  }
+}
+
+@keyframes supreme-reveal-fade {
+  0% {
+    opacity: 0;
+    background-color: rgb(245 158 11 / 0.26);
+  }
+  100% {
+    opacity: 1;
+    background-color: rgb(245 158 11 / 0);
+  }
+}
+
+.supreme-reveal {
+  animation: supreme-reveal 1500ms var(--spring-smooth) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .supreme-banner {
+    animation: supreme-banner-fade-in 240ms ease-out both;
+  }
+  .supreme-reveal {
+    animation: supreme-reveal-fade 700ms ease-out both;
+  }
+}

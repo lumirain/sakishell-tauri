@@ -1,0 +1,1684 @@
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+import {
+  useConversationStore,
+  conversationHasRunningTask,
+  conversationIsBusy,
+  conversationIsCompacting,
+} from '@/stores/conversationStore';
+import { useTaskStore } from '@/stores/taskStore';
+import { draftKeyFor, resetAgentDrafts, useAgentDraftStore } from './agentDraftStore';
+import { getStreamState, setStreamState } from './agentStreamHandlers';
+import type { AgentMessage, AgentTask, AgentConversation, StoredMessage } from '@/lib/types';
+import { composeUserInput } from '@/lib/userInput';
+import { storedMessageToAgentMessage } from './messageConversion';
+
+const {
+  agentListConversationsByConnection,
+  agentLoadConversation,
+  agentLoadActiveMessages,
+  agentLoadEarlierMessages,
+  agentTruncateConversation,
+  agentLoadPlansByConversation,
+  agentCreateConversation,
+  agentDeleteConversation,
+  agentGetConversation,
+  agentCompactConversation,
+  agentCancelCompaction,
+  agentSetConversationPinned,
+  listen,
+} = vi.hoisted(() => ({
+  agentListConversationsByConnection: vi.fn(),
+  agentLoadConversation: vi.fn(),
+  agentLoadActiveMessages: vi.fn(),
+  agentLoadEarlierMessages: vi.fn(),
+  agentTruncateConversation: vi.fn(),
+  agentLoadPlansByConversation: vi.fn(),
+  agentCreateConversation: vi.fn(),
+  agentDeleteConversation: vi.fn(),
+  agentGetConversation: vi.fn(),
+  agentCompactConversation: vi.fn(),
+  agentCancelCompaction: vi.fn(),
+  agentSetConversationPinned: vi.fn(),
+  listen: vi.fn(),
+}));
+
+vi.mock('@/lib/tauri', () => ({
+  agentListConversationsByConnection,
+  agentLoadConversation,
+  agentLoadActiveMessages,
+  agentLoadEarlierMessages,
+  agentTruncateConversation,
+  agentLoadPlansByConversation,
+  agentCreateConversation,
+  agentDeleteConversation,
+  agentGetConversation,
+  agentCompactConversation,
+  agentCancelCompaction,
+  agentSetConversationPinned,
+}));
+
+// compactConversation 经 attachStreamListener 订阅 `agent://stream/{taskId}`；
+// 测试环境无 Tauri 事件系统，mock listen 返回 no-op unlisten。
+vi.mock('@tauri-apps/api/event', () => ({
+  listen,
+}));
+
+describe('conversationStore', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetAgentDrafts();
+    listen.mockResolvedValue(() => {});
+    agentLoadPlansByConversation.mockResolvedValue([]);
+    agentLoadActiveMessages.mockImplementation(async (convId: string) => {
+      const stored = await agentLoadConversation(convId);
+      return { messages: stored ?? [], hasEarlier: false, checkpointId: null };
+    });
+    agentLoadEarlierMessages.mockResolvedValue({ messages: [], hasMore: false });
+    useConversationStore.setState({
+      conversations: {},
+      messages: {},
+      hasEarlierMessages: {},
+      activeConversationId: null,
+      activeConversationByConnection: {},
+    });
+    // 压缩占位不跨用例残留（漏解锁的用例会在这里被清掉，而不是把下一个用例
+    // 拖成"会话永远忙"的假失败）
+    useTaskStore.setState({ compacting: {} });
+  });
+
+  function makeMessage(overrides: Partial<AgentMessage> = {}): AgentMessage {
+    return {
+      id: crypto.randomUUID ? crypto.randomUUID() : 'msg-' + Date.now(),
+      role: 'user',
+      content: 'hello',
+      timestamp: new Date().toISOString(),
+      ...overrides,
+    };
+  }
+
+  it('has correct initial state', () => {
+    const state = useConversationStore.getState();
+    expect(state.activeConversationId).toBeNull();
+    expect(Object.keys(state.conversations)).toHaveLength(0);
+    expect(Object.keys(state.messages)).toHaveLength(0);
+  });
+
+  it('addMessage does nothing without active conversation', () => {
+    useConversationStore.getState().addMessage(makeMessage());
+    expect(Object.keys(useConversationStore.getState().messages)).toHaveLength(0);
+  });
+
+  it('addMessage appends to active conversation', () => {
+    useConversationStore.setState({
+      activeConversationId: 'conv-1',
+      messages: { 'conv-1': [] },
+    });
+
+    useConversationStore.getState().addMessage(makeMessage({ content: 'first' }));
+    useConversationStore.getState().addMessage(makeMessage({ content: 'second' }));
+
+    const msgs = useConversationStore.getState().messages['conv-1'];
+    expect(msgs).toHaveLength(2);
+    expect(msgs[0].content).toBe('first');
+    expect(msgs[1].content).toBe('second');
+  });
+
+  it('clearMessages clears active conversation messages', () => {
+    useConversationStore.setState({
+      activeConversationId: 'conv-1',
+      messages: { 'conv-1': [makeMessage(), makeMessage()], 'conv-2': [makeMessage()] },
+    });
+
+    useConversationStore.getState().clearMessages();
+
+    expect(useConversationStore.getState().messages['conv-1']).toHaveLength(0);
+    expect(useConversationStore.getState().messages['conv-2']).toHaveLength(1);
+  });
+
+  it('getCurrentMessages returns active messages', () => {
+    useConversationStore.setState({
+      activeConversationId: 'conv-1',
+      messages: { 'conv-1': [makeMessage({ content: 'a' }), makeMessage({ content: 'b' })] },
+    });
+
+    expect(useConversationStore.getState().getCurrentMessages()).toHaveLength(2);
+  });
+
+  it('getCurrentMessages returns empty when no active conversation', () => {
+    expect(useConversationStore.getState().getCurrentMessages()).toEqual([]);
+  });
+
+  it('clearConnectionConversations removes matching conversations', () => {
+    useConversationStore.setState({
+      conversations: {
+        'c1': { id: 'c1', connectionId: 'conn-a', title: 'A1', createdAt: '', updatedAt: '' },
+        'c2': { id: 'c2', connectionId: 'conn-a', title: 'A2', createdAt: '', updatedAt: '' },
+        'c3': { id: 'c3', connectionId: 'conn-b', title: 'B1', createdAt: '', updatedAt: '' },
+      },
+      messages: {
+        'c1': [makeMessage()],
+        'c2': [makeMessage()],
+        'c3': [makeMessage()],
+      },
+      activeConversationId: 'c2',
+    });
+
+    useConversationStore.getState().clearConnectionConversations('conn-a');
+
+    const state = useConversationStore.getState();
+    expect(Object.keys(state.conversations)).toHaveLength(1);
+    expect(state.conversations['c3']).toBeDefined();
+    expect(state.messages['c3']).toBeDefined();
+    expect(state.messages['c1']).toBeUndefined();
+    expect(state.messages['c2']).toBeUndefined();
+  });
+
+  it('clearConnectionConversations resets active when removed', () => {
+    useConversationStore.setState({
+      conversations: {
+        'c1': { id: 'c1', connectionId: 'conn-a', title: 'A', createdAt: '', updatedAt: '' },
+        'c2': { id: 'c2', connectionId: 'conn-a', title: 'B', createdAt: '', updatedAt: '' },
+      },
+      messages: { 'c1': [], 'c2': [] },
+      activeConversationId: 'c1',
+    });
+
+    useConversationStore.getState().clearConnectionConversations('conn-a');
+
+    // Active was c1 which got removed; should be null since nothing left
+    expect(useConversationStore.getState().activeConversationId).toBeNull();
+  });
+
+  it('loads messages for the restored latest conversation', async () => {
+    agentListConversationsByConnection.mockResolvedValue([
+      { id: 'latest', connectionId: 'conn-a', title: 'Latest', createdAt: '', updatedAt: '2026-01-02T00:00:00Z' },
+      { id: 'older', connectionId: 'conn-a', title: 'Older', createdAt: '', updatedAt: '2026-01-01T00:00:00Z' },
+    ]);
+    agentLoadConversation.mockResolvedValue([
+      {
+        id: 'msg-1',
+        conversationId: 'latest',
+        role: 'user',
+        content: 'previous message',
+        timestamp: '2026-01-02T00:00:00Z',
+        createdAt: '2026-01-02T00:00:00Z',
+      },
+    ]);
+
+    await useConversationStore.getState().loadConnectionConversations('conn-a');
+
+    const state = useConversationStore.getState();
+    expect(state.activeConversationId).toBe('latest');
+    expect(state.messages.latest).toHaveLength(1);
+    expect(state.messages.latest[0].content).toBe('previous message');
+    expect(agentLoadConversation).toHaveBeenCalledWith('latest');
+  });
+
+  it('loadConnectionConversations does not keep active from another connection', async () => {
+    agentListConversationsByConnection.mockResolvedValue([
+      { id: 'b1', connectionId: 'conn-b', title: 'B', createdAt: '', updatedAt: '2026-01-02T00:00:00Z' },
+    ]);
+    agentLoadConversation.mockResolvedValue([]);
+    useConversationStore.setState({
+      conversations: {
+        a1: { id: 'a1', connectionId: 'conn-a', title: 'A', createdAt: '', updatedAt: '' },
+      },
+      messages: { a1: [makeMessage({ content: 'on A' })] },
+      activeConversationId: 'a1',
+      activeConversationByConnection: { 'conn-a': 'a1' },
+    });
+
+    await useConversationStore.getState().loadConnectionConversations('conn-b');
+
+    const state = useConversationStore.getState();
+    // load 合并列表但不抢 active（仍在 conn-a）
+    expect(state.activeConversationId).toBe('a1');
+    expect(state.conversations.b1).toBeDefined();
+    expect(state.activeConversationByConnection['conn-b']).toBe('b1');
+    expect(agentLoadConversation).not.toHaveBeenCalled();
+  });
+
+  it('syncActiveToConnection switches active conversation to target connection', async () => {
+    agentListConversationsByConnection.mockResolvedValue([
+      { id: 'b1', connectionId: 'conn-b', title: 'B', createdAt: '', updatedAt: '2026-01-02T00:00:00Z' },
+    ]);
+    agentLoadConversation.mockResolvedValue([
+      {
+        id: 'msg-b',
+        conversationId: 'b1',
+        role: 'user',
+        content: 'on B',
+        timestamp: '2026-01-02T00:00:00Z',
+        createdAt: '2026-01-02T00:00:00Z',
+      },
+    ]);
+    useConversationStore.setState({
+      conversations: {
+        a1: { id: 'a1', connectionId: 'conn-a', title: 'A', createdAt: '', updatedAt: '' },
+      },
+      messages: { a1: [makeMessage({ content: 'on A' })] },
+      activeConversationId: 'a1',
+      activeConversationByConnection: { 'conn-a': 'a1' },
+    });
+
+    await useConversationStore.getState().syncActiveToConnection('conn-b');
+
+    const state = useConversationStore.getState();
+    expect(state.activeConversationId).toBe('b1');
+    expect(state.messages.b1?.[0]?.content).toBe('on B');
+    expect(state.activeConversationByConnection['conn-b']).toBe('b1');
+  });
+
+  it('syncActiveToConnection restores remembered conversation for connection', async () => {
+    agentListConversationsByConnection.mockResolvedValue([
+      { id: 'b-new', connectionId: 'conn-b', title: 'newer', createdAt: '', updatedAt: '2026-01-03T00:00:00Z' },
+      { id: 'b-old', connectionId: 'conn-b', title: 'older', createdAt: '', updatedAt: '2026-01-01T00:00:00Z' },
+    ]);
+    agentLoadConversation.mockResolvedValue([]);
+    useConversationStore.setState({
+      conversations: {
+        a1: { id: 'a1', connectionId: 'conn-a', title: 'A', createdAt: '', updatedAt: '' },
+        'b-old': { id: 'b-old', connectionId: 'conn-b', title: 'older', createdAt: '', updatedAt: '2026-01-01T00:00:00Z' },
+        'b-new': { id: 'b-new', connectionId: 'conn-b', title: 'newer', createdAt: '', updatedAt: '2026-01-03T00:00:00Z' },
+      },
+      messages: {
+        a1: [makeMessage({ content: 'A' })],
+        'b-old': [makeMessage({ content: 'remembered B' })],
+        'b-new': [makeMessage({ content: 'latest B' })],
+      },
+      activeConversationId: 'a1',
+      activeConversationByConnection: { 'conn-a': 'a1', 'conn-b': 'b-old' },
+    });
+
+    await useConversationStore.getState().syncActiveToConnection('conn-b');
+
+    expect(useConversationStore.getState().activeConversationId).toBe('b-old');
+  });
+
+  it('ensureConversation does not reuse active conversation from another connection', async () => {
+    agentCreateConversation.mockResolvedValue('b-new');
+    useConversationStore.setState({
+      conversations: {
+        a1: { id: 'a1', connectionId: 'conn-a', title: 'A', createdAt: '', updatedAt: '' },
+      },
+      messages: { a1: [] },
+      activeConversationId: 'a1',
+      activeConversationByConnection: { 'conn-a': 'a1' },
+    });
+
+    const id = await useConversationStore.getState().ensureConversation('sess-b', 'conn-b', 'hello on B');
+
+    expect(id).toBe('b-new');
+    expect(agentCreateConversation).toHaveBeenCalledWith('sess-b', 'hello on B');
+    expect(useConversationStore.getState().activeConversationId).toBe('b-new');
+    expect(useConversationStore.getState().conversations['b-new']?.connectionId).toBe('conn-b');
+  });
+
+  it('ensureConversation reuses matching conversation on same connection', async () => {
+    useConversationStore.setState({
+      conversations: {
+        b1: { id: 'b1', connectionId: 'conn-b', title: 'B', createdAt: '', updatedAt: '' },
+      },
+      messages: { b1: [] },
+      activeConversationId: 'b1',
+      activeConversationByConnection: { 'conn-b': 'b1' },
+    });
+
+    const id = await useConversationStore.getState().ensureConversation('sess-b', 'conn-b', 'hello');
+
+    expect(id).toBe('b1');
+    expect(agentCreateConversation).not.toHaveBeenCalled();
+  });
+
+  it('rolls back a user message and deletes it plus later messages', async () => {
+    agentTruncateConversation.mockResolvedValue({
+      deletedMessages: 3,
+      planAdjusted: false,
+      plan: null,
+      planTaskId: null,
+    });
+    useConversationStore.setState({
+      activeConversationId: 'conv-1',
+      messages: {
+        'conv-1': [
+          makeMessage({ id: 'm1', role: 'user', content: 'keep', timestamp: '2026-01-01T00:00:00Z' }),
+          makeMessage({
+            id: 'm2',
+            role: 'user',
+            content: 'rewrite me',
+            timestamp: '2026-01-01T00:01:00Z',
+            imagePaths: ['conv-1/m2_0.webp'],
+          }),
+          makeMessage({ id: 'm3', role: 'assistant', content: 'answer', timestamp: '2026-01-01T00:02:00Z' }),
+          makeMessage({ id: 'm4', role: 'tool', content: 'tool output', timestamp: '2026-01-01T00:03:00Z' }),
+        ],
+      },
+    });
+
+    const result = await useConversationStore.getState().rollbackToMessage('conv-1', 'm2');
+
+    expect(result).toEqual({
+      prompt: 'rewrite me',
+      removedCount: 3,
+      imagePaths: ['conv-1/m2_0.webp'],
+    });
+    expect(agentTruncateConversation).toHaveBeenCalledWith('conv-1', '2026-01-01T00:01:00Z');
+    expect(useConversationStore.getState().messages['conv-1'].map((m) => m.id)).toEqual(['m1']);
+  });
+
+  it('keeps full file contents for model history after reload and restores the input on rollback', async () => {
+    const userInput = {
+      version: 1 as const,
+      text: '分析这份日志',
+      textAttachments: [{ id: 'f1', name: 'app.log', content: '完整日志\n\n', size: 14 }],
+    };
+    const content = composeUserInput(userInput);
+    const stored: StoredMessage = {
+      id: 'file-message', conversationId: 'conv-1', role: 'user', content,
+      timestamp: '2026-01-01T00:00:00Z', createdAt: '2026-01-01T00:00:00Z',
+      userInputJson: JSON.stringify(userInput), imagePathsJson: '["images/a.png"]',
+    };
+    useConversationStore.setState({ messages: { 'conv-1': [storedMessageToAgentMessage(stored)] } });
+    expect(useConversationStore.getState().snapshotHistory('conv-1')).toEqual({ entries: [
+      {
+        kind: 'stored', id: 'file-message', reasoningContent: null,
+        fallback: { role: 'user', content, imagePaths: ['images/a.png'], dbId: 'file-message' },
+      },
+    ] });
+    agentTruncateConversation.mockResolvedValue({ deletedMessages: 1, planAdjusted: false });
+    const result = await useConversationStore.getState().rollbackToMessage('conv-1', 'file-message');
+    expect(result).toEqual({
+      prompt: userInput.text, userInput, imagePaths: ['images/a.png'], removedCount: 1,
+    });
+  });
+
+  it('rolls back legacy text unchanged even when it resembles an imported file', async () => {
+    const content = '用户正文\n\n===== 文件名: manual.txt =====\n自己输入的内容';
+    useConversationStore.setState({ messages: { 'conv-1': [makeMessage({ id: 'legacy', content })] } });
+    agentTruncateConversation.mockResolvedValue({ deletedMessages: 1, planAdjusted: false });
+    expect(await useConversationStore.getState().rollbackToMessage('conv-1', 'legacy')).toEqual({
+      prompt: content, imagePaths: [], removedCount: 1,
+    });
+  });
+
+  it('ignores inconsistent live metadata when rolling back instead of losing the original text', async () => {
+    const userInput = { version: 1 as const, text: '过期元数据', textAttachments: [] };
+    useConversationStore.setState({ messages: { 'conv-1': [makeMessage({
+      id: 'mismatch', content: '完整原文', userInput,
+    })] } });
+    agentTruncateConversation.mockResolvedValue({ deletedMessages: 1, planAdjusted: false });
+    expect(await useConversationStore.getState().rollbackToMessage('conv-1', 'mismatch')).toEqual({
+      prompt: '完整原文', imagePaths: [], removedCount: 1,
+    });
+  });
+
+  it('rejects rollback for non-user messages', async () => {
+    useConversationStore.setState({
+      activeConversationId: 'conv-1',
+      messages: {
+        'conv-1': [makeMessage({ id: 'm1', role: 'assistant', content: 'answer' })],
+      },
+    });
+
+    await expect(useConversationStore.getState().rollbackToMessage('conv-1', 'm1')).rejects.toThrow('只能撤回用户消息');
+    expect(agentTruncateConversation).not.toHaveBeenCalled();
+  });
+
+  it('does not mutate messages when persistent rollback fails', async () => {
+    agentTruncateConversation.mockRejectedValue(new Error('db failed'));
+    useConversationStore.setState({
+      activeConversationId: 'conv-1',
+      messages: {
+        'conv-1': [
+          makeMessage({ id: 'm1', role: 'user', content: 'rewrite me', timestamp: '2026-01-01T00:01:00Z' }),
+          makeMessage({ id: 'm2', role: 'assistant', content: 'answer', timestamp: '2026-01-01T00:02:00Z' }),
+        ],
+      },
+    });
+
+    await expect(useConversationStore.getState().rollbackToMessage('conv-1', 'm1')).rejects.toThrow('db failed');
+    expect(useConversationStore.getState().messages['conv-1'].map((m) => m.id)).toEqual(['m1', 'm2']);
+  });
+
+  describe('clearExecutingToolFlags', () => {
+    it('clears isExecuting on tool messages across all conversations', () => {
+      useConversationStore.setState({
+        activeConversationId: 'conv-1',
+        messages: {
+          'conv-1': [
+            makeMessage({ id: 'm1', role: 'user', content: 'hi' }),
+            makeMessage({ id: 'm2', role: 'tool', content: 'running', isExecuting: true }),
+          ],
+          'conv-2': [
+            makeMessage({ id: 'm3', role: 'tool', content: 'also running', isExecuting: true }),
+          ],
+        },
+      });
+
+      useConversationStore.getState().clearExecutingToolFlags();
+
+      const state = useConversationStore.getState();
+      expect(state.messages['conv-1'][0].isExecuting).toBeUndefined();
+      expect(state.messages['conv-1'][1].isExecuting).toBe(false);
+      expect(state.messages['conv-2'][0].isExecuting).toBe(false);
+    });
+
+    it('leaves completed tool messages untouched', () => {
+      useConversationStore.setState({
+        activeConversationId: 'conv-1',
+        messages: {
+          'conv-1': [
+            makeMessage({ id: 'm1', role: 'tool', content: 'done', isExecuting: false }),
+          ],
+        },
+      });
+
+      useConversationStore.getState().clearExecutingToolFlags();
+
+      const state = useConversationStore.getState();
+      expect(state.messages['conv-1'][0].isExecuting).toBe(false);
+    });
+
+    it('clears modelApproval on tool messages', () => {
+      useConversationStore.setState({
+        activeConversationId: 'conv-1',
+        messages: {
+          'conv-1': [
+            makeMessage({ id: 'm1', role: 'tool', content: 'checking', modelApproval: { status: 'checking' } }),
+            makeMessage({ id: 'm2', role: 'tool', content: 'block', modelApproval: { status: 'done', decision: 'block', reasons: ['x'] } }),
+            makeMessage({ id: 'm3', role: 'tool', content: 'clean' }),
+          ],
+        },
+      });
+
+      useConversationStore.getState().clearExecutingToolFlags();
+
+      const msgs = useConversationStore.getState().messages['conv-1'];
+      expect(msgs[0].modelApproval).toBeUndefined();
+      expect(msgs[1].modelApproval).toBeUndefined();
+      expect(msgs[2].modelApproval).toBeUndefined();
+    });
+
+    it('does not touch non-tool messages', () => {
+      useConversationStore.setState({
+        activeConversationId: 'conv-1',
+        messages: {
+          'conv-1': [
+            makeMessage({ id: 'm1', role: 'user', content: 'hi' }),
+            makeMessage({ id: 'm2', role: 'assistant', content: 'reply', isLoading: true }),
+          ],
+        },
+      });
+
+      useConversationStore.getState().clearExecutingToolFlags();
+
+      const state = useConversationStore.getState();
+      expect(state.messages['conv-1'][0].isLoading).toBeUndefined();
+      expect(state.messages['conv-1'][1].isLoading).toBe(true);
+    });
+  });
+
+  describe('markAbortedToolFlags', () => {
+    it('marks executing streaming tool messages with wasAborted and streaming note', () => {
+      useConversationStore.setState({
+        activeConversationId: 'conv-1',
+        messages: {
+          'conv-1': [
+            makeMessage({
+              id: 'm1',
+              role: 'tool',
+              content: '',
+              isExecuting: true,
+              toolResult: {
+                toolName: 'execute_command',
+                summary: '',
+                result: 'partial stdout',
+                success: true,
+                blocked: false,
+              },
+            }),
+          ],
+        },
+      });
+
+      useConversationStore.getState().markAbortedToolFlags();
+
+      const m = useConversationStore.getState().messages['conv-1'][0];
+      expect(m.isExecuting).toBe(false);
+      expect(m.toolResult?.wasAborted).toBe(true);
+      expect(m.toolResult?.success).toBe(false);
+      expect(m.toolResult?.result).toContain('partial stdout');
+      expect(m.toolResult?.result).toContain('用户中断');
+      expect(m.toolResult?.result).toContain('已停止等待输出并关闭 SSH 通道');
+    });
+
+    it('marks executing non-streaming tool messages with non-streaming note', () => {
+      useConversationStore.setState({
+        activeConversationId: 'conv-1',
+        messages: {
+          'conv-1': [
+            makeMessage({
+              id: 'm2',
+              role: 'tool',
+              content: '',
+              isExecuting: true,
+              toolResult: {
+                toolName: 'read_file',
+                summary: '',
+                result: '',
+                success: true,
+                blocked: false,
+              },
+            }),
+          ],
+        },
+      });
+
+      useConversationStore.getState().markAbortedToolFlags();
+
+      const m = useConversationStore.getState().messages['conv-1'][0];
+      expect(m.toolResult?.wasAborted).toBe(true);
+      expect(m.toolResult?.success).toBe(false);
+      expect(m.toolResult?.result).toContain('用户手动中断');
+      expect(m.toolResult?.result).toContain('工具可能已执行完成');
+      expect(m.toolResult?.result).not.toContain('远端命令');
+    });
+
+    it('本机命令（local_bash）中断：停的是「等待」，本机进程不保证已结束', () => {
+      // 本机命令的输出同样是流式到达前端的（后端 local_bash 挂了
+      // `ticket.streaming`），但文案**不能**跟着流式走：没有 SSH 通道可关、
+      // 进程也不在服务器上。旧实现按「流式与否」二选一，本机命令只能拿到假的
+      // 那套（「已关闭 SSH 通道」）或反的那套（「工具可能已执行完成」）。
+      useConversationStore.setState({
+        activeConversationId: 'conv-1',
+        messages: {
+          'conv-1': [
+            makeMessage({
+              id: 'm-local',
+              role: 'tool',
+              content: '',
+              isExecuting: true,
+              toolResult: {
+                toolName: 'local_bash',
+                summary: '',
+                result: 'partial stdout',
+                success: true,
+                blocked: false,
+              },
+            }),
+          ],
+        },
+      });
+
+      useConversationStore.getState().markAbortedToolFlags();
+
+      const m = useConversationStore.getState().messages['conv-1'][0];
+      expect(m.toolResult?.wasAborted).toBe(true);
+      expect(m.toolResult?.success).toBe(false);
+      const result = m.toolResult?.result ?? '';
+      expect(result).toContain('partial stdout');
+      expect(result).toContain('用户中断');
+      // 文案必须与后端 `agent_loop.rs` 的 `interruption_notice("local_bash")` 逐字节
+      // 一致（同一件事不能有两套说辞），所以这里钉的是后端那句的开头。
+      expect(result).toContain('已停止等待输出并关闭我们这侧的读端');
+      expect(result).toContain('本机进程不保证已结束');
+      // 指路本机自己的收尾手段（本机没有 sshd 替用户回收进程）
+      expect(result).toContain('Get-Process');
+      expect(result).toContain('Stop-Process -Id');
+      expect(result).toContain('pgrep');
+      // 三句都不许出现：关 SSH 通道（本机没有）、远端进程（不在服务器上）、
+      // 工具可能已执行完成（与本机「进程可能还在跑」相反）
+      expect(result).not.toContain('SSH 通道');
+      expect(result).not.toContain('远端进程');
+      expect(result).not.toContain('工具可能已执行完成');
+    });
+
+    it('clears modelApproval in addition to isExecuting', () => {
+      useConversationStore.setState({
+        activeConversationId: 'conv-1',
+        messages: {
+          'conv-1': [
+            makeMessage({
+              id: 'm3',
+              role: 'tool',
+              content: '',
+              isExecuting: false,
+              modelApproval: { status: 'checking' },
+              toolResult: {
+                toolName: 'execute_command',
+                summary: '',
+                result: '',
+                success: true,
+                blocked: false,
+              },
+            }),
+          ],
+        },
+      });
+
+      useConversationStore.getState().markAbortedToolFlags();
+
+      const m = useConversationStore.getState().messages['conv-1'][0];
+      expect(m.modelApproval).toBeUndefined();
+      expect(m.toolResult?.wasAborted).toBe(true);
+    });
+
+    it('leaves completed tool messages untouched', () => {
+      useConversationStore.setState({
+        activeConversationId: 'conv-1',
+        messages: {
+          'conv-1': [
+            makeMessage({ id: 'm4', role: 'tool', content: 'done', isExecuting: false, toolResult: { toolName: 'list_directory', summary: '', result: 'a\nb', success: true, blocked: false } }),
+          ],
+        },
+      });
+
+      useConversationStore.getState().markAbortedToolFlags();
+
+      const m = useConversationStore.getState().messages['conv-1'][0];
+      expect(m.toolResult?.wasAborted).toBeUndefined();
+      expect(m.toolResult?.result).toBe('a\nb');
+    });
+
+    it('handles tool messages without toolResult without crashing', () => {
+      useConversationStore.setState({
+        activeConversationId: 'conv-1',
+        messages: {
+          'conv-1': [
+            makeMessage({ id: 'm5', role: 'tool', content: 'running', isExecuting: true }),
+          ],
+        },
+      });
+
+      useConversationStore.getState().markAbortedToolFlags();
+
+      const m = useConversationStore.getState().messages['conv-1'][0];
+      expect(m.isExecuting).toBe(false);
+      // No toolResult so wasAborted can't be set; just no crash
+    });
+
+    it('only marks cards in the targeted conversation when conversationId is passed', () => {
+      useConversationStore.setState({
+        activeConversationId: 'conv-1',
+        messages: {
+          'conv-1': [
+            makeMessage({
+              id: 'm6',
+              role: 'tool',
+              content: '',
+              isExecuting: true,
+              toolResult: { toolName: 'execute_command', summary: '', result: '', success: true, blocked: false },
+            }),
+          ],
+          'conv-2': [
+            makeMessage({
+              id: 'm7',
+              role: 'tool',
+              content: '',
+              isExecuting: true,
+              toolResult: { toolName: 'execute_command', summary: '', result: '', success: true, blocked: false },
+            }),
+          ],
+        },
+      });
+
+      useConversationStore.getState().markAbortedToolFlags('conv-1');
+
+      const m1 = useConversationStore.getState().messages['conv-1'][0];
+      expect(m1.toolResult?.wasAborted).toBe(true);
+      const m2 = useConversationStore.getState().messages['conv-2'][0];
+      expect(m2.toolResult?.wasAborted).toBeUndefined();
+      expect(m2.isExecuting).toBe(true);
+    });
+
+    it('keeps other conversations intact when conversationId is passed', () => {
+      useConversationStore.setState({
+        activeConversationId: 'conv-1',
+        messages: {
+          'conv-1': [
+            makeMessage({ id: 'm8', role: 'tool', content: '', isExecuting: true }),
+          ],
+          'conv-2': [
+            makeMessage({ id: 'm9', role: 'assistant', content: 'hi', isLoading: true }),
+          ],
+        },
+      });
+
+      useConversationStore.getState().markAbortedToolFlags('conv-1');
+
+      const m2 = useConversationStore.getState().messages['conv-2'][0];
+      expect(m2.isLoading).toBe(true);
+    });
+  });
+
+  describe('switchConversation with running tasks', () => {
+    const now = new Date().toISOString();
+
+    function seedConversation(convId: string, msgs: AgentMessage[]) {
+      useConversationStore.setState({
+        conversations: {
+          [convId]: {
+            id: convId,
+            connectionId: 'conn-1',
+            title: convId,
+            createdAt: now,
+            updatedAt: now,
+          },
+        },
+        messages: { [convId]: msgs },
+        activeConversationId: convId,
+        activeConversationByConnection: { 'conn-1': convId },
+      });
+    }
+
+    function seedTask(taskId: string, convId: string, status: AgentTask['status']) {
+      useTaskStore.setState({
+        tasks: {
+          [taskId]: {
+            id: taskId,
+            sessionId: 's1',
+            conversationId: convId,
+            prompt: 'p',
+            mode: 'agent',
+            status,
+            createdAt: now,
+          },
+        },
+        activeTaskId: taskId,
+      });
+    }
+
+    it('keeps in-memory messages and restores the running task (no DB reload)', async () => {
+      agentLoadConversation.mockResolvedValue([
+        { id: 'db-msg', conversationId: 'conv-1', role: 'user', content: 'from-db', timestamp: now, createdAt: now },
+      ]);
+      agentLoadPlansByConversation.mockResolvedValue([]);
+      const memoryMsg = makeMessage({ id: 'mem-msg', content: 'in-memory' });
+      seedConversation('conv-1', [memoryMsg]);
+      seedTask('task-1', 'conv-1', 'executing');
+
+      await useConversationStore.getState().switchConversation('conv-1');
+
+      // 运行中：不重载 DB，内存消息保留
+      expect(agentLoadConversation).not.toHaveBeenCalled();
+      const msgs = useConversationStore.getState().messages['conv-1'];
+      expect(msgs).toHaveLength(1);
+      expect(msgs[0].id).toBe('mem-msg');
+      // 运行中任务恢复为 activeTaskId（停止按钮 / isRunning 可用）
+      expect(useTaskStore.getState().activeTaskId).toBe('task-1');
+    });
+
+    it('reloads from DB and clears active task when no task is running', async () => {
+      agentLoadConversation.mockResolvedValue([
+        { id: 'db-msg', conversationId: 'conv-1', role: 'user', content: 'from-db', timestamp: now, createdAt: now },
+      ]);
+      agentLoadPlansByConversation.mockResolvedValue([]);
+      seedConversation('conv-1', [makeMessage({ id: 'mem-msg', content: 'stale' })]);
+      seedTask('task-1', 'conv-1', 'completed');
+
+      await useConversationStore.getState().switchConversation('conv-1');
+
+      expect(agentLoadConversation).toHaveBeenCalledWith('conv-1');
+      const msgs = useConversationStore.getState().messages['conv-1'];
+      expect(msgs).toHaveLength(1);
+      expect(msgs[0].content).toBe('from-db');
+      // 无运行中任务 → activeTaskId 清空
+      expect(useTaskStore.getState().activeTaskId).toBeNull();
+    });
+
+    it('loads the backend-compacted conversation with originals preserved and card at span end', async () => {
+      // 后端落库后 load_messages 返回：原文全保留 + 卡片在 span 末尾（created_at 定位）——
+      // 前端原样展示，不需要任何回放/位置修正。
+      agentLoadConversation.mockResolvedValue([
+        { id: 'm1', conversationId: 'conv-1', role: 'user', content: 'u1', timestamp: now, createdAt: now },
+        { id: 'm2', conversationId: 'conv-1', role: 'assistant', content: 'a1', timestamp: now, createdAt: now },
+        { id: 'm3', conversationId: 'conv-1', role: 'tool', content: 'out', timestamp: now, createdAt: now },
+        {
+          id: 'card1',
+          conversationId: 'conv-1',
+          role: 'system',
+          content: '【上下文已压缩】已整理 3 条历史消息（约 1000 tokens）\n\n## Primary Request\n- s1',
+          timestamp: now,
+          createdAt: now,
+        },
+        { id: 'm4', conversationId: 'conv-1', role: 'user', content: 'u2', timestamp: now, createdAt: now },
+      ]);
+      agentLoadPlansByConversation.mockResolvedValue([]);
+      seedConversation('conv-1', []);
+      seedTask('task-1', 'conv-1', 'completed');
+
+      await useConversationStore.getState().switchConversation('conv-1');
+
+      const msgs = useConversationStore.getState().messages['conv-1'];
+      expect(msgs.map((m) => m.id)).toEqual(['m1', 'm2', 'm3', 'card1', 'm4']);
+      expect(msgs[3].compaction?.status).toBe('done');
+      expect(msgs[3].compaction?.summary).toContain('s1');
+    });
+
+    it('subagent (plan-mode) running task is restored after switching to its conversation', async () => {
+      agentLoadConversation.mockResolvedValue([]);
+      agentLoadPlansByConversation.mockResolvedValue([]);
+      seedConversation('sub-conv-1', [makeMessage({ id: 'skel' })]);
+      useTaskStore.setState({
+        tasks: {
+          'parent-1': {
+            id: 'parent-1',
+            sessionId: 's1',
+            conversationId: 'conv-1',
+            prompt: 'p',
+            mode: 'agent',
+            status: 'executing',
+            createdAt: now,
+          },
+          'sub-1': {
+            id: 'sub-1',
+            sessionId: 's1',
+            conversationId: 'sub-conv-1',
+            prompt: 'p',
+            mode: 'plan',
+            status: 'planning',
+            createdAt: now,
+            parentTaskId: 'parent-1',
+          },
+        },
+        activeTaskId: 'parent-1',
+      });
+
+      await useConversationStore.getState().switchConversation('sub-conv-1');
+
+      // 切到子对话：恢复子任务为 activeTaskId（而不是清空）
+      expect(useTaskStore.getState().activeTaskId).toBe('sub-1');
+      // 子对话运行中也不重载
+      expect(agentLoadConversation).not.toHaveBeenCalled();
+    });
+
+    it('loadConversation behaves the same for running conversations', async () => {
+      agentLoadConversation.mockResolvedValue([
+        { id: 'db-msg', conversationId: 'conv-1', role: 'user', content: 'from-db', timestamp: now, createdAt: now },
+      ]);
+      agentLoadPlansByConversation.mockResolvedValue([]);
+      seedConversation('conv-1', [makeMessage({ id: 'mem-msg' })]);
+      seedTask('task-1', 'conv-1', 'waiting_approval');
+
+      await useConversationStore.getState().loadConversation('conv-1');
+
+      expect(agentLoadConversation).not.toHaveBeenCalled();
+      expect(useConversationStore.getState().messages['conv-1'][0].id).toBe('mem-msg');
+      expect(useTaskStore.getState().activeTaskId).toBe('task-1');
+    });
+  });
+
+  describe('registerSubConversation', () => {
+    it('registers a sub-conversation with skeleton messages and parent link', () => {
+      useConversationStore.setState({
+        conversations: {},
+        messages: {},
+        activeConversationId: null,
+      });
+
+      const loadingId = useConversationStore.getState().registerSubConversation(
+        'sub-conv-1',
+        'conn-1',
+        'explore nginx（子agent）',
+        'sub-task-1',
+        'look at /etc/nginx',
+        'main-conv-1',
+      );
+
+      const state = useConversationStore.getState();
+      expect(loadingId).toBe('sub-loading-sub-task-1');
+      expect(state.conversations['sub-conv-1']).toMatchObject({
+        id: 'sub-conv-1',
+        connectionId: 'conn-1',
+        title: 'explore nginx（子agent）',
+        parentConversationId: 'main-conv-1',
+      });
+      const msgs = state.messages['sub-conv-1'];
+      expect(msgs).toHaveLength(2);
+      expect(msgs[0]).toMatchObject({ role: 'user', content: 'look at /etc/nginx' });
+      expect(msgs[1]).toMatchObject({ role: 'assistant', isLoading: true, id: loadingId });
+    });
+
+    it('is idempotent: returns null and keeps existing messages when already registered', () => {
+      useConversationStore.setState({
+        conversations: {},
+        messages: {},
+        activeConversationId: null,
+      });
+      const first = useConversationStore.getState().registerSubConversation(
+        'sub-conv-1',
+        'conn-1',
+        't',
+        'sub-task-1',
+        'prompt',
+        'main-conv-1',
+      );
+      expect(first).not.toBeNull();
+
+      const second = useConversationStore.getState().registerSubConversation(
+        'sub-conv-1',
+        'conn-1',
+        't',
+        'sub-task-1',
+        'prompt',
+        'main-conv-1',
+      );
+      expect(second).toBeNull();
+      expect(useConversationStore.getState().messages['sub-conv-1']).toHaveLength(2);
+    });
+
+    it('does not touch the active conversation', () => {
+      useConversationStore.setState({
+        conversations: {},
+        messages: {},
+        activeConversationId: 'main-conv',
+      });
+
+      useConversationStore.getState().registerSubConversation(
+        'sub-conv-2',
+        'conn-1',
+        't',
+        'sub-task-2',
+        'prompt',
+        'main-conv',
+      );
+
+      const state = useConversationStore.getState();
+      expect(state.activeConversationId).toBe('main-conv');
+      expect(state.messages['main-conv']).toBeUndefined();
+    });
+  });
+
+  describe('setConversationPinned', () => {
+    function seedConversations() {
+      useConversationStore.setState({
+        conversations: {
+          // 对象键序 = 展示顺序（reorderByUpdatedAt 维护）
+          newer: {
+            id: 'newer',
+            connectionId: 'conn-1',
+            title: 'Newer',
+            createdAt: '2026-01-02T00:00:00Z',
+            updatedAt: '2026-01-02T00:00:00Z',
+          },
+          older: {
+            id: 'older',
+            connectionId: 'conn-1',
+            title: 'Older',
+            createdAt: '2026-01-01T00:00:00Z',
+            updatedAt: '2026-01-01T00:00:00Z',
+          },
+        },
+      });
+    }
+
+    it('置顶后浮到最前，且不改 updatedAt', async () => {
+      seedConversations();
+      agentSetConversationPinned.mockResolvedValue(undefined);
+
+      await useConversationStore.getState().setConversationPinned('older', true);
+
+      expect(agentSetConversationPinned).toHaveBeenCalledWith('older', true);
+      const convs = useConversationStore.getState().conversations;
+      expect(Object.keys(convs)).toEqual(['older', 'newer']);
+      expect(convs.older.pinned).toBe(true);
+      // 置顶不是内容变更：时间戳原样（否则取消置顶会打乱日期分组）
+      expect(convs.older.updatedAt).toBe('2026-01-01T00:00:00Z');
+    });
+
+    it('取消置顶后回落时间序', async () => {
+      seedConversations();
+      useConversationStore.setState((s) => ({
+        conversations: {
+          ...s.conversations,
+          older: { ...s.conversations.older, pinned: true },
+        },
+      }));
+      agentSetConversationPinned.mockResolvedValue(undefined);
+
+      await useConversationStore.getState().setConversationPinned('older', false);
+
+      const convs = useConversationStore.getState().conversations;
+      expect(Object.keys(convs)).toEqual(['newer', 'older']);
+      expect(convs.older.pinned).toBe(false);
+    });
+
+    it('后端失败时抛出且不改本地（先 await 后 set）', async () => {
+      seedConversations();
+      const before = useConversationStore.getState().conversations;
+      agentSetConversationPinned.mockRejectedValue(new Error('boom'));
+
+      await expect(
+        useConversationStore.getState().setConversationPinned('older', true),
+      ).rejects.toThrow('boom');
+
+      const after = useConversationStore.getState().conversations;
+      expect(after).toBe(before);
+      expect(after.older.pinned).toBeUndefined();
+      expect(Object.keys(after)).toEqual(['newer', 'older']);
+    });
+  });
+
+  describe('deleteConversation cascade', () => {
+    it('deletes the conversation and all its sub-conversations from the store', async () => {
+      agentDeleteConversation.mockResolvedValue(undefined);
+      const now = new Date().toISOString();
+      useConversationStore.setState({
+        activeConversationId: 'main-conv',
+        conversations: {
+          'main-conv': {
+            id: 'main-conv',
+            connectionId: 'conn-1',
+            title: 'Main',
+            createdAt: now,
+            updatedAt: now,
+          },
+          'sub-conv-1': {
+            id: 'sub-conv-1',
+            connectionId: 'conn-1',
+            title: 'Sub1（子agent）',
+            createdAt: now,
+            updatedAt: now,
+            parentConversationId: 'main-conv',
+          },
+          'sub-conv-2': {
+            id: 'sub-conv-2',
+            connectionId: 'conn-1',
+            title: 'Sub2（子agent）',
+            createdAt: now,
+            updatedAt: now,
+            parentConversationId: 'main-conv',
+          },
+          'other-conv': {
+            id: 'other-conv',
+            connectionId: 'conn-1',
+            title: 'Other',
+            createdAt: now,
+            updatedAt: now,
+          },
+        },
+        messages: {
+          'main-conv': [makeMessage({ id: 'm1' })],
+          'sub-conv-1': [makeMessage({ id: 'm2' })],
+        },
+      });
+
+      const drafts = useAgentDraftStore.getState();
+      for (const id of ['main-conv', 'sub-conv-1', 'other-conv']) {
+        await drafts.restoreMessage(draftKeyFor(id, null), {
+          text: `${id} 的草稿`,
+          textAttachments: [{ id: `${id}-file`, name: '日志.txt', content: id }],
+        });
+      }
+      const pendingSend = drafts.takeSendSnapshot(draftKeyFor('main-conv', null))!;
+
+      await useConversationStore.getState().deleteConversation('main-conv');
+
+      const state = useConversationStore.getState();
+      expect(state.conversations['main-conv']).toBeUndefined();
+      expect(state.conversations['sub-conv-1']).toBeUndefined();
+      expect(state.conversations['sub-conv-2']).toBeUndefined();
+      expect(state.conversations['other-conv']).toBeDefined();
+      expect(state.messages['main-conv']).toBeUndefined();
+      expect(state.messages['sub-conv-1']).toBeUndefined();
+      // active 被删除 → 切换到其他主对话
+      expect(state.activeConversationId).toBe('other-conv');
+      // 显式删除才释放草稿和在飞快照；晚到的失败不能复活已删除内容。
+      drafts.finishSend(pendingSend, { status: 'rejected' });
+      expect(useAgentDraftStore.getState().drafts['conv:main-conv']).toBeUndefined();
+      expect(useAgentDraftStore.getState().drafts['conv:sub-conv-1']).toBeUndefined();
+      expect(useAgentDraftStore.getState().sending['conv:main-conv']).toBeUndefined();
+      expect(drafts.getDraft('conv:other-conv').attachments[0].content).toBe('other-conv');
+    });
+
+    it('删除失败或仅清理断线缓存时保留草稿', async () => {
+      const now = new Date().toISOString();
+      useConversationStore.setState({
+        conversations: {
+          'keep-conv': {
+            id: 'keep-conv', connectionId: 'conn-1', title: '保留',
+            createdAt: now, updatedAt: now,
+          },
+        },
+      });
+      const drafts = useAgentDraftStore.getState();
+      await drafts.restoreMessage('conv:keep-conv', {
+        text: '尚未发送',
+        textAttachments: [{ id: 'file', name: '日志.txt', content: '完整日志' }],
+      });
+      const previous = drafts.getDraft('conv:keep-conv');
+      agentDeleteConversation.mockRejectedValueOnce({ kind: 'Database', message: '删除失败' });
+
+      await expect(useConversationStore.getState().deleteConversation('keep-conv')).rejects.toMatchObject({ message: '删除失败' });
+      expect(drafts.getDraft('conv:keep-conv')).toBe(previous);
+
+      useConversationStore.getState().clearConnectionConversations('conn-1');
+      expect(drafts.getDraft('conv:keep-conv')).toBe(previous);
+    });
+
+    it('keeps parent when deleting a sub-conversation only', async () => {
+      agentDeleteConversation.mockResolvedValue(undefined);
+      const now = new Date().toISOString();
+      useConversationStore.setState({
+        activeConversationId: 'main-conv',
+        conversations: {
+          'main-conv': {
+            id: 'main-conv',
+            connectionId: 'conn-1',
+            title: 'Main',
+            createdAt: now,
+            updatedAt: now,
+          },
+          'sub-conv-1': {
+            id: 'sub-conv-1',
+            connectionId: 'conn-1',
+            title: 'Sub1（子agent）',
+            createdAt: now,
+            updatedAt: now,
+            parentConversationId: 'main-conv',
+          },
+        },
+        messages: {},
+      });
+
+      await useConversationStore.getState().deleteConversation('sub-conv-1');
+
+      const state = useConversationStore.getState();
+      expect(state.conversations['sub-conv-1']).toBeUndefined();
+      expect(state.conversations['main-conv']).toBeDefined();
+      expect(state.activeConversationId).toBe('main-conv');
+    });
+  });
+
+  describe('snapshotHistory', () => {
+    it('未知会话返回空快照，不创建或清空消息桶', () => {
+      const existing = [makeMessage({ id: 'keep', content: '已有内容' })];
+      useConversationStore.setState({ messages: { known: existing } });
+      expect(useConversationStore.getState().snapshotHistory('missing')).toEqual({ entries: [] });
+      expect(useConversationStore.getState().messages).toEqual({ known: existing });
+    });
+
+    it('原样传递当前消息顺序，系统通知与骨架由后端投影', () => {
+      const messages = [
+        makeMessage({ id: 'user', content: '继续' }),
+        makeMessage({ id: 'notice', role: 'system', content: 'LLM 错误：断开' }),
+        makeMessage({ id: 'loading', role: 'assistant', content: '', isLoading: true }),
+      ];
+      useConversationStore.setState({ messages: { current: messages } });
+      expect(useConversationStore.getState().snapshotHistory('current')).toEqual({
+        entries: [
+          { kind: 'transient', message: { role: 'user', content: '继续' } },
+          { kind: 'transient', message: { role: 'system', content: 'LLM 错误：断开' } },
+          { kind: 'transient', message: { role: 'assistant', content: '', isLoading: true } },
+        ],
+      });
+      expect(useConversationStore.getState().messages.current).toBe(messages);
+    });
+  });
+
+  describe('compactConversation 手动压缩反馈', () => {
+    const now = new Date().toISOString();
+
+    function seedConversation(convId: string, msgs: AgentMessage[]) {
+      useConversationStore.setState({
+        conversations: {
+          [convId]: {
+            id: convId,
+            connectionId: 'conn-1',
+            title: convId,
+            createdAt: now,
+            updatedAt: now,
+          },
+        },
+        messages: { [convId]: msgs },
+        activeConversationId: convId,
+        activeConversationByConnection: { 'conn-1': convId },
+      });
+    }
+
+    function seedTask(taskId: string, convId: string, status: AgentTask['status']) {
+      useTaskStore.setState({
+        tasks: {
+          [taskId]: {
+            id: taskId,
+            sessionId: 's1',
+            conversationId: convId,
+            prompt: 'p',
+            mode: 'agent',
+            status,
+            createdAt: now,
+          },
+        },
+        activeTaskId: taskId,
+      });
+    }
+
+    function mockCompactResult(overrides: Record<string, unknown>) {
+      agentCompactConversation.mockResolvedValue({
+        compacted: false,
+        summary: null,
+        shadowedMessages: 0,
+        shadowedTokens: 0,
+        tailDbId: null,
+        reason: null,
+        attempted: false,
+        ...overrides,
+      });
+    }
+
+    it('无可压区间（attempted=false）时插入"无需压缩"通知', async () => {
+      mockCompactResult({ reason: '没有可压缩的早期历史区间' });
+      seedConversation('conv-1', [makeMessage({ id: 'u1', content: 'go' })]);
+      seedTask('task-1', 'conv-1', 'completed');
+
+      const result = await useConversationStore.getState().compactConversation('conv-1');
+
+      expect(result.compacted).toBe(false);
+      const msgs = useConversationStore.getState().messages['conv-1'];
+      expect(msgs).toHaveLength(2);
+      const notice = msgs[1];
+      expect(notice.role).toBe('system');
+      expect(notice.content).toBe('无需压缩：没有可压缩的早期历史区间');
+      expect(notice.compaction).toBeUndefined();
+    });
+
+    it('摘要失败且 Skipped 事件丢失（attempted=true + 残留 running 卡）时把卡转为未完成文本', async () => {
+      mockCompactResult({
+        attempted: true,
+        reason: '生成的摘要未比原文更短（约 200 ≥ 100 tokens），已放弃本次压缩',
+      });
+      seedConversation('conv-1', [
+        makeMessage({ id: 'u1', content: 'go' }),
+        {
+          id: 'running-1',
+          role: 'system',
+          content: '上下文压缩中…',
+          timestamp: now,
+          compaction: { status: 'running' },
+        },
+      ]);
+      seedTask('task-1', 'conv-1', 'completed');
+
+      // 固定 taskId（compactConversation 内部用 crypto.randomUUID 生成），
+      // 预置残留的 running 卡占位 id，模拟 Skipped 事件在 listener 清理前丢失。
+      const uuid = '00000000-0000-4000-8000-000000000000';
+      const uuidSpy = vi
+        .spyOn(crypto, 'randomUUID')
+        .mockReturnValue(uuid as `${string}-${string}-${string}-${string}-${string}`);
+      setStreamState(uuid, { ...getStreamState(uuid), compactionMessageId: 'running-1' });
+      try {
+        await useConversationStore.getState().compactConversation('conv-1');
+      } finally {
+        uuidSpy.mockRestore();
+      }
+
+      const msgs = useConversationStore.getState().messages['conv-1'];
+      expect(msgs).toHaveLength(2); // 不新增消息
+      const card = msgs.find((m) => m.id === 'running-1');
+      expect(card?.content).toContain('上下文压缩未完成');
+      expect(card?.content).toContain('已放弃本次压缩');
+      expect(card?.compaction).toBeUndefined(); // 转普通 system 文本
+      expect(getStreamState(uuid).compactionMessageId).toBeNull(); // 占位 id 释放
+    });
+
+    it('摘要失败但事件已正常处理（attempted=true + 无残留卡）时不重复插入', async () => {
+      mockCompactResult({ attempted: true, reason: '摘要被输出长度上限截断（生成不完整），已放弃本次压缩' });
+      seedConversation('conv-1', [
+        makeMessage({ id: 'u1', content: 'go' }),
+        // 事件路径已把 running 卡转成普通 system 文本（compaction 字段清除、占位 id 释放）
+        { id: 'card-1', role: 'system', content: '上下文压缩未完成：摘要被输出长度上限截断（生成不完整），已放弃本次压缩', timestamp: now },
+      ]);
+      seedTask('task-1', 'conv-1', 'completed');
+
+      await useConversationStore.getState().compactConversation('conv-1');
+
+      const msgs = useConversationStore.getState().messages['conv-1'];
+      expect(msgs).toHaveLength(2); // 不新增任何消息（防重复）
+      expect(msgs.map((m) => m.id)).toEqual(['u1', 'card-1']);
+    });
+
+    it('命令失败（未配置 LLM）且无 running 卡时插入失败提示', async () => {
+      agentCompactConversation.mockRejectedValue(new Error('尚未配置 LLM，请前往设置填写'));
+      seedConversation('conv-1', [makeMessage({ id: 'u1', content: 'go' })]);
+      seedTask('task-1', 'conv-1', 'completed');
+
+      await expect(useConversationStore.getState().compactConversation('conv-1')).rejects.toThrow(
+        '尚未配置 LLM',
+      );
+      const msgs = useConversationStore.getState().messages['conv-1'];
+      expect(msgs).toHaveLength(2);
+      expect(msgs[1].role).toBe('system');
+      expect(msgs[1].content).toBe('上下文压缩失败：尚未配置 LLM，请前往设置填写');
+      expect(msgs[1].compaction).toBeUndefined();
+    });
+
+    it('会话有运行中任务时插入提示并拒绝压缩', async () => {
+      seedConversation('conv-1', [makeMessage({ id: 'u1', content: 'go' })]);
+      seedTask('task-1', 'conv-1', 'executing');
+
+      await expect(useConversationStore.getState().compactConversation('conv-1')).rejects.toThrow(
+        '会话正在运行任务',
+      );
+      // 不调用后端（守卫在调用前拦截）
+      expect(agentCompactConversation).not.toHaveBeenCalled();
+      const msgs = useConversationStore.getState().messages['conv-1'];
+      expect(msgs).toHaveLength(2);
+      expect(msgs[1].role).toBe('system');
+      expect(msgs[1].content).toContain('会话正在运行任务');
+    });
+
+    it('压缩成功时结果路径不操作 store（live 更新由 Done 事件负责，原文全保留）', async () => {
+      mockCompactResult({
+        compacted: true,
+        summary: '## Primary Request\n- build',
+        shadowedMessages: 2,
+        shadowedTokens: 100,
+        tailDbId: 'row-2',
+      });
+      seedConversation('conv-1', [
+        makeMessage({ id: 'u1', content: 'go' }),
+        makeMessage({ id: 'a1', role: 'assistant', content: 'ok' }),
+        makeMessage({ id: 'u2', content: 'next' }),
+      ]);
+      seedTask('task-1', 'conv-1', 'completed');
+
+      await useConversationStore.getState().compactConversation('conv-1');
+
+      // 结果路径不改 store：压缩由后端落库 + Done 事件更新 live 视图；
+      // 原文一条不少（无隐藏）。
+      const msgs = useConversationStore.getState().messages['conv-1'];
+      expect(msgs.map((m) => m.id)).toEqual(['u1', 'a1', 'u2']);
+    });
+
+    // ── 压缩占位（会话写锁）─────────────────────────────────────────────
+    // 背景：压缩的卡片按「提交那一刻的队尾」落位，从快照到提交之间隔着一次完整
+    // 的摘要调用。这期间写进来的消息会被卡片盖到后面、再被归档边界从后续请求里
+    // 抹掉。占位就是让这个窗口一次都不出现。
+
+    /** 让后端命令悬挂，模拟「摘要调用正在跑」的那几十秒。 */
+    function holdCompaction() {
+      let release!: () => void;
+      agentCompactConversation.mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            release = () =>
+              resolve({
+                compacted: true,
+                summary: 's',
+                shadowedMessages: 1,
+                shadowedTokens: 10,
+                tailDbId: null,
+                reason: null,
+                attempted: true,
+              });
+          }),
+      );
+      return () => release();
+    }
+
+    it('压缩期间同步占位：第二次压缩被拒且不打后端，命令返回后解锁', async () => {
+      const release = holdCompaction();
+      seedConversation('conv-1', [makeMessage({ id: 'u1', content: 'go' })]);
+      seedTask('task-1', 'conv-1', 'completed'); // 已完成的任务不算忙
+
+      const pending = useConversationStore.getState().compactConversation('conv-1');
+
+      // 同步上锁：不能等微任务 —— 前面任何一个 await 之后才上锁，窗口就已经开了
+      expect(conversationIsCompacting('conv-1')).toBe(true);
+      expect(conversationIsBusy('conv-1')).toBe(true);
+      expect(conversationHasRunningTask('conv-1')).toBe(false); // 忙不是因为有任务
+
+      const before = useConversationStore.getState().messages['conv-1'].length;
+      await expect(
+        useConversationStore.getState().compactConversation('conv-1'),
+      ).rejects.toThrow('正在压缩上下文');
+      expect(agentCompactConversation).toHaveBeenCalledTimes(1); // 第二次没打后端
+      const after = useConversationStore.getState().messages['conv-1'];
+      expect(after).toHaveLength(before + 1); // 但给了可见提示
+      expect(after[after.length - 1].content).toContain('正在压缩上下文');
+
+      release();
+      await pending;
+      expect(conversationIsCompacting('conv-1')).toBe(false);
+      expect(conversationIsBusy('conv-1')).toBe(false);
+    });
+
+    it.each([
+      ['命令抛错', () => agentCompactConversation.mockRejectedValue(new Error('boom'))],
+      [
+        '被跳过（attempted=false）',
+        () =>
+          agentCompactConversation.mockResolvedValue({
+            compacted: false,
+            summary: null,
+            shadowedMessages: 0,
+            shadowedTokens: 0,
+            tailDbId: null,
+            reason: '没有可压缩的早期历史区间',
+            attempted: false,
+          }),
+      ],
+    ])('%s 之后占位必须释放（否则该会话输入永久禁用）', async (_name, arrange) => {
+      arrange();
+      seedConversation('conv-1', [makeMessage({ id: 'u1', content: 'go' })]);
+      seedTask('task-1', 'conv-1', 'completed');
+
+      await useConversationStore
+        .getState()
+        .compactConversation('conv-1')
+        .catch(() => undefined);
+
+      expect(conversationIsCompacting('conv-1')).toBe(false);
+      expect(conversationIsBusy('conv-1')).toBe(false);
+    });
+
+    it('取消压缩只转发给后端，不提前解锁（解锁交给命令返回后的 finally）', async () => {
+      const release = holdCompaction();
+      agentCancelCompaction.mockResolvedValue(true);
+      seedConversation('conv-1', [makeMessage({ id: 'u1', content: 'go' })]);
+      seedTask('task-1', 'conv-1', 'completed');
+
+      const pending = useConversationStore.getState().compactConversation('conv-1');
+      await expect(
+        useConversationStore.getState().cancelCompaction('conv-1'),
+      ).resolves.toBe(true);
+      expect(agentCancelCompaction).toHaveBeenCalledWith('conv-1');
+
+      // 摘要可能在取消到达前就跑完了（select! 只包住进行中的请求）→ 那一次仍会
+      // 落库，这段窗口里放消息进来就又踩回原来的坑，所以占位必须留到命令返回。
+      expect(conversationIsCompacting('conv-1')).toBe(true);
+
+      release();
+      await pending;
+      expect(conversationIsCompacting('conv-1')).toBe(false);
+    });
+  });
+
+  describe('显式切换对话的代际守卫', () => {
+    const now = new Date().toISOString();
+
+    function storedMsg(id: string, conversationId: string, content: string) {
+      return {
+        id,
+        conversationId,
+        role: 'user',
+        content,
+        timestamp: now,
+        createdAt: now,
+      };
+    }
+
+    function seedTwoConversations() {
+      useConversationStore.setState({
+        conversations: {
+          'conv-a': { id: 'conv-a', connectionId: 'conn-1', title: 'A', createdAt: now, updatedAt: now },
+          'conv-b': { id: 'conv-b', connectionId: 'conn-1', title: 'B', createdAt: now, updatedAt: now },
+        },
+        messages: {},
+        activeConversationId: null,
+        activeConversationByConnection: {},
+        activeConversationBySession: {},
+      });
+    }
+
+    it('连点两条：加载慢的那条晚归也不许把 active 盖回去', async () => {
+      seedTwoConversations();
+      let resolveA: ((value: unknown) => void) | undefined;
+      agentLoadActiveMessages.mockImplementation((convId: string) => {
+        if (convId === 'conv-a') {
+          return new Promise((resolve) => {
+            resolveA = resolve;
+          });
+        }
+        return Promise.resolve({ messages: [storedMsg('b-msg', 'conv-b', 'B')], hasEarlier: false, checkpointId: null });
+      });
+
+      const switchA = useConversationStore.getState().switchConversation('conv-a');
+      const switchB = useConversationStore.getState().switchConversation('conv-b');
+      await switchB;
+      expect(useConversationStore.getState().activeConversationId).toBe('conv-b');
+
+      // A 的加载这才返回：它已经被后来的 B 取代，整份结果作废
+      resolveA?.({ messages: [storedMsg('a-msg', 'conv-a', 'A')], hasEarlier: false, checkpointId: null });
+      await switchA;
+
+      expect(useConversationStore.getState().activeConversationId).toBe('conv-b');
+      expect(useConversationStore.getState().messages['conv-b'].map((m) => m.id)).toEqual(['b-msg']);
+      // 过期的那次连消息缓存都不写（宁可下次重载，也不给慢的那次留覆盖机会）
+      expect(useConversationStore.getState().messages['conv-a']).toBeUndefined();
+    });
+
+    it('loadConversation 期间发生显式切换：过期的加载不落地', async () => {
+      seedTwoConversations();
+      let resolveLoad: ((value: unknown) => void) | undefined;
+      agentLoadActiveMessages.mockImplementation((convId: string) => {
+        if (convId === 'conv-a') {
+          return new Promise((resolve) => {
+            resolveLoad = resolve;
+          });
+        }
+        return Promise.resolve({ messages: [storedMsg('b-msg', 'conv-b', 'B')], hasEarlier: false, checkpointId: null });
+      });
+
+      // 连接恢复流程（loadConnectionConversations 内部走的就是 loadConversation）
+      const loading = useConversationStore.getState().loadConversation('conv-a');
+      // 加载途中用户点了另一条
+      await useConversationStore.getState().switchConversation('conv-b');
+      resolveLoad?.({ messages: [storedMsg('a-msg', 'conv-a', 'A')], hasEarlier: false, checkpointId: null });
+      await loading;
+
+      expect(useConversationStore.getState().activeConversationId).toBe('conv-b');
+      expect(useConversationStore.getState().messages['conv-a']).toBeUndefined();
+    });
+  });
+
+  describe('归档真分页（hasEarlier 跟随后端真值）', () => {
+    const storedMsg = (id: string, content: string): StoredMessage =>
+      ({
+        id,
+        conversation_id: 'conv-1',
+        role: 'user',
+        content,
+        timestamp: '2026-01-01T00:00:00Z',
+        created_at: '2026-01-01T00:00:00Z',
+      }) as unknown as StoredMessage;
+
+    function seedArchivedConversation() {
+      useConversationStore.setState({
+        activeConversationId: 'conv-1',
+        conversations: {
+          'conv-1': { id: 'conv-1', title: 'T', connectionId: 'c1', createdAt: '', updatedAt: '' } as AgentConversation,
+        },
+        messages: { 'conv-1': [makeMessage({ id: 'anchor' })] },
+        hasEarlierMessages: { 'conv-1': true },
+      });
+    }
+
+    it('loadEarlierHistory 后 hasEarlier 跟随后端 hasMore，不再一次写死 false', async () => {
+      seedArchivedConversation();
+      agentLoadEarlierMessages.mockResolvedValue({
+        messages: [storedMsg('e1', '更早 1'), storedMsg('e2', '更早 2')],
+        hasMore: true,
+      });
+
+      await useConversationStore.getState().loadEarlierHistory('conv-1');
+
+      const state = useConversationStore.getState();
+      expect(state.messages['conv-1'].map((m) => m.id)).toEqual(['e1', 'e2', 'anchor']);
+      expect(state.hasEarlierMessages['conv-1']).toBe(true);
+    });
+
+    it('后端说没有了才写 false', async () => {
+      seedArchivedConversation();
+      agentLoadEarlierMessages.mockResolvedValue({
+        messages: [storedMsg('e1', '最早一条')],
+        hasMore: false,
+      });
+
+      await useConversationStore.getState().loadEarlierHistory('conv-1');
+
+      expect(useConversationStore.getState().hasEarlierMessages['conv-1']).toBe(false);
+    });
+
+    it('在飞的同一会话翻页不重复发请求', async () => {
+      seedArchivedConversation();
+      let resolveFirst: ((value: unknown) => void) | undefined;
+      agentLoadEarlierMessages.mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            resolveFirst ??= resolve;
+          }),
+      );
+
+      const first = useConversationStore.getState().loadEarlierHistory('conv-1');
+      const second = useConversationStore.getState().loadEarlierHistory('conv-1');
+      resolveFirst?.({ messages: [storedMsg('e1', '更早')], hasMore: true });
+      await Promise.all([first, second]);
+
+      expect(agentLoadEarlierMessages).toHaveBeenCalledTimes(1);
+      expect(agentLoadEarlierMessages).toHaveBeenCalledWith('conv-1', 'anchor', 50);
+    });
+
+    it('rollbackToMessage 逐页补齐深档消息后能撤回', async () => {
+      seedArchivedConversation();
+      // 两页归档，目标在第二页
+      agentLoadEarlierMessages
+        .mockResolvedValueOnce({
+          messages: [storedMsg('p1', '第一页')],
+          hasMore: true,
+        })
+        .mockResolvedValueOnce({
+          messages: [storedMsg('p2-target', '目标'), storedMsg('p2-b', '第二页后')],
+          hasMore: false,
+        });
+      agentTruncateConversation.mockResolvedValue({
+        deletedMessages: 2,
+        planAdjusted: false,
+        plan: null,
+        planTaskId: null,
+      });
+
+      const result = await useConversationStore
+        .getState()
+        .rollbackToMessage('conv-1', 'p2-target');
+
+      expect(agentLoadEarlierMessages).toHaveBeenCalledTimes(2);
+      expect(result.prompt).toBe('目标');
+      // 撤回后本地缓存截到目标之前（目标即最前一条 → 截成空）
+      const msgs = useConversationStore.getState().messages['conv-1'];
+      expect(msgs.map((m) => m.id)).toEqual([]);
+    });
+
+    it('翻到底也找不到：报「消息不存在」', async () => {
+      seedArchivedConversation();
+      agentLoadEarlierMessages.mockResolvedValue({
+        messages: [storedMsg('e1', '更早')],
+        hasMore: false,
+      });
+
+      await expect(
+        useConversationStore.getState().rollbackToMessage('conv-1', 'ghost'),
+      ).rejects.toThrow('消息不存在');
+    });
+  });
+});
