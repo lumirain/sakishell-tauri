@@ -26,8 +26,9 @@ jobs:
         # 不写 version：自动读 package.json 里钉死的 packageManager（pnpm@11.15.1）
 
       - uses: actions/setup-node@v4
+        # node-24：pnpm 11.x 的 store 实现依赖 node:sqlite（Node 22.5+ 才有），node-20 会 ERR_UNKNOWN_BUILTIN_MODULE
         with:
-          node-version: '20'
+          node-version: '24'
           cache: pnpm
           cache-dependency-path: pnpm-lock.yaml
 
