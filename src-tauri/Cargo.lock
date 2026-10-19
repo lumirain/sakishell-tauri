@@ -3550,60 +3550,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sakishell"
-version = "1.0.0"
-dependencies = [
- "aes-gcm 0.10.3",
- "android-native-keyring-store",
- "async-trait",
- "axum",
- "base64 0.22.1",
- "chrono",
- "dirs 5.0.1",
- "env_logger",
- "fs4",
- "futures",
- "handlebars",
- "html2md",
- "jni 0.21.1",
- "keyring",
- "keyring-core",
- "log",
- "minisign-verify",
- "ndk-context",
- "notify",
- "parking_lot",
- "percent-encoding",
- "reqwest 0.12.28",
- "rusqlite",
- "russh",
- "russh-sftp",
- "scraper",
- "semver",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2 0.10.9",
- "shell-words",
- "tauri",
- "tauri-build",
- "tauri-plugin-clipboard-manager",
- "tauri-plugin-dialog",
- "tauri-plugin-fs",
- "tauri-plugin-notification",
- "tauri-plugin-opener",
- "tauri-plugin-shell",
- "tauri-winrt-notification",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "url",
- "uuid",
- "zeroize",
- "zip",
-]
-
-[[package]]
 name = "markup5ever"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5702,6 +5648,60 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+
+[[package]]
+name = "sakishell"
+version = "1.0.1"
+dependencies = [
+ "aes-gcm 0.10.3",
+ "android-native-keyring-store",
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "dirs 5.0.1",
+ "env_logger",
+ "fs4",
+ "futures",
+ "handlebars",
+ "html2md",
+ "jni 0.21.1",
+ "keyring",
+ "keyring-core",
+ "log",
+ "minisign-verify",
+ "ndk-context",
+ "notify",
+ "parking_lot",
+ "percent-encoding",
+ "reqwest 0.12.28",
+ "rusqlite",
+ "russh",
+ "russh-sftp",
+ "scraper",
+ "semver",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2 0.10.9",
+ "shell-words",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-clipboard-manager",
+ "tauri-plugin-dialog",
+ "tauri-plugin-fs",
+ "tauri-plugin-notification",
+ "tauri-plugin-opener",
+ "tauri-plugin-shell",
+ "tauri-winrt-notification",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "url",
+ "uuid",
+ "zeroize",
+ "zip",
+]
 
 [[package]]
 name = "salsa20"
