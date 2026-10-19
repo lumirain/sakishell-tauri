@@ -10,12 +10,15 @@
 // DNS rebinding 的浏览器）都能访问，而这里暴露的是「在你所有服务器上执行
 // 无审批命令」。所以本模块不是「把 stdio 换个壳」，它必须自带边界：
 //
-//   1. **默认只绑 127.0.0.1**。要暴露到局域网得用户显式传 `--mcp-bind`。
+//   1. **默认绑 0.0.0.0**（局域网可直接访问）。外部访问的凭据门槛是
+//      **强制 Bearer token**（第 2 条）：token 是「谁能调用」的唯一钥匙，
+//      暴露到局域网属于产品既定行为（用户在设置页可改回 127.0.0.1）。
 //   2. **强制 Bearer token**，没有 token 直接拒绝启动。token 用 SHA-256
 //      摘要后按位比较，避免用逐字节提前返回的方式泄漏长度与前缀。
 //   3. **限流**，防止本地进程把它当成高频执行通道刷。
 //
-// 三条都是「不给配置项就安全」的方向：默认值即安全值，放宽必须显式为之。
+// 三条都是「不给配置项就安全」的方向：token 与限流是硬门槛，绑定地址是
+// 产品默认（0.0.0.0），收紧为仅本机须显式为之（填 127.0.0.1）。
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -42,10 +45,12 @@ use crate::error::AppError;
 /// 默认端口。刻意避开 3000 / 8080 这类常被占用的开发端口。
 pub const DEFAULT_HTTP_PORT: u16 = 8765;
 
-/// 默认绑定地址：仅本机回环。
+/// 默认绑定地址：0.0.0.0，局域网内其他设备可直接连接。
 ///
-/// 想局域网访问必须显式改——这是刻意的：默认值必须是安全值。
-pub const DEFAULT_BIND: &str = "127.0.0.1";
+/// 这是产品既定行为（HTTP 常驻服务默认对外开放）；想只监听本机，
+/// 显式填 `127.0.0.1`（CLI 传 `--mcp-bind 127.0.0.1`，GUI 在设置页改）。
+/// 暴露到局域网的安全门槛由**强制 Bearer token** 承担。
+pub const DEFAULT_BIND: &str = "0.0.0.0";
 
 /// 每秒允许的请求数上限。
 const RATE_LIMIT_PER_SEC: u32 = 60;
@@ -265,7 +270,7 @@ async fn bind_listener(addr: SocketAddr, port: u16) -> Result<tokio::net::TcpLis
             addr
         )),
         std::io::ErrorKind::AddrNotAvailable => AppError::Config(format!(
-            "本机没有 {} 这个地址，无法绑定。绑定地址一般保持 127.0.0.1。",
+            "本机没有 {} 这个地址，无法绑定。绑定地址一般保持 0.0.0.0（局域网可访问），仅限本机时填 127.0.0.1。",
             addr.ip()
         )),
         _ => AppError::Network(format!("无法监听 {}：{}", addr, e)),
@@ -353,16 +358,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_bind_is_loopback() {
-        // 默认值必须是安全值：改 DEFAULT_BIND 成 0.0.0.0 会让这条测试挂掉，
-        // 从而拦住「不小心把服务暴露到局域网」
-        assert_eq!(DEFAULT_BIND, "127.0.0.1");
+    fn default_bind_exposes_lan() {
+        // 默认 0.0.0.0：HTTP 常驻服务默认对局域网开放（产品决策）。
+        // 安全由强制 Bearer token 承担；要仅本机必须显式填 127.0.0.1。
+        assert_eq!(DEFAULT_BIND, "0.0.0.0");
         let cfg = HttpConfig {
             bind: DEFAULT_BIND.parse().unwrap(),
             port: DEFAULT_HTTP_PORT,
             token: "t".into(),
         };
-        assert!(cfg.is_loopback());
+        assert!(!cfg.is_loopback(), "0.0.0.0 不是回环地址");
     }
 
     #[test]

@@ -52,7 +52,7 @@ pub async fn mcp_server_start_http(
 ) -> Result<HttpRuntimeInfo, AppError> {
     let bind: IpAddr = bind.trim().parse().map_err(|_| {
         AppError::Config(format!(
-            "绑定地址「{}」不是合法 IP。只监听本机填 127.0.0.1。",
+            "绑定地址「{}」不是合法 IP。默认 0.0.0.0 局域网可访问；仅限本机填 127.0.0.1。",
             bind
         ))
     })?;

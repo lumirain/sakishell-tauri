@@ -81,7 +81,7 @@ function StatusPill({ running }: { running: boolean }) {
 export function McpServerSection() {
   const [status, setStatus] = useState<McpHttpRuntimeInfo | null>(null);
   const [config, setConfig] = useState<McpClientConfig | null>(null);
-  const [bind, setBind] = useState('127.0.0.1');
+  const [bind, setBind] = useState('0.0.0.0');
   const [port, setPort] = useState(8765);
   /** 停止状态下待用的令牌；启动后由后端返回的为准 */
   const [pendingToken, setPendingToken] = useState('');
@@ -234,7 +234,7 @@ export function McpServerSection() {
           description={
             running
               ? '运行中不可修改，先停止服务再改。'
-              : '默认只监听本机。改成别的地址会让局域网内其他机器也能连上。'
+              : '默认监听 0.0.0.0：局域网内其他设备可直接连接。改回 127.0.0.1 则仅本机可访问。'
           }
           sectionId="settings-mcp-server"
           keywords={['bind', '地址', '端口', 'port', '监听', 'localhost']}
@@ -246,7 +246,7 @@ export function McpServerSection() {
                 onChange={(e) => setBind(e.target.value)}
                 disabled={running || busy}
                 aria-label="监听地址"
-                placeholder="127.0.0.1"
+                placeholder="0.0.0.0"
                 spellCheck={false}
                 className="w-40 rounded-lg bg-zinc-800 border border-zinc-700 px-3 py-1.5 text-sm text-zinc-100 font-mono focus:outline-none focus:border-indigo-500 disabled:opacity-50"
               />
@@ -266,7 +266,8 @@ export function McpServerSection() {
                 <p className="text-[11px] leading-5 text-red-200/90">
                   <span className="font-medium">{bind}</span> 不是本机地址：局域网内任何能访问
                   这个端口的程序，都能在你已保存的服务器上执行<span className="font-medium">无审批</span>
-                  命令。真要用，请走 SSH 隧道或 Tailscale 之类的私有网络，不要直接暴露。
+                  命令。默认 0.0.0.0 即此状态——请务必使用下方生成的访问令牌，不要让它泄露。
+                  仅限本机使用时改回 127.0.0.1。
                 </p>
               </div>
             )}
