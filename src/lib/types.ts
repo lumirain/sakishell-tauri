@@ -440,6 +440,17 @@ export interface McpExternalExecChunk {
   chunk: string;
 }
 
+/** 后端请前端为连接打开终端标签页（`mcp://open-terminal`）。 */
+export interface McpOpenTerminalEvent {
+  connectionId: string;
+  connectionName: string;
+  host: string;
+  port: number;
+  user: string;
+  command: string;
+  seq: number;
+}
+
 export interface McpServerDefaults {
   bind: string;
   port: number;

@@ -1025,6 +1025,10 @@ pub fn run() {
             commands::mcp_server::mcp_server_client_config,
             #[cfg(desktop)]
             commands::mcp_server::mcp_server_defaults,
+            #[cfg(desktop)]
+            commands::mcp_server::mcp_external_input,
+            #[cfg(desktop)]
+            commands::mcp_server::mcp_session_ready,
             commands::update::check_update,
             commands::update::open_external_url,
             commands::update::get_update_state,

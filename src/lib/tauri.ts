@@ -756,6 +756,14 @@ export async function mcpExternalInput(
   return invoke<McpExecOutput>("mcp_external_input", { connectionId, command });
 }
 
+/** 前端为连接打开终端标签页成功后通知后端（解除「等待 GUI 会话」挂起）。 */
+export async function mcpSessionReady(
+  connectionId: string,
+  sessionId: string,
+): Promise<void> {
+  return invoke<void>("mcp_session_ready", { connectionId, sessionId });
+}
+
 export async function mcpServerDefaults(): Promise<McpServerDefaults> {
   return invoke<McpServerDefaults>("mcp_server_defaults");
 }

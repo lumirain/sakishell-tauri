@@ -111,6 +111,20 @@ pub async fn mcp_external_input(
         .await
 }
 
+/// 前端为连接打开终端标签页成功后回调：解除后端「等待 GUI 会话」的挂起，
+/// 让 AI 命令在该终端会话的交互 shell 里继续执行。
+#[tauri::command]
+pub async fn mcp_session_ready(connection_id: String, session_id: String) -> Result<(), AppError> {
+    let server = runtime::server()
+        .ok_or_else(|| AppError::Config("MCP 服务未启动，无法确认会话就绪。".into()))?;
+    let registry = server.registry()?;
+    registry
+        .executor()
+        .notify_session_ready(&connection_id, &session_id)
+        .await;
+    Ok(())
+}
+
 /// 停止 HTTP 服务。返回「之前是否在跑」——幂等，重复点不报错。
 #[tauri::command]
 pub async fn mcp_server_stop_http() -> Result<bool, AppError> {

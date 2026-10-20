@@ -16,7 +16,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use tauri::AppHandle;
+use tauri::{AppHandle, Listener};
+use tokio::sync::oneshot;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::RwLock as TokioRwLock;
 
@@ -39,6 +40,20 @@ pub const EXEC_EVENT: &str = "mcp://external-exec";
 /// 外部调用输出 chunk 事件（复用 executor 的流式协议）：
 /// `{type:"toolOutput", toolCallId:"mcp:{connectionId}:{seq}", chunk}`。
 pub const OUTPUT_EVENT: &str = "mcp://exec-output";
+
+/// 请前端为某连接打开一个 SSH 终端标签页（AI 命令要落在 GUI 可见的
+/// 交互 shell 里执行、连接保持复用）。
+///
+/// payload：`{connectionId, connectionName, host, port, user, command, seq}`。
+/// 前端打开成功后调用 `mcp_session_ready(connectionId, sessionId)` 通知后端。
+pub const OPEN_TERMINAL_EVENT: &str = "mcp://open-terminal";
+
+/// 注入交互 shell 的命令结束标记（echo 退出码用）。
+/// 足够独特，避免被命令自身输出误命中；输出里最后一次出现即命令边界。
+const DONE_MARKER: &str = "__SAKISHELL_DONE_9F3K__";
+
+/// 等待前端打开终端标签页的最长时间。
+const OPEN_TERMINAL_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn now_millis() -> u128 {
     SystemTime::now()
@@ -99,6 +114,9 @@ pub struct ExternalExecutor {
     /// 可见命令的全局序号：每个 chunk 的 `toolCallId` 编码
     /// `mcp:{connectionId}:{seq}`，前端据此把输出路由回对应会话。
     seq: AtomicU64,
+    /// 「请前端打开终端标签页」的在途请求：connectionId → 就绪信号
+    /// （前端 `mcp_session_ready` 发回 sessionId）。超时或取消时移除。
+    pending_gui: TokioMutex<HashMap<String, oneshot::Sender<String>>>,
 }
 
 /// 连接信息（不含敏感数据）
@@ -147,6 +165,7 @@ impl ExternalExecutor {
             temp_auth: RwLock::new(HashMap::new()),
             app,
             seq: AtomicU64::new(0),
+            pending_gui: TokioMutex::new(HashMap::new()),
         }
     }
 
@@ -284,16 +303,16 @@ impl ExternalExecutor {
 
     /// 执行 SSH 命令并**实时推送到 GUI**（外部 AI / 用户输入共用）。
     ///
-    /// 与 [`Self::execute_command`] 的执行语义完全一致（无头会话复用、死会话
-    /// 重建重试），差别只在事件：
-    /// - 命令开始发 [`EXEC_EVENT`]（`phase:"started"`）；
-    /// - 输出经 [`OUTPUT_EVENT`] 流式下发（每个 chunk 携带
-    ///   `toolCallId = "mcp:{connectionId}:{seq}"` 供前端路由）；
-    /// - 结束发 [`EXEC_EVENT`]（`phase:"finished"`，含状态与退出码）。
+    /// 与 [`Self::execute_command`] 的执行语义一致（死会话重建重试），差别：
+    /// - **GUI 优先**：命令在用户可见的 SSH 终端标签页里执行（交互 shell，
+    ///   `send_input` 写入，输出进终端流，连接保持不复用即不关闭）；该连接
+    ///   没有打开终端标签页时，发 [`OPEN_TERMINAL_EVENT`] 请前端自动打开。
+    /// - 命令开始/结束发 [`EXEC_EVENT`]；输出经 [`OUTPUT_EVENT`] 流式下发
+    ///   （`toolCallId = "mcp:{connectionId}:{seq}"`）。
     ///
-    /// 无 AppHandle（CLI 无头模式）时行为等价静默版——不产生任何 GUI 事件。
+    /// 无 AppHandle（CLI 无头模式）时退回旧的静默无头路径（不产生 GUI 事件）。
     ///
-    /// `source` 区分「外部 AI 派发」与「用户在界面输入」，前端据此标注来源。
+    /// `source` 区分「外部 AI 派发」与「用户在界面输入」。
     pub async fn execute_command_visible(
         &self,
         connection_id: &str,
@@ -308,32 +327,103 @@ impl ExternalExecutor {
             timeout_ms
         );
 
-        let session_id = self.ensure_session(connection_id).await?;
         let conn = self.saved_connection(connection_id).await?;
         let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
 
-        self.emit_started(connection_id, &conn, &session_id, command, seq, source);
+        // ── CLI 无头模式：原静默路径 ──
+        if self.app.is_none() {
+            let session_id = self.ensure_session(connection_id).await?;
+            self.emit_started(connection_id, &conn, &session_id, command, seq, source);
+            return match self
+                .submit_on_visible(connection_id, &session_id, command, timeout_ms, seq, source)
+                .await
+            {
+                Ok(out) => {
+                    self.emit_finished(connection_id, seq, "completed", Some(out.exit_code), None);
+                    Ok(out)
+                }
+                Err(e) if is_dead_session_error(&e) => {
+                    self.sessions.lock().await.remove(connection_id);
+                    let fresh = self.ensure_session(connection_id).await?;
+                    match self
+                        .submit_on_visible(connection_id, &fresh, command, timeout_ms, seq, source)
+                        .await
+                    {
+                        Ok(out) => {
+                            self.emit_finished(
+                                connection_id,
+                                seq,
+                                "completed",
+                                Some(out.exit_code),
+                                None,
+                            );
+                            Ok(out)
+                        }
+                        Err(e2) => {
+                            self.emit_finished(
+                                connection_id,
+                                seq,
+                                "failed",
+                                None,
+                                Some(e2.to_string()),
+                            );
+                            Err(e2)
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.emit_finished(connection_id, seq, "failed", None, Some(e.to_string()));
+                    Err(e)
+                }
+            };
+        }
 
-        match self
-            .submit_on_visible(connection_id, &session_id, command, timeout_ms, seq, source)
-            .await
-        {
+        // ── GUI 路径：命令落在可见终端标签页里执行 ──
+        let attempt = async {
+            // 该连接已打开的活跃 GUI 会话；没有则请前端开一个终端标签页
+            let session_id = match self
+                .ssh_manager
+                .latest_active_session_for_connection(connection_id)
+                .await
+            {
+                Some(sid) => sid,
+                None => self.request_gui_session(connection_id, command, seq).await?,
+            };
+            self.emit_started(connection_id, &conn, &session_id, command, seq, source);
+            self.run_in_shell_and_capture(connection_id, &session_id, command, timeout_ms, seq, source)
+                .await
+        };
+
+        match attempt.await {
             Ok(out) => {
                 self.emit_finished(connection_id, seq, "completed", Some(out.exit_code), None);
                 Ok(out)
             }
             Err(e) if is_dead_session_error(&e) => {
                 log::info!(
-                    "[MCP External] 会话 {} 已失效（{}），重建后重试一次",
-                    session_id,
+                    "[MCP External] GUI 会话已失效（{}），重新获取会话后重试一次",
                     e
                 );
-                self.sessions.lock().await.remove(connection_id);
-                let fresh = self.ensure_session(connection_id).await?;
-                match self
-                    .submit_on_visible(connection_id, &fresh, command, timeout_ms, seq, source)
+                let retry = async {
+                    let session_id = match self
+                        .ssh_manager
+                        .latest_active_session_for_connection(connection_id)
+                        .await
+                    {
+                        Some(sid) => sid,
+                        None => self.request_gui_session(connection_id, command, seq).await?,
+                    };
+                    self.run_in_shell_and_capture(
+                        connection_id,
+                        &session_id,
+                        command,
+                        timeout_ms,
+                        seq,
+                        source,
+                    )
                     .await
-                {
+                };
+                match retry.await {
                     Ok(out) => {
                         self.emit_finished(connection_id, seq, "completed", Some(out.exit_code), None);
                         Ok(out)
@@ -351,6 +441,179 @@ impl ExternalExecutor {
         }
     }
 
+    /// 请求前端为该连接打开一个 SSH 终端标签页，等它就绪（返回 session_id）。
+    ///
+    /// 前端收到 [`OPEN_TERMINAL_EVENT`] 后：用已保存连接配置调
+    /// `sessionStore.connect`，成功后再调 `mcp_session_ready` 把 sessionId 送回。
+    async fn request_gui_session(
+        &self,
+        connection_id: &str,
+        command: &str,
+        seq: u64,
+    ) -> Result<String, AppError> {
+        let conn = self.saved_connection(connection_id).await?;
+        let Some(app) = &self.app else {
+            return Err(AppError::Config(
+                "CLI 无头模式没有 GUI 可开终端标签页。".into(),
+            ));
+        };
+
+        let (tx, rx) = oneshot::channel::<String>();
+        self.pending_gui.lock().await.insert(connection_id.to_string(), tx);
+
+        crate::emit_event(
+            app,
+            OPEN_TERMINAL_EVENT,
+            &serde_json::json!({
+                "connectionId": connection_id,
+                "connectionName": conn.name,
+                "host": conn.host,
+                "port": conn.port,
+                "user": conn.username,
+                "command": command,
+                "seq": seq,
+            }),
+        );
+        log::info!(
+            "[MCP External] 已请求前端打开终端标签页: connection={}",
+            connection_id
+        );
+
+        match tokio::time::timeout(OPEN_TERMINAL_TIMEOUT, rx).await {
+            Ok(Ok(session_id)) => Ok(session_id),
+            Ok(Err(_)) => {
+                self.pending_gui.lock().await.remove(connection_id);
+                Err(AppError::Agent(
+                    "前端打开终端标签页的通道中断（应用可能已关闭）。".into(),
+                ))
+            }
+            Err(_) => {
+                self.pending_gui.lock().await.remove(connection_id);
+                Err(AppError::Agent(format!(
+                    "等待前端打开终端标签页超时（{}s）。请确认 SakiShell 窗口在前台运行。",
+                    OPEN_TERMINAL_TIMEOUT.as_secs()
+                )))
+            }
+        }
+    }
+
+    /// 前端打开终端标签页成功后回调：解除 `request_gui_session` 的等待。
+    pub async fn notify_session_ready(&self, connection_id: &str, session_id: &str) {
+        if let Some(tx) = self.pending_gui.lock().await.remove(connection_id) {
+            let _ = tx.send(session_id.to_string());
+        }
+    }
+
+    /// 在指定 GUI 终端会话的**交互 shell** 里执行命令（`send_input` 写入，
+    /// 输出自然进终端流，用户全程可见），同时用结束标记捕获命令边界与
+    /// 退出码，返回给调用方（AI）。
+    async fn run_in_shell_and_capture(
+        &self,
+        connection_id: &str,
+        session_id: &str,
+        command: &str,
+        timeout_ms: Option<u64>,
+        seq: u64,
+        _source: CommandSource,
+    ) -> Result<CommandOutput, AppError> {
+        let app = self.app.clone().ok_or_else(|| {
+            AppError::Config("GUI 会话执行需要 AppHandle（CLI 无头模式不可用）。".into())
+        })?;
+        let timeout = timeout_ms
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::from_secs(30));
+
+        // 订阅该会话的输出事件（先于 send_input 建立，避免漏掉首个 chunk）。
+        // 输出同时透传 `OUTPUT_EVENT`（外部调用面板的命令流记录），
+        // 并在缓冲里检测结束标记，命中即发就绪信号。
+        let buf: Arc<parking_lot::Mutex<String>> = Arc::new(parking_lot::Mutex::new(String::new()));
+        let exit_code: Arc<parking_lot::Mutex<Option<i32>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        let (finish_tx, finish_rx) = oneshot::channel::<()>();
+        let finish: Arc<parking_lot::Mutex<Option<oneshot::Sender<()>>>> =
+            Arc::new(parking_lot::Mutex::new(Some(finish_tx)));
+
+        let event_name = format!("ssh://output/{}", session_id);
+        let app_listener = app.clone();
+        let event_id = {
+            let app_listener = app_listener.clone();
+            let emit_target = app_listener.clone();
+            let buf = buf.clone();
+            let exit_code = exit_code.clone();
+            let finish = finish.clone();
+            let connection_id = connection_id.to_string();
+            app_listener.listen(&event_name, move |event| {
+                let text: String = serde_json::from_str(event.payload()).unwrap_or_default();
+                if text.is_empty() {
+                    return;
+                }
+                // 透传给外部调用面板（命令流记录），复用 executor 的流式协议
+                crate::emit_event(
+                    &emit_target,
+                    OUTPUT_EVENT,
+                    &serde_json::json!({
+                        "type": "toolOutput",
+                        "toolCallId": format!("mcp:{}:{}", connection_id, seq),
+                        "chunk": text,
+                    }),
+                );
+                let mut b = buf.lock();
+                b.push_str(&text);
+                // 结束标记：`...__SAKISHELL_DONE_9F3K__:<code>\n`，取最后一次出现
+                if let Some(pos) = b.rfind(DONE_MARKER) {
+                    let after = &b[pos + DONE_MARKER.len()..];
+                    let line_end = after.find('\n').unwrap_or(after.len());
+                    let code_part = after[..line_end].trim_start_matches(':').trim();
+                    if let Ok(code) = code_part.parse::<i32>() {
+                        *exit_code.lock() = Some(code);
+                    }
+                    if let Some(tx) = finish.lock().take() {
+                        let _ = tx.send(());
+                    }
+                }
+            })
+        };
+
+        // 交互 shell 中执行：命令 + 结束标记（终端可见全过程，连接保持）
+        let payload = format!("{}\necho \"{}\":$?\n", command, DONE_MARKER);
+        let send_result = self
+            .ssh_manager
+            .send_input(session_id, payload.as_bytes())
+            .await;
+
+        let outcome = match send_result {
+            Err(e) => Err(e),
+            Ok(()) => match tokio::time::timeout(timeout, finish_rx).await {
+                Ok(Ok(())) => {
+                    let b = buf.lock().clone();
+                    // 取标记行之前的内容作为命令输出
+                    let stdout = match b.split_once(DONE_MARKER) {
+                        Some((head, _)) => head,
+                        None => b.as_str(),
+                    }
+                    .trim_end()
+                    .to_string();
+                    let exit = exit_code.lock().unwrap_or(1);
+                    Ok(CommandOutput {
+                        stdout,
+                        stderr: String::new(), // 交互 shell stdout/stderr 合流
+                        exit_code: exit,
+                    })
+                }
+                Ok(Err(_)) => Err(AppError::Agent("监听会话输出时通道中断。".into())),
+                Err(_) => {
+                    let b = buf.lock().clone();
+                    Err(AppError::Agent(format!(
+                        "Command timed out。已收到的部分输出：{}",
+                        b
+                    )))
+                }
+            },
+        };
+
+        app_listener.unlisten(event_id);
+        outcome
+    }
     /// 在指定会话上跑一条命令并归一化结果。
     async fn submit_on(
         &self,

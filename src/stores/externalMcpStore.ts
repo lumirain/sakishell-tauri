@@ -11,12 +11,17 @@
 
 import { create } from "zustand";
 import { subscribeTauriEvent } from "@/lib/tauriEvent";
-import { mcpExternalInput } from "@/lib/tauri";
+import { mcpExternalInput, mcpSessionReady } from "@/lib/tauri";
 import { getErrorMessage } from "@/lib/errors";
+import { useConnectionStore } from "@/stores/connectionStore";
+import { useSessionStore } from "@/stores/sessionStore";
 import type {
+  ConnectionConfig,
   McpExternalExecEvent,
   McpExternalExecChunk,
   McpExecOutput,
+  McpOpenTerminalEvent,
+  SavedConnection,
 } from "@/lib/types";
 
 export type ExternalExecStatus =
@@ -58,7 +63,58 @@ interface ExternalMcpState {
 
 const EXEC_EVENT = "mcp://external-exec";
 const OUTPUT_EVENT = "mcp://exec-output";
+const OPEN_TERMINAL_EVENT = "mcp://open-terminal";
 const TOOL_CALL_PREFIX = "mcp:";
+
+/**
+ * 用已保存连接配置打开一个终端标签页（AI 命令要落在 GUI 可见的交互 shell 里）。
+ *
+ * - Password 连接：优先用密钥链里保存的密码（外部调用场景下 AI 已成功连过，
+ *   密钥链通常已有凭据）；密钥链没有时连接失败返回 null。
+ * - PrivateKey 连接：密钥链取私钥（keyId），免交互。
+ *
+ * 打开成功后返回 sessionId；失败返回 null（面板只提示，不弹密码浮层——
+ * 用户可从侧边栏手动连接一次把凭据存进密钥链）。
+ */
+export async function openConnectionTerminal(
+  conn: SavedConnection,
+): Promise<string | null> {
+  const sessions = useSessionStore.getState();
+  try {
+    if (conn.authMethod === "Password") {
+      return await sessions.connectWithSavedPassword(conn.id, conn.name);
+    }
+    if (conn.authMethod === "PrivateKey") {
+      const authMethod: ConnectionConfig["authMethod"] = {
+        type: "PrivateKey",
+        keyId: conn.keyId,
+        keyPath: conn.keyPath,
+      };
+      return await sessions.connect({
+        host: conn.host,
+        port: conn.port,
+        username: conn.username,
+        authMethod,
+        connectionId: conn.id,
+        trustNewHostKey: false,
+      });
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** 打开连接 id 对应的终端标签页；连接不存在或打开失败返回 null。 */
+export async function openConnectionTerminalById(
+  connectionId: string,
+): Promise<string | null> {
+  const conn = useConnectionStore
+    .getState()
+    .connections.find((c) => c.id === connectionId);
+  if (!conn) return null;
+  return openConnectionTerminal(conn);
+}
 
 /** 解析 `mcp:{connectionId}:{seq}`；格式不符返回 null。 */
 export function parseToolCallId(toolCallId: string): {
@@ -173,6 +229,18 @@ export const useExternalMcpStore = create<ExternalMcpState>((set, get) => {
           },
         };
       });
+    });
+
+    // 后端要求在该连接的 GUI 终端标签页里执行命令：自动打开终端，
+    // 就绪后回调后端（命令随后经 `ssh://output/{sessionId}` 流到终端）。
+    subscribeTauriEvent<McpOpenTerminalEvent>(OPEN_TERMINAL_EVENT, (payload) => {
+      void (async () => {
+        const sessionId = await openConnectionTerminalById(payload.connectionId);
+        if (!sessionId) return;
+        await mcpSessionReady(payload.connectionId, sessionId).catch(() => {
+          // 回调失败不影响终端已打开；命令会等待就绪信号直到超时
+        });
+      })();
     });
 
     set({ ready: true });

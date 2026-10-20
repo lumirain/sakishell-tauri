@@ -1,19 +1,28 @@
 // 「外部调用」面板：外部 AI 客户端经 MCP 服务执行命令的实时可见视图。
 //
-// 布局：左侧是连接会话列表（一个连接 = 一个持久会话，对应后端无头会话缓存），
+// 布局：左侧是连接会话列表（一个连接 = 一个持久会话；点击会话项会像左侧
+// 标签一样打开/激活对应连接的 SSH 终端标签页，AI 命令就在那个终端里执行），
 // 右侧是选中会话的命令流（命令 + 实时输出 + 状态 + 退出码），底部输入框
 // 让你在同一连接上手动补命令（与 AI 的执行同流显示）。
 //
-// 数据源：`stores/externalMcpStore.ts` 订阅 `mcp://external-exec` 与
-// `mcp://exec-output` 事件维护会话状态——本组件纯展示，不直接接触后端。
+// 交互：
+// - 每条命令头部有放大按钮：单独把该命令与输出全屏查看（Esc / 按钮还原）；
+// - 会话列表与命令流之间可拖拽调节宽度；
+// - 会话项右上角终端按钮：直接打开该连接的终端标签页。
+//
+// 数据源：`stores/externalMcpStore.ts` 订阅 `mcp://external-exec`、
+// `mcp://exec-output` 与 `mcp://open-terminal` 事件维护会话状态——
+// 本组件纯展示 + 触发「打开终端」，不直接接触后端。
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Maximize2, Minimize2 } from "lucide-react";
+import { Maximize2, Minimize2, Terminal, X } from "lucide-react";
 import {
   useExternalMcpStore,
+  openConnectionTerminalById,
   type ExternalExecCommand,
   type ExternalMcpSession,
 } from "@/stores/externalMcpStore";
+import { useSessionStore } from "@/stores/sessionStore";
 import { getErrorMessage } from "@/lib/errors";
 
 const STATUS_LABEL: Record<ExternalExecCommand["status"], string> = {
@@ -41,10 +50,10 @@ function formatTime(millis: number): string {
 
 function CommandEntry({
   cmd,
-  maximized,
+  onMaximize,
 }: {
   cmd: ExternalExecCommand;
-  maximized: boolean;
+  onMaximize: (seq: number) => void;
 }) {
   const running = cmd.status === "running";
   return (
@@ -68,13 +77,18 @@ function CommandEntry({
         <span className="flex-shrink-0 text-[10px] text-zinc-500 tabular-nums">
           {formatTime(cmd.startedAt)}
         </span>
+        <button
+          type="button"
+          onClick={() => onMaximize(cmd.seq)}
+          title="放大查看该命令与输出"
+          aria-label="放大"
+          className="flex-shrink-0 rounded p-1 text-zinc-500 transition-colors hover:bg-zinc-700 hover:text-zinc-100"
+        >
+          <Maximize2 className="h-3 w-3" />
+        </button>
       </div>
       {cmd.output.trim().length > 0 && (
-        <pre
-          className={`px-3 py-2 font-mono text-xs leading-relaxed text-zinc-300 whitespace-pre-wrap break-all overflow-auto ${
-            maximized ? "max-h-[70vh]" : "max-h-64"
-          }`}
-        >
+        <pre className="px-3 py-2 font-mono text-xs leading-relaxed text-zinc-300 whitespace-pre-wrap break-all overflow-auto max-h-64">
           {cmd.output}
         </pre>
       )}
@@ -146,10 +160,10 @@ function SessionInput({ connectionId }: { connectionId: string }) {
 
 function SessionStream({
   session,
-  maximized,
+  onMaximize,
 }: {
   session: ExternalMcpSession;
-  maximized: boolean;
+  onMaximize: (seq: number) => void;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickToBottomRef = useRef(true);
@@ -185,7 +199,7 @@ function SessionStream({
       className="flex-1 overflow-auto px-3 py-3 space-y-2"
     >
       {session.commands.map((cmd) => (
-        <CommandEntry key={cmd.seq} cmd={cmd} maximized={maximized} />
+        <CommandEntry key={cmd.seq} cmd={cmd} onMaximize={onMaximize} />
       ))}
     </div>
   );
@@ -195,21 +209,23 @@ export default function ExternalMcpPanel() {
   const sessions = useExternalMcpStore((s) => s.sessions);
   const initEvents = useExternalMcpStore((s) => s.initEvents);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  /** 最大化：覆盖整个应用窗口查看命令与输出，Esc / 按钮还原。 */
-  const [maximized, setMaximized] = useState(false);
+  // 单条命令放大：只覆盖该命令与输出（Esc / 按钮还原）。
+  const [maximizedSeq, setMaximizedSeq] = useState<number | null>(null);
+  const [terminalBusyId, setTerminalBusyId] = useState<string | null>(null);
+  const [terminalError, setTerminalError] = useState<string | null>(null);
 
   useEffect(() => {
     initEvents();
   }, [initEvents]);
 
   useEffect(() => {
-    if (!maximized) return;
+    if (maximizedSeq == null) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setMaximized(false);
+      if (e.key === "Escape") setMaximizedSeq(null);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [maximized]);
+  }, [maximizedSeq]);
 
   // 会话按最后活动时间排序；默认选中最近的一个。
   const ordered = useMemo(
@@ -232,6 +248,35 @@ export default function ExternalMcpPanel() {
   }, [selectedId, sessions, ordered]);
 
   const selected = selectedId ? sessions[selectedId] : null;
+  const maximizedCmd = selected?.commands.find((c) => c.seq === maximizedSeq) ?? null;
+  /** 会话列表宽度（px），可拖拽调节。 */
+  const [listWidth, setListWidth] = useState(224);
+
+  /** 像左侧标签一样：激活（或打开）该连接的终端标签页。 */
+  const activateTerminal = async (connectionId: string) => {
+    const s = useSessionStore.getState();
+    const existing = Object.values(s.sessions).find(
+      (x) => x.configId === connectionId && x.status === "connected",
+    );
+    if (existing) {
+      s.setActiveSession(existing.id);
+      return;
+    }
+    setTerminalBusyId(connectionId);
+    setTerminalError(null);
+    try {
+      const sessionId = await openConnectionTerminalById(connectionId);
+      if (!sessionId) {
+        setTerminalError(
+          "无法自动打开终端：该连接需要密码或密钥，请先从侧边栏连接一次（凭据会存入密钥链）。",
+        );
+      }
+    } catch {
+      setTerminalError("打开终端失败，请尝试从侧边栏手动连接。");
+    } finally {
+      setTerminalBusyId(null);
+    }
+  };
 
   if (ordered.length === 0) {
     return (
@@ -240,87 +285,200 @@ export default function ExternalMcpPanel() {
         <p className="max-w-sm text-xs leading-relaxed text-zinc-500">
           在设置中启用 HTTP MCP 服务后，外部 AI 客户端（如 Claude Code）通过
           <code className="mx-1 rounded bg-zinc-800 px-1 py-0.5 font-mono">ssh_execute</code>
-          在已保存连接上执行命令时，命令与输出会实时显示在这里。
+          在已保存连接上执行命令时，命令会在该连接的 SSH 终端标签页里执行，
+          并实时显示在这里。
         </p>
       </div>
     );
   }
 
   return (
-    <div
-      className={`flex bg-zinc-900 ${
-        maximized ? "fixed inset-0 z-50" : "h-full"
-      }`}
-    >
-      {/* 会话列表 */}
-      <div className="flex w-56 flex-shrink-0 flex-col border-r border-zinc-800">
-        <div className="px-3 py-2 text-xs font-semibold text-zinc-400">外部 AI 会话</div>
-        <div className="flex-1 overflow-auto px-2 pb-2 space-y-1">
-          {ordered.map((s) => {
-            const last = s.commands[s.commands.length - 1];
-            const active = s.connectionId === selectedId;
-            return (
-              <button
-                key={s.connectionId}
-                type="button"
-                onClick={() => setSelectedId(s.connectionId)}
-                className={`block w-full rounded-md px-2.5 py-2 text-left transition-colors ${
-                  active ? "bg-indigo-600/20" : "hover:bg-zinc-800"
-                }`}
-              >
-                <div className="flex items-center justify-between gap-1">
-                  <span className="min-w-0 truncate text-sm font-medium text-zinc-200">
-                    {s.connectionName}
-                  </span>
-                  <span className="flex-shrink-0 text-[10px] text-zinc-500">
-                    {s.commands.length}
-                  </span>
-                </div>
-                <div className="truncate text-[11px] text-zinc-500">
-                  {s.host}
-                  {last && ` · ${STATUS_LABEL[last.status]}`}
-                </div>
-              </button>
-            );
-          })}
+    <>
+      <div className="flex h-full bg-zinc-900">
+        {/* 会话列表（宽度可拖） */}
+        <div
+          className="flex flex-shrink-0 flex-col border-r border-zinc-800"
+          style={{ width: listWidth }}
+        >
+          <div className="px-3 py-2 text-xs font-semibold text-zinc-400">外部 AI 会话</div>
+          <div className="flex-1 overflow-auto px-2 pb-2 space-y-1">
+            {ordered.map((s) => {
+              const last = s.commands[s.commands.length - 1];
+              const active = s.connectionId === selectedId;
+              return (
+                <button
+                  key={s.connectionId}
+                  type="button"
+                  onClick={() => setSelectedId(s.connectionId)}
+                  className={`group block w-full rounded-md px-2.5 py-2 text-left transition-colors ${
+                    active ? "bg-indigo-600/20" : "hover:bg-zinc-800"
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-1">
+                    <span className="min-w-0 truncate text-sm font-medium text-zinc-200">
+                      {s.connectionName}
+                    </span>
+                    <span className="flex items-center gap-1">
+                      <span className="flex-shrink-0 text-[10px] text-zinc-500">
+                        {s.commands.length}
+                      </span>
+                      <span
+                        role="button"
+                        tabIndex={-1}
+                        title="打开该连接的终端标签页"
+                        aria-label="打开终端"
+                        className={`flex-shrink-0 rounded p-0.5 text-zinc-500 transition-colors ${
+                          terminalBusyId === s.connectionId
+                            ? "animate-pulse text-indigo-400"
+                            : "opacity-0 group-hover:opacity-100 hover:bg-zinc-700 hover:text-zinc-100"
+                        }`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          void activateTerminal(s.connectionId);
+                        }}
+                      >
+                        <Terminal className="h-3.5 w-3.5" />
+                      </span>
+                    </span>
+                  </div>
+                  <div className="truncate text-[11px] text-zinc-500">
+                    {s.host}
+                    {last && ` · ${STATUS_LABEL[last.status]}`}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+          {terminalError && (
+            <p className="border-t border-zinc-800 px-3 py-1.5 text-[11px] text-red-400">
+              {terminalError}
+            </p>
+          )}
+        </div>
+
+        {/* 拖拽分隔条 */}
+        <div
+          role="separator"
+          aria-orientation="vertical"
+          title="拖拽调节宽度"
+          className="group relative w-1 flex-shrink-0 cursor-col-resize bg-zinc-800/60 transition-colors hover:bg-indigo-500/60"
+          onMouseDown={(e) => {
+            e.preventDefault();
+            const startX = e.clientX;
+            const startWidth = listWidth;
+            const onMove = (ev: MouseEvent) => {
+              setListWidth(
+                Math.min(420, Math.max(160, startWidth + (ev.clientX - startX))),
+              );
+            };
+            const onUp = () => {
+              window.removeEventListener("mousemove", onMove);
+              window.removeEventListener("mouseup", onUp);
+              document.body.style.cursor = "";
+              document.body.style.userSelect = "";
+            };
+            window.addEventListener("mousemove", onMove);
+            window.addEventListener("mouseup", onUp);
+            document.body.style.cursor = "col-resize";
+            document.body.style.userSelect = "none";
+          }}
+        />
+
+        {/* 命令流 */}
+        <div className="flex min-w-0 flex-1 flex-col">
+          {selected ? (
+            <>
+              <div className="flex items-center gap-2 border-b border-zinc-800 px-3 py-2">
+                <span className="text-sm font-medium text-zinc-200">
+                  {selected.connectionName}
+                </span>
+                <span className="text-[11px] text-zinc-500">{selected.host}</span>
+                <button
+                  type="button"
+                  onClick={() => void activateTerminal(selected.connectionId)}
+                  title="打开该连接的终端标签页"
+                  className="ml-2 flex-shrink-0 rounded-md border border-zinc-700 bg-zinc-800/60 p-1 text-zinc-400 transition-colors hover:bg-zinc-700 hover:text-zinc-100"
+                >
+                  <Terminal className="h-3.5 w-3.5" />
+                </button>
+                <span className="ml-auto text-[11px] text-zinc-500">
+                  {selected.commands.length} 条命令
+                </span>
+              </div>
+              <SessionStream
+                session={selected}
+                onMaximize={setMaximizedSeq}
+              />
+              <SessionInput connectionId={selected.connectionId} />
+            </>
+          ) : (
+            <div className="flex h-full items-center justify-center text-sm text-zinc-500">
+              <p>选择左侧会话查看命令流。</p>
+            </div>
+          )}
         </div>
       </div>
 
-      {/* 命令流 */}
-      <div className="flex min-w-0 flex-1 flex-col">
-        {selected ? (
-          <>
-            <div className="flex items-center gap-2 border-b border-zinc-800 px-3 py-2">
-              <span className="text-sm font-medium text-zinc-200">
-                {selected.connectionName}
-              </span>
-              <span className="text-[11px] text-zinc-500">{selected.host}</span>
-              <span className="ml-auto text-[11px] text-zinc-500">
-                {selected.commands.length} 条命令
-              </span>
-              <button
-                type="button"
-                onClick={() => setMaximized((v) => !v)}
-                title={maximized ? "还原（Esc）" : "最大化"}
-                aria-label={maximized ? "还原" : "最大化"}
-                className="flex-shrink-0 rounded-md border border-zinc-700 bg-zinc-800/60 p-1.5 text-zinc-400 transition-colors hover:bg-zinc-700 hover:text-zinc-100"
-              >
-                {maximized ? (
-                  <Minimize2 className="h-3.5 w-3.5" />
-                ) : (
-                  <Maximize2 className="h-3.5 w-3.5" />
-                )}
-              </button>
-            </div>
-            <SessionStream session={selected} maximized={maximized} />
-            <SessionInput connectionId={selected.connectionId} />
-          </>
-        ) : (
-          <div className="flex h-full items-center justify-center text-sm text-zinc-500">
-            <p>选择左侧会话查看命令流。</p>
+      {/* 单条命令放大视图（全屏覆盖，Esc / 关闭按钮还原） */}
+      {maximizedCmd && (
+        <div className="fixed inset-0 z-50 flex flex-col bg-zinc-900">
+          <div className="flex items-center gap-2 border-b border-zinc-800 px-4 py-2.5">
+            <span
+              className={`flex-shrink-0 text-[10px] font-semibold px-1.5 py-0.5 rounded ${
+                maximizedCmd.source === "ai"
+                  ? "bg-indigo-500/20 text-indigo-300"
+                  : "bg-zinc-500/20 text-zinc-300"
+              }`}
+            >
+              {maximizedCmd.source === "ai" ? "AI" : "你"}
+            </span>
+            <code className="min-w-0 flex-1 truncate font-mono text-sm text-zinc-100">
+              {maximizedCmd.command}
+            </code>
+            <span
+              className={`flex-shrink-0 text-[11px] ${STATUS_COLOR[maximizedCmd.status]}`}
+            >
+              {STATUS_LABEL[maximizedCmd.status]}
+            </span>
+            <span className="flex-shrink-0 text-[11px] text-zinc-500 tabular-nums">
+              {formatTime(maximizedCmd.startedAt)}
+            </span>
+            <button
+              type="button"
+              onClick={() => setMaximizedSeq(null)}
+              title="还原（Esc）"
+              aria-label="还原"
+              className="flex-shrink-0 rounded-md border border-zinc-700 bg-zinc-800/60 p-1.5 text-zinc-400 transition-colors hover:bg-zinc-700 hover:text-zinc-100"
+            >
+              <Minimize2 className="h-3.5 w-3.5" />
+            </button>
+            <button
+              type="button"
+              onClick={() => setMaximizedSeq(null)}
+              title="关闭"
+              aria-label="关闭"
+              className="flex-shrink-0 rounded-md border border-zinc-700 bg-zinc-800/60 p-1.5 text-zinc-400 transition-colors hover:bg-zinc-700 hover:text-zinc-100"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
           </div>
-        )}
-      </div>
-    </div>
+          <pre className="flex-1 overflow-auto px-4 py-3 font-mono text-xs leading-relaxed text-zinc-300 whitespace-pre-wrap break-all">
+            {maximizedCmd.output}
+          </pre>
+          <div className="flex items-center gap-3 border-t border-zinc-800 px-4 py-2 text-[11px] text-zinc-500">
+            {maximizedCmd.exitCode != null && <span>退出码 {maximizedCmd.exitCode}</span>}
+            {maximizedCmd.error && <span className="text-red-400">{maximizedCmd.error}</span>}
+            {maximizedCmd.finishedAt && (
+              <span className="tabular-nums">
+                结束于 {formatTime(maximizedCmd.finishedAt)}
+              </span>
+            )}
+            {maximizedCmd.status === "running" && (
+              <span className="animate-pulse">● 运行中</span>
+            )}
+          </div>
+        </div>
+      )}
+    </>
   );
 }
