@@ -57,6 +57,13 @@
         "installerIcon": "icons/icon.ico",
         "headerImage": "icons/nsis-header.bmp"
       }
+    },
+    "updater": {
+      "active": true,
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDJENjk4MEVCOTA5MUZFQzgKUldUSS9wR1E2NEJwTGU5WVI3QnJNL1pRb3IvalJsTWpxNitFVkIza0dPV2VNZ0doSEZldk8vdkkK",
+      "endpoints": [
+        "https://raw.githubusercontent.com/lumirain/sakishell-tauri/main/latest.json"
+      ]
     }
   }
 }
