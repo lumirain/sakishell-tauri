@@ -28,6 +28,7 @@ import { usePluginStore } from '@/stores/pluginStore';
 import { useMarketStore } from '@/stores/marketStore';
 import { useJobStore } from '@/stores/jobStore';
 import { useViewStore, byMount } from '@/stores/viewStore';
+import { useExternalMcpStore } from '@/stores/externalMcpStore';
 import { attachTransferListeners, detachTransferListeners } from '@/stores/sftpTransferManager';
 import { appReady, sftpPreviewCleanup } from '@/lib/tauri';
 import { playNotificationSound } from '@/lib/notificationSound';
@@ -200,6 +201,9 @@ export default function App() {
     // 启动恢复：拉取全部会话的后台作业（事件不会重放，重启前已存在的
     // 作业靠这次全量拉取回到 UI；只 upsert 合并，不覆盖事件实时状态）
     void useJobStore.getState().fetchJobs();
+    // 外部 MCP 会话事件在应用启动即订阅：不依赖用户切到「外部调用」标签，
+    // 否则外部 AI 执行命令时监听尚未建立，命令记录会全部丢失。
+    useExternalMcpStore.getState().initEvents();
     return () => {
       detachTransferListeners();
       detachInteractions();
