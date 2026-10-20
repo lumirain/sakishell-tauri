@@ -218,6 +218,19 @@ export default function ExternalMcpPanel() {
     initEvents();
   }, [initEvents]);
 
+  // 左侧「AI 会话」面板点击命令记录 → 本面板选中对应连接
+  useEffect(() => {
+    const onFocusExternal = (e: Event) => {
+      const detail = (e as CustomEvent<{ connectionId: string }>).detail;
+      if (detail?.connectionId) {
+        setSelectedId(detail.connectionId);
+      }
+    };
+    window.addEventListener("sakishell:focus-external-mcp", onFocusExternal);
+    return () =>
+      window.removeEventListener("sakishell:focus-external-mcp", onFocusExternal);
+  }, []);
+
   useEffect(() => {
     if (maximizedSeq == null) return;
     const onKey = (e: KeyboardEvent) => {
@@ -252,12 +265,15 @@ export default function ExternalMcpPanel() {
   /** 会话列表宽度（px），可拖拽调节。 */
   const [listWidth, setListWidth] = useState(224);
 
-  /** 像左侧标签一样：激活（或打开）该连接的终端标签页。 */
+  /** 像左侧标签一样：激活（或打开）该连接的 AI 专用终端标签页。 */
   const activateTerminal = async (connectionId: string) => {
     const s = useSessionStore.getState();
-    const existing = Object.values(s.sessions).find(
+    const connected = Object.values(s.sessions).filter(
       (x) => x.configId === connectionId && x.status === "connected",
     );
+    // 优先激活 AI 用途的会话；没有则退而激活普通会话
+    const existing =
+      connected.find((x) => x.kind === "ai") ?? connected[0];
     if (existing) {
       s.setActiveSession(existing.id);
       return;

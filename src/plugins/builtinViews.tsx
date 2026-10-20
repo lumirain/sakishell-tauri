@@ -19,7 +19,7 @@ export function registerBuiltinViews(): void {
       navGroup: 'top',
       order: 10,
       component: async () => ({
-        default: (await import('@/components/connection/ConnectionList')).default,
+        default: (await import('@/components/layout/SidebarShell')).default,
       }),
     },
     {

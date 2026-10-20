@@ -28,6 +28,8 @@ interface SessionState {
   disconnect: (sessionId: string) => Promise<void>;
   setActiveSession: (sessionId: string | null) => void;
   getActiveSession: () => Session | null;
+  /** 标记会话用途（`"ai"` = 外部 AI 调用拉起的终端；缺省 = 普通）。 */
+  markSessionKind: (sessionId: string, kind: "ai") => void;
   updateSessionStatus: (
     sessionId: string,
     status: Session["status"],
@@ -360,6 +362,15 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     const { sessions, activeSessionId } = get();
     if (!activeSessionId) return null;
     return sessions[activeSessionId] ?? null;
+  },
+
+  /** 标记会话用途（`"ai"` = 外部 AI 调用拉起的终端；缺省 = 普通）。 */
+  markSessionKind: (sessionId: string, kind: "ai") => {
+    const session = get().sessions[sessionId];
+    if (!session || session.kind === kind) return;
+    set((state) => ({
+      sessions: { ...state.sessions, [sessionId]: { ...session, kind } },
+    }));
   },
 
   updateSessionStatus: (

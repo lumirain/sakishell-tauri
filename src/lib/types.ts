@@ -296,6 +296,11 @@ export interface Session {
   errorMessage?: string;
   /** The saved connection config ID (persistent across restarts) */
   configId?: string;
+  /**
+   * 会话用途标识：`"ai"` = 外部 AI 调用拉起的 SSH 终端（独立标签组、
+   * 带 AI 徽标，不与普通手动连接会话混用）；缺省 = 普通会话。
+   */
+  kind?: "ai";
 }
 
 export type SessionStatus = 'connecting' | 'connected' | 'disconnected' | 'error';

@@ -81,16 +81,16 @@ export async function openConnectionTerminal(
 ): Promise<string | null> {
   const sessions = useSessionStore.getState();
   try {
+    let sessionId: string | null = null;
     if (conn.authMethod === "Password") {
-      return await sessions.connectWithSavedPassword(conn.id, conn.name);
-    }
-    if (conn.authMethod === "PrivateKey") {
+      sessionId = await sessions.connectWithSavedPassword(conn.id, conn.name);
+    } else if (conn.authMethod === "PrivateKey") {
       const authMethod: ConnectionConfig["authMethod"] = {
         type: "PrivateKey",
         keyId: conn.keyId,
         keyPath: conn.keyPath,
       };
-      return await sessions.connect({
+      sessionId = await sessions.connect({
         host: conn.host,
         port: conn.port,
         username: conn.username,
@@ -99,7 +99,11 @@ export async function openConnectionTerminal(
         trustNewHostKey: false,
       });
     }
-    return null;
+    if (sessionId) {
+      // AI 用途标记：独立标签组 + AI 徽标，不与普通手动连接会话混用
+      sessions.markSessionKind(sessionId, "ai");
+    }
+    return sessionId;
   } catch {
     return null;
   }

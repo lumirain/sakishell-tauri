@@ -58,6 +58,18 @@ export default function AgentPanel() {
   const [tasksDrawerTab, setTasksDrawerTab] = useState<'agents' | 'jobs'>('agents');
   /** 面板视图：内置 AI 会话 / 外部 MCP 调用（见 ExternalMcpPanel）。 */
   const [panelView, setPanelView] = useState<"agent" | "external">("agent");
+  /** 左侧「AI 会话」面板点击命令记录 → 切到外部调用 tab（跨组件解耦）。 */
+  useEffect(() => {
+    const onFocusExternal = (e: Event) => {
+      const detail = (e as CustomEvent<{ connectionId: string }>).detail;
+      if (detail?.connectionId) {
+        setPanelView("external");
+      }
+    };
+    window.addEventListener("sakishell:focus-external-mcp", onFocusExternal);
+    return () =>
+      window.removeEventListener("sakishell:focus-external-mcp", onFocusExternal);
+  }, []);
   /** 用户主动发送后允许一次强制贴底；流式更新只跟随近底区。 */
   const userJustSentRef = useRef(false);
   const inputRef = useRef<HTMLTextAreaElement>(null);

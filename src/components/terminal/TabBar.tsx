@@ -137,6 +137,139 @@ export default function TabBar() {
     runReconnect(sessionId);
   };
 
+  /** 单条会话标签。isAi 时带 AI 徽标（外部 AI 拉起的终端，独立成组）。 */
+  const renderTab = (session: (typeof sessionList)[number], isAi: boolean) => {
+    const isActive = session.id === activeSessionId;
+    const base = baseLabelOf(session);
+    const label = labelCounts[base] > 1 ? `${base}:${dupIndex[session.id]}` : base;
+    const canReconnect =
+      (session.status === 'disconnected' || session.status === 'error') &&
+      Boolean(session.configId);
+    const showReconnectHint =
+      session.status === 'disconnected' || session.status === 'error';
+
+    return (
+      <div
+        key={session.id}
+        onClick={() => setActiveSession(session.id)}
+        className={`
+          group flex items-center gap-2 px-3 py-2 text-xs cursor-pointer
+          border-r border-zinc-800 min-w-0 max-w-[180px]
+          transition-colors
+          ${
+            isActive
+              ? 'bg-zinc-800 text-zinc-100'
+              : 'text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-200'
+          }
+        `}
+      >
+        {/* AI 徽标 */}
+        {isAi && (
+          <span
+            title="AI 专用会话"
+            className="flex-shrink-0 rounded bg-indigo-600/30 px-1 py-px text-[9px] font-bold uppercase tracking-wide text-indigo-300"
+          >
+            AI
+          </span>
+        )}
+
+        {/* Status dot */}
+        <span
+          className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
+            session.status === 'connected'
+              ? 'bg-emerald-500'
+              : session.status === 'connecting'
+                ? 'bg-amber-500 animate-pulse'
+                : session.status === 'error'
+                  ? 'bg-red-500'
+                  : 'bg-zinc-600'
+          }`}
+        />
+
+        {/* Label */}
+        <span className="truncate flex-1">{label}</span>
+
+        {/* Agent Activity Status (OpenCode style Spinner / Amber dot / Emerald dot) */}
+        <AgentStatusIndicator
+          status={getSessionAgentStatus(
+            session.id,
+            tasks,
+            unreadCompletedConversations,
+          )}
+          size="xs"
+          showTooltip
+        />
+
+        {/* Reconnect on disconnected/error */}
+        {showReconnectHint && (
+          <button
+            type="button"
+            onClick={(e) => {
+              if (!canReconnect) {
+                e.stopPropagation();
+                return;
+              }
+              handleReconnect(session.id, e);
+            }}
+            disabled={!canReconnect || session.status === 'connecting'}
+            className={`
+              p-0.5 rounded flex-shrink-0
+              transition-colors
+              ${
+                canReconnect
+                  ? 'text-zinc-400 hover:bg-zinc-700 hover:text-emerald-400'
+                  : 'text-zinc-600 cursor-not-allowed'
+              }
+            `}
+            title={
+              canReconnect
+                ? '重新连接'
+                : '临时连接无法自动重连，请去侧边栏重新连接'
+            }
+          >
+            <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth={2}
+                d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
+              />
+            </svg>
+          </button>
+        )}
+
+        {/* Close button */}
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            const configId = session.configId;
+            const sid = session.id;
+            disconnect(sid).then(() => {
+              if (configId) {
+                onDisconnected(configId, sid);
+              }
+            });
+          }}
+          className="
+            opacity-0 group-hover:opacity-100
+            p-0.5 rounded hover:bg-zinc-700 text-zinc-500 hover:text-zinc-200
+            transition-opacity flex-shrink-0
+          "
+          title="关闭会话"
+        >
+          <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+          </svg>
+        </button>
+      </div>
+    );
+  };
+
+  // 独立标签组：外部 AI 拉起的终端（kind="ai"）与普通手动连接会话分开
+  const normalSessions = sessionList.filter((s) => s.kind !== 'ai');
+  const aiSessions = sessionList.filter((s) => s.kind === 'ai');
+
   return (
     <>
       {reconnectNotice && (
@@ -156,125 +289,25 @@ export default function TabBar() {
         </div>
       )}
       <div className="flex items-center bg-zinc-900 border-b border-zinc-800 overflow-x-auto">
-        <div className="flex items-center">
-          {sessionList.map((session) => {
-            const isActive = session.id === activeSessionId;
-            const base = baseLabelOf(session);
-            const label = labelCounts[base] > 1 ? `${base}:${dupIndex[session.id]}` : base;
-            const canReconnect =
-              (session.status === 'disconnected' || session.status === 'error') &&
-              Boolean(session.configId);
-            const showReconnectHint =
-              session.status === 'disconnected' || session.status === 'error';
+        {normalSessions.length > 0 && (
+          <div className="flex items-center">
+            {normalSessions.map((session) => renderTab(session, false))}
+          </div>
+        )}
 
-            return (
-              <div
-                key={session.id}
-                onClick={() => setActiveSession(session.id)}
-                className={`
-                  group flex items-center gap-2 px-3 py-2 text-xs cursor-pointer
-                  border-r border-zinc-800 min-w-0 max-w-[180px]
-                  transition-colors
-                  ${
-                    isActive
-                      ? 'bg-zinc-800 text-zinc-100'
-                      : 'text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-200'
-                  }
-                `}
-              >
-                {/* Status dot */}
-                <span
-                  className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
-                    session.status === 'connected'
-                      ? 'bg-emerald-500'
-                      : session.status === 'connecting'
-                        ? 'bg-amber-500 animate-pulse'
-                        : session.status === 'error'
-                          ? 'bg-red-500'
-                          : 'bg-zinc-600'
-                  }`}
-                />
+        {normalSessions.length > 0 && aiSessions.length > 0 && (
+          <div className="flex flex-shrink-0 items-center gap-1.5 border-r border-zinc-800 bg-zinc-900 px-2.5">
+            <span className="rounded bg-indigo-600/30 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide text-indigo-300">
+              AI 会话
+            </span>
+          </div>
+        )}
 
-                {/* Label */}
-                <span className="truncate flex-1">{label}</span>
-
-                {/* Agent Activity Status (OpenCode style Spinner / Amber dot / Emerald dot) */}
-                <AgentStatusIndicator
-                  status={getSessionAgentStatus(
-                    session.id,
-                    tasks,
-                    unreadCompletedConversations,
-                  )}
-                  size="xs"
-                  showTooltip
-                />
-
-                {/* Reconnect on disconnected/error */}
-                {showReconnectHint && (
-                  <button
-                    type="button"
-                    onClick={(e) => {
-                      if (!canReconnect) {
-                        e.stopPropagation();
-                        return;
-                      }
-                      handleReconnect(session.id, e);
-                    }}
-                    disabled={!canReconnect || session.status === 'connecting'}
-                    className={`
-                      p-0.5 rounded flex-shrink-0
-                      transition-colors
-                      ${
-                        canReconnect
-                          ? 'text-zinc-400 hover:bg-zinc-700 hover:text-emerald-400'
-                          : 'text-zinc-600 cursor-not-allowed'
-                      }
-                    `}
-                    title={
-                      canReconnect
-                        ? '重新连接'
-                        : '临时连接无法自动重连，请去侧边栏重新连接'
-                    }
-                  >
-                    <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        strokeWidth={2}
-                        d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
-                      />
-                    </svg>
-                  </button>
-                )}
-
-                {/* Close button */}
-                <button
-                  type="button"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    const configId = session.configId;
-                    const sid = session.id;
-                    disconnect(sid).then(() => {
-                      if (configId) {
-                        onDisconnected(configId, sid);
-                      }
-                    });
-                  }}
-                  className="
-                    opacity-0 group-hover:opacity-100
-                    p-0.5 rounded hover:bg-zinc-700 text-zinc-500 hover:text-zinc-200
-                    transition-opacity flex-shrink-0
-                  "
-                  title="关闭会话"
-                >
-                  <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                  </svg>
-                </button>
-              </div>
-            );
-          })}
-        </div>
+        {aiSessions.length > 0 && (
+          <div className="flex items-center bg-indigo-950/20">
+            {aiSessions.map((session) => renderTab(session, true))}
+          </div>
+        )}
       </div>
       {mismatch.Modal}
       {PasswordPromptEl}
