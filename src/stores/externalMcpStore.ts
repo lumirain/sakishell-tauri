@@ -102,6 +102,10 @@ export async function openConnectionTerminal(
     if (sessionId) {
       // AI 用途标记：独立标签组 + AI 徽标，不与普通手动连接会话混用
       sessions.markSessionKind(sessionId, "ai");
+      // 同步后端标记（后续 AI 命令只复用 AI 会话；无 pending 等待时仅登记）
+      await mcpSessionReady(conn.id, sessionId).catch(() => {
+        // 后端未启动等场景不阻断：前端标记已足够 UI 分组正确
+      });
     }
     return sessionId;
   } catch {

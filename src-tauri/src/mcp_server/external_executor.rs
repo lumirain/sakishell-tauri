@@ -380,10 +380,12 @@ impl ExternalExecutor {
 
         // ── GUI 路径：命令落在可见终端标签页里执行 ──
         let attempt = async {
-            // 该连接已打开的活跃 GUI 会话；没有则请前端开一个终端标签页
+            // 只复用 **AI 用途**的终端会话（外部 AI 拉起的专属连接）；
+            // 普通手动连接开的终端绝不承接 AI 命令。没有 AI 会话则请前端
+            // 新开一个专属 AI 终端标签页。
             let session_id = match self
                 .ssh_manager
-                .latest_active_session_for_connection(connection_id)
+                .latest_active_ai_session_for_connection(connection_id)
                 .await
             {
                 Some(sid) => sid,
@@ -407,7 +409,7 @@ impl ExternalExecutor {
                 let retry = async {
                     let session_id = match self
                         .ssh_manager
-                        .latest_active_session_for_connection(connection_id)
+                        .latest_active_ai_session_for_connection(connection_id)
                         .await
                     {
                         Some(sid) => sid,
@@ -499,6 +501,9 @@ impl ExternalExecutor {
 
     /// 前端打开终端标签页成功后回调：解除 `request_gui_session` 的等待。
     pub async fn notify_session_ready(&self, connection_id: &str, session_id: &str) {
+        // 该会话由外部 AI 调用拉起 → 后端标记为 AI 用途：
+        // 后续 AI 命令只复用 AI 标记的会话，绝不落到普通终端上。
+        self.ssh_manager.mark_ai_session(session_id).await;
         if let Some(tx) = self.pending_gui.lock().await.remove(connection_id) {
             let _ = tx.send(session_id.to_string());
         }

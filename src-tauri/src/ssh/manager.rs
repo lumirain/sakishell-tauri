@@ -80,6 +80,9 @@ pub struct SshManager {
     /// [`Self::latest_active_session_for_connection`] 读取时惰性进行
     /// （不在线/已断开的条目留在队里但会被跳过，条目数受连接数上界约束）。
     activation_order: Arc<RwLock<std::collections::VecDeque<String>>>,
+    /// AI 用途的会话（外部 AI 调用拉起的专属终端）。AI 命令只复用这里
+    /// 标记的会话；没有就另开一个专属 AI 连接，绝不落到普通终端上。
+    ai_sessions: Arc<RwLock<std::collections::HashSet<String>>>,
 }
 
 impl SshManager {
@@ -92,6 +95,7 @@ impl SshManager {
             known_hosts,
             disconnect_observers: Arc::new(RwLock::new(Vec::new())),
             activation_order: Arc::new(RwLock::new(std::collections::VecDeque::new())),
+            ai_sessions: Arc::new(RwLock::new(std::collections::HashSet::new())),
         }
     }
 
@@ -735,6 +739,35 @@ impl SshManager {
             }
         }
         None
+    }
+
+    /// 取某 SavedConnection 最近激活的 **AI 用途**在线 session。
+    /// 只有被 [`Self::mark_ai_session`] 标记过的会话才算数——
+    /// 外部 AI 的命令绝不落到普通（手动连接的）终端上。
+    /// 全部没有 → None（调用方应另开专属 AI 连接）。
+    pub async fn latest_active_ai_session_for_connection(
+        &self,
+        connection_id: &str,
+    ) -> Option<String> {
+        let conns = self.connections.read().await;
+        let order = self.activation_order.read().await;
+        let ai = self.ai_sessions.read().await;
+        for sid in order.iter().rev() {
+            if !ai.contains(sid) {
+                continue;
+            }
+            if let Some(c) = conns.get(sid) {
+                if c.connection_id.as_deref() == Some(connection_id) {
+                    return Some(sid.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// 把会话标记为「AI 用途」（外部 AI 调用拉起的专属终端）。
+    pub async fn mark_ai_session(&self, session_id: &str) {
+        self.ai_sessions.write().await.insert(session_id.to_string());
     }
 
     /// Whether `session_id` currently has a connection of the given
