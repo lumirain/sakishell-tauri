@@ -239,11 +239,11 @@ pub async fn open_external_url(app: tauri::AppHandle, url: String) -> Result<(),
 /// `cdn`/`testingcf` 仍是 v1.7.2）——所以必须并发取最高版本，不能「第一个成功
 /// 者生效」，否则只要第一个入口是旧缓存，后面的新内容就永远轮不到。
 pub const CHECK_URLS: &[&str] = &[
-    "https://raw.githubusercontent.com/q541810/Marcel_ssh/main/latest.json",
-    "https://cdn.jsdelivr.net/gh/q541810/Marcel_ssh@main/latest.json",
-    "https://fastly.jsdelivr.net/gh/q541810/Marcel_ssh@main/latest.json",
-    "https://gcore.jsdelivr.net/gh/q541810/Marcel_ssh@main/latest.json",
-    "https://testingcf.jsdelivr.net/gh/q541810/Marcel_ssh@main/latest.json",
+    "https://raw.githubusercontent.com/lumirain/sakishell-tauri/main/latest.json",
+    "https://cdn.jsdelivr.net/gh/lumirain/sakishell-tauri@main/latest.json",
+    "https://fastly.jsdelivr.net/gh/lumirain/sakishell-tauri@main/latest.json",
+    "https://gcore.jsdelivr.net/gh/lumirain/sakishell-tauri@main/latest.json",
+    "https://testingcf.jsdelivr.net/gh/lumirain/sakishell-tauri@main/latest.json",
 ];
 
 /// 拉取并解析 latest.json（command 与后台调度器共用入口）。

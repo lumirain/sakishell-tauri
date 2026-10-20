@@ -116,14 +116,9 @@ export function McpServerSection() {
         // 拿不到默认值就用组件里的兜底值，不打断使用
       }
       const st = await refresh();
-      // 没在跑时预备一个令牌，用户点「启用」就能直接用
-      if (!st) {
-        try {
-          setPendingToken(await mcpServerRegenerateToken());
-        } catch {
-          // 生成失败时留空，后端启动时会自动补一个
-        }
-      }
+      // 停用状态下令牌默认留空（= 不启用认证，下方给出安全警示）；
+      // 需要令牌时点「重新生成」或手动填写固定值即可。
+      void st;
     })();
   }, [refresh]);
 
@@ -280,7 +275,7 @@ export function McpServerSection() {
           description={
             running
               ? '客户端需在 Authorization 头里带它。换令牌会让已接入的客户端立刻断连，所以要改得先停服务。'
-              : '启动时会用这个令牌；留空则自动生成一个。'
+              : '填入固定值则启动即用、不会自动更换；留空 = 不启用令牌认证（局域网内任何程序都可调用，下方有安全提示）。'
           }
           sectionId="settings-mcp-server"
           keywords={['token', '令牌', '密钥', '认证', 'auth', 'bearer', 'api key']}
@@ -292,7 +287,7 @@ export function McpServerSection() {
               spellCheck={false}
               aria-label="访问令牌"
               onChange={(e) => setPendingToken(e.target.value)}
-              placeholder="启动时自动生成"
+              placeholder="留空=不启用令牌（不推荐）"
               className="flex-1 min-w-0 rounded-lg bg-zinc-800 border border-zinc-700 px-3 py-1.5 text-xs text-zinc-300 font-mono focus:outline-none focus:border-indigo-500 read-only:opacity-70"
             />
             {shownToken && <CopyButton text={shownToken} />}
@@ -303,6 +298,17 @@ export function McpServerSection() {
               </Button>
             )}
           </div>
+          {!running && !shownToken && (
+            <div className="mt-2 flex items-start gap-2 rounded-lg border border-red-500/30 bg-red-500/5 p-2.5">
+              <ShieldAlert className="w-3.5 h-3.5 text-red-400 flex-shrink-0 mt-0.5" />
+              <p className="text-[11px] leading-5 text-red-200/90">
+                <span className="font-medium">访问令牌为空</span>：启用后服务将
+                <span className="font-medium">不要求任何认证</span>，局域网内任何能访问该端口的
+                程序都能在你已保存的服务器上执行命令。仅限可信环境使用；否则请点击「重新生成」
+                或手动填写一个固定令牌。
+              </p>
+            </div>
+          )}
         </SettingItem>
 
         {running && config?.http && (

@@ -43,7 +43,9 @@ pub async fn mcp_server_status() -> Option<HttpRuntimeInfo> {
 
 /// 启动 HTTP 服务。
 ///
-/// `token` 传 `None` 或空白则自动生成一个（复用后端同一套生成逻辑）——
+/// `token` 传 `None` 或空白则**不启用令牌认证**（空令牌 = 局域网内任何进程
+/// 都能调用，前端会给出安全警示；仅在你确认环境可信时这样做）——传非空则
+/// 使用该固定令牌（「固定令牌」即用户手动填写的值，启动即用）。
 /// 空令牌会被后端拒绝，这里代用户决定一个随机值比让他面对一个报错好。
 #[tauri::command]
 pub async fn mcp_server_start_http(
@@ -66,7 +68,7 @@ pub async fn mcp_server_start_http(
 
     let token = match token.map(|t| t.trim().to_string()) {
         Some(t) if !t.is_empty() => t,
-        _ => generate_token(),
+        _ => String::new(), // 空令牌 = 不启用认证（前端负责安全警示）
     };
 
     // 复用 GUI 已在用的实例：界面上新增的连接会立刻对 MCP 调用可见

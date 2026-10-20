@@ -8,6 +8,7 @@
 // `mcp://exec-output` 事件维护会话状态——本组件纯展示，不直接接触后端。
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { Maximize2, Minimize2 } from "lucide-react";
 import {
   useExternalMcpStore,
   type ExternalExecCommand,
@@ -38,7 +39,13 @@ function formatTime(millis: number): string {
   return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
-function CommandEntry({ cmd }: { cmd: ExternalExecCommand }) {
+function CommandEntry({
+  cmd,
+  maximized,
+}: {
+  cmd: ExternalExecCommand;
+  maximized: boolean;
+}) {
   const running = cmd.status === "running";
   return (
     <div className="rounded-md border border-zinc-700/60 bg-zinc-800/40">
@@ -63,7 +70,11 @@ function CommandEntry({ cmd }: { cmd: ExternalExecCommand }) {
         </span>
       </div>
       {cmd.output.trim().length > 0 && (
-        <pre className="max-h-64 overflow-auto px-3 py-2 font-mono text-xs leading-relaxed text-zinc-300 whitespace-pre-wrap break-all">
+        <pre
+          className={`px-3 py-2 font-mono text-xs leading-relaxed text-zinc-300 whitespace-pre-wrap break-all overflow-auto ${
+            maximized ? "max-h-[70vh]" : "max-h-64"
+          }`}
+        >
           {cmd.output}
         </pre>
       )}
@@ -133,7 +144,13 @@ function SessionInput({ connectionId }: { connectionId: string }) {
   );
 }
 
-function SessionStream({ session }: { session: ExternalMcpSession }) {
+function SessionStream({
+  session,
+  maximized,
+}: {
+  session: ExternalMcpSession;
+  maximized: boolean;
+}) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickToBottomRef = useRef(true);
   const lastRunning = session.commands.some((c) => c.status === "running");
@@ -168,7 +185,7 @@ function SessionStream({ session }: { session: ExternalMcpSession }) {
       className="flex-1 overflow-auto px-3 py-3 space-y-2"
     >
       {session.commands.map((cmd) => (
-        <CommandEntry key={cmd.seq} cmd={cmd} />
+        <CommandEntry key={cmd.seq} cmd={cmd} maximized={maximized} />
       ))}
     </div>
   );
@@ -178,10 +195,21 @@ export default function ExternalMcpPanel() {
   const sessions = useExternalMcpStore((s) => s.sessions);
   const initEvents = useExternalMcpStore((s) => s.initEvents);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  /** 最大化：覆盖整个应用窗口查看命令与输出，Esc / 按钮还原。 */
+  const [maximized, setMaximized] = useState(false);
 
   useEffect(() => {
     initEvents();
   }, [initEvents]);
+
+  useEffect(() => {
+    if (!maximized) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setMaximized(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [maximized]);
 
   // 会话按最后活动时间排序；默认选中最近的一个。
   const ordered = useMemo(
@@ -219,7 +247,11 @@ export default function ExternalMcpPanel() {
   }
 
   return (
-    <div className="flex h-full bg-zinc-900">
+    <div
+      className={`flex bg-zinc-900 ${
+        maximized ? "fixed inset-0 z-50" : "h-full"
+      }`}
+    >
       {/* 会话列表 */}
       <div className="flex w-56 flex-shrink-0 flex-col border-r border-zinc-800">
         <div className="px-3 py-2 text-xs font-semibold text-zinc-400">外部 AI 会话</div>
@@ -266,8 +298,21 @@ export default function ExternalMcpPanel() {
               <span className="ml-auto text-[11px] text-zinc-500">
                 {selected.commands.length} 条命令
               </span>
+              <button
+                type="button"
+                onClick={() => setMaximized((v) => !v)}
+                title={maximized ? "还原（Esc）" : "最大化"}
+                aria-label={maximized ? "还原" : "最大化"}
+                className="flex-shrink-0 rounded-md border border-zinc-700 bg-zinc-800/60 p-1.5 text-zinc-400 transition-colors hover:bg-zinc-700 hover:text-zinc-100"
+              >
+                {maximized ? (
+                  <Minimize2 className="h-3.5 w-3.5" />
+                ) : (
+                  <Maximize2 className="h-3.5 w-3.5" />
+                )}
+              </button>
             </div>
-            <SessionStream session={selected} />
+            <SessionStream session={selected} maximized={maximized} />
             <SessionInput connectionId={selected.connectionId} />
           </>
         ) : (

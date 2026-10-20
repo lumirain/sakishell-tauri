@@ -11,14 +11,17 @@
 // 无审批命令」。所以本模块不是「把 stdio 换个壳」，它必须自带边界：
 //
 //   1. **默认绑 0.0.0.0**（局域网可直接访问）。外部访问的凭据门槛是
-//      **强制 Bearer token**（第 2 条）：token 是「谁能调用」的唯一钥匙，
+//      **Bearer token**（第 2 条）：token 是「谁能调用」的唯一钥匙，
 //      暴露到局域网属于产品既定行为（用户在设置页可改回 127.0.0.1）。
-//   2. **强制 Bearer token**，没有 token 直接拒绝启动。token 用 SHA-256
-//      摘要后按位比较，避免用逐字节提前返回的方式泄漏长度与前缀。
+//   2. **Bearer token（可为空）**：token 为空 = 不启用认证（任何请求放行，
+//      限流仍生效）。空令牌意味着局域网内任何进程都能在已保存的服务器上
+//      执行无审批命令，**必须**由前端给出醒目安全警示；token 非空时用
+//      SHA-256 摘要后按位比较，避免用逐字节提前返回的方式泄漏长度与前缀。
 //   3. **限流**，防止本地进程把它当成高频执行通道刷。
 //
-// 三条都是「不给配置项就安全」的方向：token 与限流是硬门槛，绑定地址是
-// 产品默认（0.0.0.0），收紧为仅本机须显式为之（填 127.0.0.1）。
+// 三条都是「不给配置项就安全」的方向：限流是硬门槛，token 若留空则无认证
+// （仅限可信环境，前端警示），绑定地址默认 0.0.0.0，收紧为仅本机须显式为之
+// （填 127.0.0.1）。
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -49,7 +52,8 @@ pub const DEFAULT_HTTP_PORT: u16 = 8765;
 ///
 /// 这是产品既定行为（HTTP 常驻服务默认对外开放）；想只监听本机，
 /// 显式填 `127.0.0.1`（CLI 传 `--mcp-bind 127.0.0.1`，GUI 在设置页改）。
-/// 暴露到局域网的安全门槛由**强制 Bearer token** 承担。
+/// 暴露到局域网的安全门槛由 **Bearer token** 承担（token 可留空，留空时
+/// 无认证、前端会给出安全警示）。
 pub const DEFAULT_BIND: &str = "0.0.0.0";
 
 /// 每秒允许的请求数上限。
@@ -60,7 +64,7 @@ const RATE_LIMIT_PER_SEC: u32 = 60;
 pub struct HttpConfig {
     pub bind: IpAddr,
     pub port: u16,
-    /// 访问令牌。空串会在启动时被拒绝——见模块注释第 2 条。
+    /// 访问令牌。空串 = 不启用认证（前端应给出安全警示）——见模块注释第 2 条。
     pub token: String,
 }
 
@@ -197,13 +201,9 @@ pub async fn start_http_server(
     server: &McpServer,
     cfg: HttpConfig,
 ) -> Result<HttpServerHandle, AppError> {
-    if cfg.token.trim().is_empty() {
-        return Err(AppError::Config(
-            "HTTP 模式必须提供访问令牌；空令牌会把这个端口变成一个无需认证的远程命令执行接口。"
-                .into(),
-        ));
-    }
-
+    // 允许空令牌：空令牌 = 不启用 Bearer 认证（前端会给出安全警示）。
+    // 若调用方明确要求无认证模式（如内网可信环境），这里不设硬门槛；
+    // 限流（`RateLimiter`）始终生效，防止端口被滥用。
     let registry = server.build_registry()?;
     let state = HttpState {
         server: Arc::new(server.clone()),
@@ -301,7 +301,8 @@ async fn handle_mcp(
     let authorized = bearer_token(&headers)
         .map(|t| token_matches(t, &state.token))
         .unwrap_or(false);
-    if !authorized {
+    // 空令牌 = 无认证模式：任何请求放行（限流仍生效）。仅在确认环境可信时使用。
+    if !state.token.is_empty() && !authorized {
         log::warn!("[MCP HTTP] 拒绝未授权请求");
         return (
             StatusCode::UNAUTHORIZED,

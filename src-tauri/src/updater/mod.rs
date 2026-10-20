@@ -41,13 +41,14 @@ pub mod install;
 mod notify;
 
 /// 更新签名公钥：minisign 公钥文件整体 base64（`pnpm tauri signer generate`
-/// 产出的 `.pub` 内容）。对应私钥 `~/.tauri/marcel-update.key`（空密码，
-/// 不进 git；丢失则无法继续推更新，需换公钥发版）。
+/// 产出的 `.pub` 内容）。对应私钥 `~/.tauri/sakishell-update.key`（空密码，
+/// 不进 git；丢失则无法继续推更新，需换公钥发版）。CI 签名用同一私钥，
+/// 存于 GitHub repo secret `TAURI_SIGNING_PRIVATE_KEY`。
 ///
 /// 仅 Windows 使用：Android 的 APK 由系统安装器强制校验签名与已装版本一致，
 /// 不走（也无法走）minisign 链。
 #[cfg(windows)]
-const UPDATE_PUBKEY_B64: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDExQzlENTYxN0FBRDg3MUUKUldRZWg2MTZZZFhKRVNZOGh2OTNBY3JNT0NFYlV0Yy83SklLQTFVWThLUElDaEtLbWVaVE02OFQK";
+const UPDATE_PUBKEY_B64: &str = "ZFc1MGNuVnpkR1ZrSUdOdmJXMWxiblE2SUcxcGJtbHphV2R1SUhCMVlteHBZeUJyWlhrNklESkVOams0TUVWQ09UQTVNVVpGUXpnS1VsZFVTUzl3UjFFMk5FSndUR1U1V1ZJM1FuSk5MMXBSYjNJdmFsSnNUV3B4Tml0RlZrSXphMGRQVjJWTlowZG9TRVpsZGs4dmRra0s=";
 
 /// 启动后首次检查的延迟（秒）。
 const FIRST_CHECK_DELAY_SECS: u64 = 30;
