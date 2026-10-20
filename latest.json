@@ -1,5 +1,5 @@
 {
-  "version": "1.0.5",
+  "version": "1.0.6",
   "release_url": "https://github.com/lumirain/sakishell-tauri/releases/tag/v1.0.5",
   "installer_url": "https://github.com/lumirain/sakishell-tauri/releases/download/v1.0.5/SakiShell_1.0.5_x64-setup.exe",
   "installer_mirrors": [],
@@ -7,7 +7,7 @@
   "sha256": "6a8c988768492f6f99a74340f7c914e3cc26e761aaf10ee033c990f9deb46192",
   "size": 12479974,
   "android": {
-    "version": "1.0.5",
+    "version": "1.0.6",
     "release_url": "https://github.com/lumirain/sakishell-tauri/releases/tag/v1.0.5",
     "installer_url": "",
     "installer_mirrors": [],
