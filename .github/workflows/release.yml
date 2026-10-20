@@ -45,11 +45,24 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         with:
           tagName: v${{ env.VERSION }}
           releaseName: 'v${{ env.VERSION }}'
           releaseBody: 'SakiShell v${{ env.VERSION }} — AI-native SSH terminal with MCP server for AI clients.'
           releaseDraft: false
           prerelease: false
-          signingKey: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+
+      # 用 SakiShell 自己的 minisign 私钥为安装包签名（自研更新链路的
+      # latest.json signature 字段需要这段签名文本；tauri.conf 未启用内置
+      # updater，签名在这里手动完成并上传 .sig）
+      - name: Sign installer (minisign)
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$TAURI_SIGNING_PRIVATE_KEY" > "$RUNNER_TEMP/sakishell-update.key"
+          INSTALLER="src-tauri/target/release/bundle/nsis/SakiShell_${VERSION}_x64-setup.exe"
+          pnpm tauri signer sign -k "$RUNNER_TEMP/sakishell-update.key" "$INSTALLER"
+          gh release upload "v${VERSION}" "${INSTALLER}.sig" --repo lumirain/sakishell-tauri --clobber
+          echo "签名文件已上传: ${INSTALLER}.sig"
