@@ -58,11 +58,12 @@ jobs:
       - name: Sign installer (minisign)
         shell: bash
         env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          # 密钥为空密码，必须显式置空，否则 tauri signer 会尝试读密码失败
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
         run: |
-          echo "$TAURI_SIGNING_PRIVATE_KEY" > "$RUNNER_TEMP/sakishell-update.key"
           INSTALLER="src-tauri/target/release/bundle/nsis/SakiShell_${VERSION}_x64-setup.exe"
-          pnpm tauri signer sign -k "$RUNNER_TEMP/sakishell-update.key" "$INSTALLER"
+          pnpm tauri signer sign "$INSTALLER"
           gh release upload "v${VERSION}" "${INSTALLER}.sig" --repo lumirain/sakishell-tauri --clobber
           echo "签名文件已上传: ${INSTALLER}.sig"
