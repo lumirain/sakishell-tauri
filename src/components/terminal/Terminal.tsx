@@ -141,11 +141,43 @@ export default function Terminal() {
       if (!instanceId) return;
       const instance = terminalInstanceManager.get(instanceId);
       // 休眠中的终端没有 xterm 可 fit；唤醒后的 fit 由同步 effect 负责。
-      if (!instance?.fitAddon) return;
+      if (!instance?.fitAddon || !instance.terminal) return;
       instance.fitAddon.fit();
+      // 全屏重绘：窗口最小化 / 切走再回来后，GPU 画布可能停留在旧帧，
+      // 光 fit 不刷新会留下错乱字符，强制把整屏重画一遍。
+      instance.terminal.refresh(0, instance.terminal.rows - 1);
       terminalInstanceManager.resizeRemoteIfChanged(instance);
     });
   };
+
+  // 窗口最小化 / 失焦再恢复后重绘：WebView 隐藏期间 GPU 合成暂停，回来时
+  // 画布常停留在旧帧或尺寸未更新，导致字符错乱。监听可见性恢复、窗口聚焦与
+  // 尺寸变化，对活动终端重新 fit + 全屏 refresh + 向 pty 上报尺寸。
+  useEffect(() => {
+    const repaint = () => {
+      const instanceId = activeInstanceIdRef.current;
+      if (!instanceId) return;
+      const instance = terminalInstanceManager.get(instanceId);
+      if (!instance?.fitAddon || !instance.terminal) return;
+      requestAnimationFrame(() => {
+        if (!instance.fitAddon || !instance.terminal) return;
+        instance.fitAddon.fit();
+        instance.terminal.refresh(0, instance.terminal.rows - 1);
+        terminalInstanceManager.resizeRemoteIfChanged(instance);
+      });
+    };
+    const onVisibility = () => {
+      if (!document.hidden) repaint();
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    window.addEventListener('focus', repaint);
+    window.addEventListener('resize', repaint);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibility);
+      window.removeEventListener('focus', repaint);
+      window.removeEventListener('resize', repaint);
+    };
+  }, []);
 
   // Sync terminals with sessions
   useEffect(() => {

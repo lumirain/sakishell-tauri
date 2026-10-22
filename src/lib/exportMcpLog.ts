@@ -12,6 +12,7 @@ import type {
   ExternalExecCommand,
   ExternalMcpSession,
 } from '@/stores/externalMcpStore';
+import { sanitizeExecOutput } from './terminalText';
 
 const STATUS_TEXT: Record<ExternalExecCommand['status'], string> = {
   running: '运行中',
@@ -57,7 +58,7 @@ export function buildSingleCommandText(
     `状态：${STATUS_TEXT[cmd.status]}`,
     `命令：${cmd.command}`,
     RULE,
-    cmd.output.trim() ? cmd.output.trim() : '（无输出）',
+    sanitizeExecOutput(cmd.output) || '（无输出）',
     RULE,
   ];
   if (cmd.exitCode != null) {

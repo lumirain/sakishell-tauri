@@ -28,6 +28,7 @@ import {
   exportSessionLog,
   exportSingleCommand,
 } from "@/lib/exportMcpLog";
+import { sanitizeExecOutput } from "@/lib/terminalText";
 
 /** 轻量下拉菜单：⋯ 按钮展开，点外部 / Esc 关闭。 */
 function MoreMenu({
@@ -168,9 +169,9 @@ function CommandEntry({
           <Maximize2 className="h-3 w-3" />
         </button>
       </div>
-      {cmd.output.trim().length > 0 && (
+      {sanitizeExecOutput(cmd.output).length > 0 && (
         <pre className="px-3 py-2 font-mono text-xs leading-relaxed text-zinc-300 whitespace-pre-wrap break-all overflow-auto max-h-64">
-          {cmd.output}
+          {sanitizeExecOutput(cmd.output)}
         </pre>
       )}
       {(cmd.finishedAt || cmd.exitCode != null || cmd.error) && (
@@ -353,8 +354,6 @@ export default function ExternalMcpPanel() {
 
   const selected = selectedId ? sessions[selectedId] : null;
   const maximizedCmd = selected?.commands.find((c) => c.seq === maximizedSeq) ?? null;
-  /** 会话列表宽度（px），可拖拽调节。 */
-  const [listWidth, setListWidth] = useState(224);
 
   /** 像左侧标签一样：激活（或打开）该连接的 AI 专用终端标签页。 */
   const activateTerminal = async (connectionId: string) => {
@@ -435,97 +434,13 @@ export default function ExternalMcpPanel() {
 
   return (
     <>
-      <div className="flex h-full bg-zinc-900">
-        {/* 会话列表（宽度可拖） */}
-        <div
-          className="flex flex-shrink-0 flex-col border-r border-zinc-800"
-          style={{ width: listWidth }}
-        >
-          <div className="px-3 py-2 text-xs font-semibold text-zinc-400">外部 AI 会话</div>
-          <div className="flex-1 overflow-auto px-2 pb-2 space-y-1">
-            {ordered.map((s) => {
-              const last = s.commands[s.commands.length - 1];
-              const active = s.connectionId === selectedId;
-              return (
-                <button
-                  key={s.connectionId}
-                  type="button"
-                  onClick={() => setSelectedId(s.connectionId)}
-                  className={`group block w-full rounded-md px-2.5 py-2 text-left transition-colors ${
-                    active ? "bg-indigo-600/20" : "hover:bg-zinc-800"
-                  }`}
-                >
-                  <div className="flex items-center justify-between gap-1">
-                    <span className="min-w-0 truncate text-sm font-medium text-zinc-200">
-                      {s.connectionName}
-                    </span>
-                    <span className="flex items-center gap-1">
-                      <span className="flex-shrink-0 text-[10px] text-zinc-500">
-                        {s.commands.length}
-                      </span>
-                      <span
-                        role="button"
-                        tabIndex={-1}
-                        title="打开该连接的终端标签页"
-                        aria-label="打开终端"
-                        className={`flex-shrink-0 rounded p-0.5 text-zinc-500 transition-colors ${
-                          terminalBusyId === s.connectionId
-                            ? "animate-pulse text-indigo-400"
-                            : "opacity-0 group-hover:opacity-100 hover:bg-zinc-700 hover:text-zinc-100"
-                        }`}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          void activateTerminal(s.connectionId);
-                        }}
-                      >
-                        <Terminal className="h-3.5 w-3.5" />
-                      </span>
-                    </span>
-                  </div>
-                  <div className="truncate text-[11px] text-zinc-500">
-                    {s.host}
-                    {last && ` · ${STATUS_LABEL[last.status]}`}
-                  </div>
-                </button>
-              );
-            })}
-          </div>
-          {terminalError && (
-            <p className="border-t border-zinc-800 px-3 py-1.5 text-[11px] text-red-400">
-              {terminalError}
-            </p>
-          )}
-        </div>
-
-        {/* 拖拽分隔条 */}
-        <div
-          role="separator"
-          aria-orientation="vertical"
-          title="拖拽调节宽度"
-          className="group relative w-1 flex-shrink-0 cursor-col-resize bg-zinc-800/60 transition-colors hover:bg-indigo-500/60"
-          onMouseDown={(e) => {
-            e.preventDefault();
-            const startX = e.clientX;
-            const startWidth = listWidth;
-            const onMove = (ev: MouseEvent) => {
-              setListWidth(
-                Math.min(420, Math.max(160, startWidth + (ev.clientX - startX))),
-              );
-            };
-            const onUp = () => {
-              window.removeEventListener("mousemove", onMove);
-              window.removeEventListener("mouseup", onUp);
-              document.body.style.cursor = "";
-              document.body.style.userSelect = "";
-            };
-            window.addEventListener("mousemove", onMove);
-            window.addEventListener("mouseup", onUp);
-            document.body.style.cursor = "col-resize";
-            document.body.style.userSelect = "none";
-          }}
-        />
-
-        {/* 命令流 */}
+      <div className="flex h-full flex-col bg-zinc-900">
+        {terminalError && (
+          <p className="border-b border-zinc-800 px-3 py-1.5 text-[11px] text-red-400">
+            {terminalError}
+          </p>
+        )}
+        {/* 命令流（占满整个右栏；会话切换由左栏「AI 命令记录」驱动） */}
         <div className="flex min-w-0 flex-1 flex-col">
           {selected ? (
             <>
@@ -620,7 +535,7 @@ export default function ExternalMcpPanel() {
             </button>
           </div>
           <pre className="flex-1 overflow-auto px-4 py-3 font-mono text-xs leading-relaxed text-zinc-300 whitespace-pre-wrap break-all">
-            {maximizedCmd.output}
+            {sanitizeExecOutput(maximizedCmd.output)}
           </pre>
           <div className="flex items-center gap-3 border-t border-zinc-800 px-4 py-2 text-[11px] text-zinc-500">
             {maximizedCmd.exitCode != null && <span>退出码 {maximizedCmd.exitCode}</span>}

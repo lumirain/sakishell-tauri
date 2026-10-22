@@ -302,16 +302,20 @@ export default function App() {
 
   // 布局求解只依赖 store 与窗口宽。拖动/方向键期间的候选宽度走 liveOverride
   // 直写 DOM，不进渲染路径；store 拿到提交值后，这里的求解结果自然与 DOM 一致。
+  // AI 工作台强制展开右栏：布局求解 / 可拖范围也要按「开」计算，否则用户
+  // 之前关过右栏时，AI 视图虽被强制显示，宽度却是 0、把手不可拖。
+  const layoutAgentOpen = aiViewActive || agentPanelOpen;
+
   const resolvedLayout = useMemo(
     () =>
       resolveWorkspaceLayout({
         containerWidth: layoutWidth,
         settings: workspaceLayout,
         sidebarOpen,
-        agentOpen: agentPanelOpen,
+        agentOpen: layoutAgentOpen,
         isExclusive,
       }),
-    [agentPanelOpen, isExclusive, layoutWidth, workspaceLayout, sidebarOpen],
+    [layoutAgentOpen, isExclusive, layoutWidth, workspaceLayout, sidebarOpen],
   );
 
   const sidebarWidth = resolvedLayout.sidebarWidth;
@@ -328,10 +332,10 @@ export default function App() {
         containerWidth: layoutWidth,
         settings: workspaceLayout,
         sidebarOpen,
-        agentOpen: agentPanelOpen,
+        agentOpen: layoutAgentOpen,
         isExclusive,
       }),
-    [agentPanelOpen, isExclusive, layoutWidth, sidebarOpen, workspaceLayout],
+    [layoutAgentOpen, isExclusive, layoutWidth, sidebarOpen, workspaceLayout],
   );
   const dockBounds = useMemo(
     () =>
@@ -340,10 +344,10 @@ export default function App() {
         containerWidth: layoutWidth,
         settings: workspaceLayout,
         sidebarOpen,
-        agentOpen: agentPanelOpen,
+        agentOpen: layoutAgentOpen,
         isExclusive,
       }),
-    [agentPanelOpen, isExclusive, layoutWidth, sidebarOpen, workspaceLayout],
+    [layoutAgentOpen, isExclusive, layoutWidth, sidebarOpen, workspaceLayout],
   );
 
   const persistWorkspaceLayout = useCallback((patch: Partial<WorkspaceLayoutSettings>) => {
@@ -468,7 +472,7 @@ export default function App() {
         scale: resolveWorkspaceScale(layoutWidth),
         workspaceLayout: layout,
         sidebarOpen,
-        agentOpen: agentPanelOpen,
+        agentOpen: layoutAgentOpen,
         isExclusive,
         rafId: null,
         touchedOverride: false,
@@ -476,7 +480,7 @@ export default function App() {
       setResizingSide(side);
     },
     [
-      agentPanelOpen,
+      layoutAgentOpen,
       cancelPendingNudge,
       dockBounds,
       isExclusive,
@@ -561,7 +565,7 @@ export default function App() {
         containerWidth,
         settings: { ...layout, ...baseWidthPatch(side, layout, base) },
         sidebarOpen,
-        agentOpen: agentPanelOpen,
+        agentOpen: layoutAgentOpen,
         isExclusive,
       });
       liveOverrideRef.current = {
@@ -570,7 +574,7 @@ export default function App() {
         layout: solved,
         containerWidth,
         sidebarOpen,
-        agentOpen: agentPanelOpen,
+        agentOpen: layoutAgentOpen,
         isExclusive,
       };
       applyDragWidths(solved);
@@ -590,7 +594,7 @@ export default function App() {
       }, NUDGE_COMMIT_MS);
     },
     [
-      agentPanelOpen,
+      layoutAgentOpen,
       applyDragWidths,
       commitPanelBase,
       dockBounds,
@@ -639,7 +643,7 @@ export default function App() {
       if (
         override.containerWidth !== mainRowWidthRef.current ||
         override.sidebarOpen !== effectiveSidebarOpen ||
-        override.agentOpen !== effectiveAgentPanelOpen ||
+        override.agentOpen !== layoutAgentOpen ||
         override.isExclusive !== isExclusive
       ) {
         liveOverrideRef.current = null;
