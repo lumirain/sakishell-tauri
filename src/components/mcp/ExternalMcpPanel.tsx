@@ -210,7 +210,7 @@ function SessionInput({ connectionId }: { connectionId: string }) {
   };
 
   return (
-    <div className="border-t border-zinc-800 px-3 py-2">
+    <div className="flex-shrink-0 border-t border-zinc-800 px-3 py-2">
       <div className="flex items-center gap-2">
         <input
           type="text"
@@ -280,7 +280,7 @@ function SessionStream({
     <div
       ref={scrollRef}
       onScroll={handleScroll}
-      className="flex-1 overflow-auto px-3 py-3 space-y-2"
+      className="flex-1 min-h-0 overflow-auto px-3 py-3 space-y-2"
     >
       {session.commands.map((cmd) => (
         <CommandEntry
@@ -434,17 +434,17 @@ export default function ExternalMcpPanel() {
 
   return (
     <>
-      <div className="flex h-full flex-col bg-zinc-900">
+      <div className="flex h-full min-h-0 flex-1 flex-col bg-zinc-900">
         {terminalError && (
           <p className="border-b border-zinc-800 px-3 py-1.5 text-[11px] text-red-400">
             {terminalError}
           </p>
         )}
         {/* 命令流（占满整个右栏；会话切换由左栏「AI 命令记录」驱动） */}
-        <div className="flex min-w-0 flex-1 flex-col">
+        <div className="flex min-w-0 min-h-0 flex-1 flex-col">
           {selected ? (
             <>
-              <div className="flex items-center gap-2 border-b border-zinc-800 px-3 py-2">
+              <div className="flex flex-shrink-0 items-center gap-2 border-b border-zinc-800 px-3 py-2">
                 <span className="text-sm font-medium text-zinc-200">
                   {selected.connectionName}
                 </span>
@@ -534,7 +534,7 @@ export default function ExternalMcpPanel() {
               <X className="h-3.5 w-3.5" />
             </button>
           </div>
-          <pre className="flex-1 overflow-auto px-4 py-3 font-mono text-xs leading-relaxed text-zinc-300 whitespace-pre-wrap break-all">
+          <pre className="flex-1 min-h-0 overflow-auto px-4 py-3 font-mono text-xs leading-relaxed text-zinc-300 whitespace-pre-wrap break-all">
             {sanitizeExecOutput(maximizedCmd.output)}
           </pre>
           <div className="flex items-center gap-3 border-t border-zinc-800 px-4 py-2 text-[11px] text-zinc-500">
