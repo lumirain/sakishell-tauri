@@ -310,7 +310,9 @@ export default function App() {
   // 直写 DOM，不进渲染路径；store 拿到提交值后，这里的求解结果自然与 DOM 一致。
   // AI 工作台强制展开右栏：布局求解 / 可拖范围也要按「开」计算，否则用户
   // 之前关过右栏时，AI 视图虽被强制显示，宽度却是 0、把手不可拖。
-  const layoutAgentOpen = aiViewActive || agentPanelOpen;
+  // 临时收起（dockDismissed）时按「关」求解，让 dockWidth=0、中栏终端填满，
+  // 而不是只隐藏视觉却仍占着求解宽度。
+  const layoutAgentOpen = (aiViewActive || agentPanelOpen) && !dockDismissed;
 
   const resolvedLayout = useMemo(
     () =>
