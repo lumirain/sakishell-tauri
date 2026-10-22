@@ -20,23 +20,31 @@ const ESC_BARE_RE = /\x1b./g;
 const DONE_LINE_RE = /^.*SAKISHELL_DONE[^\n]*\n?/gm;
 
 /**
- * 处理 `\r`：回车回到行首，后续内容覆盖本行。纯文本记录里进度条类的反复
- * 覆盖只需保留最后一次写入，所以回到行首时清空当前缓冲即可。
+ * 处理 `\r`：回车把光标移回行首，后续字符从行首按列覆盖。普通行尾的 `\r\n`
+ * 只把光标归零、整行内容保留到换行；单独的 `\r`（进度条反复重画同一行）用
+ * 最后一次写入覆盖。按列覆盖，绝不能把整行误清空（否则 `text\r\n` 会被清空）。
  */
 function applyCarriageReturn(text: string): string {
   const lines: string[] = [];
-  let cur = "";
+  let row = "";
+  let cursor = 0;
   for (const ch of text) {
     if (ch === "\r") {
-      cur = "";
+      cursor = 0;
     } else if (ch === "\n") {
-      lines.push(cur);
-      cur = "";
+      lines.push(row);
+      row = "";
+      cursor = 0;
     } else {
-      cur += ch;
+      if (cursor < row.length) {
+        row = row.slice(0, cursor) + ch + row.slice(cursor + 1);
+      } else {
+        row += ch;
+      }
+      cursor += 1;
     }
   }
-  lines.push(cur);
+  lines.push(row);
   return lines.join("\n");
 }
 

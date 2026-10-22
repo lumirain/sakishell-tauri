@@ -200,9 +200,15 @@ export default function App() {
   const effectiveSidebarOpen = sidebarOpen && !isExclusive && sidebarProvider !== null;
   // dock 里停谁由 agentPrimary 决定：停终端时它永远在（终端是常驻中心视图）
   const dockProvider = agentPrimary ? centerProviders[0] : agentProvider;
-  // AI 工作台激活时右栏强制展开外部调用（不写回用户的 agentOpen 偏好，切回即还原）
+  // AI 工作台激活时右栏强制展开外部调用（不写回用户的 agentOpen 偏好，切回即还原）。
+  // dockDismissed 是会话级「临时收起」：顶栏按钮在 AI 视图点一下收起、再点恢复，
+  // 不改动保存的 agentOpen 偏好；离开 AI 视图自动复位。
+  const [dockDismissed, setDockDismissed] = useState(false);
   const effectiveAgentPanelOpen =
-    (aiViewActive || agentPanelOpen) && !isExclusive && dockProvider !== null;
+    (aiViewActive || agentPanelOpen) &&
+    !isExclusive &&
+    dockProvider !== null &&
+    !dockDismissed;
   const [dockMounted, setAgentPanelMounted] = useState(effectiveAgentPanelOpen);
   const dockWasUnmountedRef = useRef(!effectiveAgentPanelOpen);
 
@@ -384,8 +390,18 @@ export default function App() {
   };
 
   const handleToggleAgentPanel = () => {
+    if (aiViewActive) {
+      // AI 工作台右栏是强制展开的，这里只做会话级临时收起/恢复，不写回偏好。
+      setDockDismissed((v) => !v);
+      return;
+    }
     persistWorkspaceLayout({ agentOpen: !agentPanelOpen });
   };
+
+  // 离开 / 进入 AI 工作台时复位临时收起，保证再次进入是展开状态。
+  useEffect(() => {
+    setDockDismissed(false);
+  }, [aiViewActive]);
 
   /** 把一次求解结果直接写到四块承载宽度的 DOM 上（不经过 React）。 */
   const applyDragWidths = useCallback((layout: ResolvedWorkspaceLayout) => {
