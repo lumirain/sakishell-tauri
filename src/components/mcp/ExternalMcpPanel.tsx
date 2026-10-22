@@ -15,7 +15,7 @@
 // 本组件纯展示 + 触发「打开终端」，不直接接触后端。
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Maximize2, Minimize2, Terminal, X } from "lucide-react";
+import { Maximize2, Minimize2, Terminal, X, MoreVertical, Download } from "lucide-react";
 import {
   useExternalMcpStore,
   openConnectionTerminalById,
@@ -24,6 +24,73 @@ import {
 } from "@/stores/externalMcpStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { getErrorMessage } from "@/lib/errors";
+import {
+  exportSessionLog,
+  exportSingleCommand,
+} from "@/lib/exportMcpLog";
+
+/** 轻量下拉菜单：⋯ 按钮展开，点外部 / Esc 关闭。 */
+function MoreMenu({
+  items,
+  title,
+}: {
+  items: { label: string; onClick: () => void; disabled?: boolean }[];
+  title?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e: MouseEvent) => {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("mousedown", onDoc);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDoc);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  return (
+    <div ref={rootRef} className="relative flex-shrink-0">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        title={title ?? "更多操作"}
+        aria-label="更多操作"
+        className="rounded p-1 text-zinc-500 transition-colors hover:bg-zinc-700 hover:text-zinc-100"
+      >
+        <MoreVertical className="h-3 w-3" />
+      </button>
+      {open && (
+        <div className="absolute right-0 top-full z-30 mt-1 w-40 rounded-md border border-zinc-700 bg-zinc-800 py-1 shadow-xl">
+          {items.map((it) => (
+            <button
+              key={it.label}
+              type="button"
+              disabled={it.disabled}
+              onClick={() => {
+                setOpen(false);
+                it.onClick();
+              }}
+              className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-zinc-200 transition-colors hover:bg-zinc-700 disabled:opacity-40"
+            >
+              <Download className="h-3 w-3 text-zinc-400" />
+              {it.label}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
 
 const STATUS_LABEL: Record<ExternalExecCommand["status"], string> = {
   running: "运行中",
@@ -50,10 +117,14 @@ function formatTime(millis: number): string {
 
 function CommandEntry({
   cmd,
+  session,
   onMaximize,
+  onExportSingle,
 }: {
   cmd: ExternalExecCommand;
+  session: ExternalMcpSession;
   onMaximize: (seq: number) => void;
+  onExportSingle: (cmd: ExternalExecCommand) => void;
 }) {
   const running = cmd.status === "running";
   return (
@@ -77,6 +148,16 @@ function CommandEntry({
         <span className="flex-shrink-0 text-[10px] text-zinc-500 tabular-nums">
           {formatTime(cmd.startedAt)}
         </span>
+        <MoreMenu
+          title="导出本条命令"
+          items={[
+            {
+              label: "导出本条（txt）",
+              disabled: running,
+              onClick: () => onExportSingle(cmd),
+            },
+          ]}
+        />
         <button
           type="button"
           onClick={() => onMaximize(cmd.seq)}
@@ -161,9 +242,11 @@ function SessionInput({ connectionId }: { connectionId: string }) {
 function SessionStream({
   session,
   onMaximize,
+  onExportSingle,
 }: {
   session: ExternalMcpSession;
   onMaximize: (seq: number) => void;
+  onExportSingle: (cmd: ExternalExecCommand) => void;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickToBottomRef = useRef(true);
@@ -199,7 +282,13 @@ function SessionStream({
       className="flex-1 overflow-auto px-3 py-3 space-y-2"
     >
       {session.commands.map((cmd) => (
-        <CommandEntry key={cmd.seq} cmd={cmd} onMaximize={onMaximize} />
+        <CommandEntry
+          key={cmd.seq}
+          cmd={cmd}
+          session={session}
+          onMaximize={onMaximize}
+          onExportSingle={onExportSingle}
+        />
       ))}
     </div>
   );
@@ -213,6 +302,8 @@ export default function ExternalMcpPanel() {
   const [maximizedSeq, setMaximizedSeq] = useState<number | null>(null);
   const [terminalBusyId, setTerminalBusyId] = useState<string | null>(null);
   const [terminalError, setTerminalError] = useState<string | null>(null);
+  const [exportBusy, setExportBusy] = useState(false);
+  const [exportMessage, setExportMessage] = useState<string | null>(null);
 
   useEffect(() => {
     initEvents();
@@ -291,6 +382,40 @@ export default function ExternalMcpPanel() {
       setTerminalError("打开终端失败，请尝试从侧边栏手动连接。");
     } finally {
       setTerminalBusyId(null);
+    }
+  };
+
+  /** 导出反馈短暂提示（3 秒自动消失）。 */
+  const flashExport = (msg: string) => {
+    setExportMessage(msg);
+    window.setTimeout(() => setExportMessage(null), 3000);
+  };
+
+  const handleExportSingle = async (cmd: ExternalExecCommand) => {
+    if (!selected || exportBusy) return;
+    setExportBusy(true);
+    setExportMessage(null);
+    try {
+      const ok = await exportSingleCommand(selected, cmd);
+      flashExport(ok ? "已导出本条命令" : "已取消导出");
+    } catch (e) {
+      setExportMessage(`导出失败：${getErrorMessage(e)}`);
+    } finally {
+      setExportBusy(false);
+    }
+  };
+
+  const handleExportSession = async () => {
+    if (!selected || exportBusy) return;
+    setExportBusy(true);
+    setExportMessage(null);
+    try {
+      const ok = await exportSessionLog(selected);
+      flashExport(ok ? `已导出 ${selected.commands.length} 条命令` : "已取消导出");
+    } catch (e) {
+      setExportMessage(`导出失败：${getErrorMessage(e)}`);
+    } finally {
+      setExportBusy(false);
     }
   };
 
@@ -420,10 +545,26 @@ export default function ExternalMcpPanel() {
                 <span className="ml-auto text-[11px] text-zinc-500">
                   {selected.commands.length} 条命令
                 </span>
+                <MoreMenu
+                  title="导出整个会话"
+                  items={[
+                    {
+                      label: `导出整个会话（${selected.commands.length} 条）`,
+                      disabled: exportBusy || selected.commands.length === 0,
+                      onClick: () => void handleExportSession(),
+                    },
+                  ]}
+                />
               </div>
+              {exportMessage && (
+                <div className="border-b border-zinc-800 bg-indigo-500/10 px-3 py-1 text-[11px] text-indigo-300">
+                  {exportMessage}
+                </div>
+              )}
               <SessionStream
                 session={selected}
                 onMaximize={setMaximizedSeq}
+                onExportSingle={(cmd) => void handleExportSingle(cmd)}
               />
               <SessionInput connectionId={selected.connectionId} />
             </>

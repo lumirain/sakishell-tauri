@@ -32,6 +32,7 @@ import { useExternalMcpStore } from '@/stores/externalMcpStore';
 import { attachTransferListeners, detachTransferListeners } from '@/stores/sftpTransferManager';
 import { appReady, sftpPreviewCleanup } from '@/lib/tauri';
 import { playNotificationSound } from '@/lib/notificationSound';
+import { autoStartMcpHttpIfEnabled } from '@/lib/mcpHttpAutoStart';
 import { useTauriEvent } from '@/hooks/useTauriEvent';
 import type { AgentMode, ViewProvider, WorkspaceLayoutSettings } from '@/lib/types';
 import {
@@ -182,13 +183,26 @@ export default function App() {
     !isExclusive && activeProvider?.mount === 'sidebar' ? activeProvider : null;
   // center: 非 exclusive 时固定取 order 最小者，builtin.terminal(order=10, 不可禁用) 常驻，插件实际无法使用
   const centerProvider = isExclusive ? activeProvider : centerProviders[0];
-  // agent: 固定取 order 最小者，builtin.agent(order=10, 不可禁用) 常驻，
-  // 插件 agent 视图必须 order<10 才能显示（同时顶掉内置 Agent 面板），实际不可用
-  const agentProvider = isExclusive ? null : agentProviders[0];
+  // agent: 智能助手（builtin.agent）与外部调用（builtin.external-mcp）都挂在
+  // agent 挂载点。AI 工作台（builtin.ai）激活时右侧显示外部调用，其余情况显示
+  // 智能助手——两者不再挤在同一个 tab 里。
+  const aiViewActive = activeId === 'builtin.ai';
+  const builtinAgentProvider =
+    providers.find((p) => p.id === 'builtin.agent') ?? agentProviders[0];
+  const externalMcpProvider = providers.find(
+    (p) => p.id === 'builtin.external-mcp',
+  );
+  const agentProvider = isExclusive
+    ? null
+    : aiViewActive
+      ? (externalMcpProvider ?? builtinAgentProvider)
+      : builtinAgentProvider;
   const effectiveSidebarOpen = sidebarOpen && !isExclusive && sidebarProvider !== null;
   // dock 里停谁由 agentPrimary 决定：停终端时它永远在（终端是常驻中心视图）
   const dockProvider = agentPrimary ? centerProviders[0] : agentProvider;
-  const effectiveAgentPanelOpen = agentPanelOpen && !isExclusive && dockProvider !== null;
+  // AI 工作台激活时右栏强制展开外部调用（不写回用户的 agentOpen 偏好，切回即还原）
+  const effectiveAgentPanelOpen =
+    (aiViewActive || agentPanelOpen) && !isExclusive && dockProvider !== null;
   const [dockMounted, setAgentPanelMounted] = useState(effectiveAgentPanelOpen);
   const dockWasUnmountedRef = useRef(!effectiveAgentPanelOpen);
 
@@ -204,6 +218,8 @@ export default function App() {
     // 外部 MCP 会话事件在应用启动即订阅：不依赖用户切到「外部调用」标签，
     // 否则外部 AI 执行命令时监听尚未建立，命令记录会全部丢失。
     useExternalMcpStore.getState().initEvents();
+    // HTTP 常驻服务「启动时自动开启」：开关为开则按保存配置静默拉起，失败不打扰
+    void autoStartMcpHttpIfEnabled();
     return () => {
       detachTransferListeners();
       detachInteractions();

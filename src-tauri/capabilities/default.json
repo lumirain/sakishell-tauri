@@ -38,6 +38,7 @@
     },
     "fs:allow-read",
     "fs:allow-read-file",
+    "fs:allow-write-text-file",
     "fs:allow-exists",
     "fs:allow-stat",
     "fs:allow-read-dir",

@@ -1,4 +1,4 @@
-import { Bug, Terminal, Wand, Plug, Settings } from 'lucide-react';
+import { Bug, Terminal, Wand, Plug, Settings, Sparkles } from 'lucide-react';
 import type { ViewProvider } from '@/lib/types';
 import { useViewStore } from '@/stores/viewStore';
 
@@ -14,12 +14,26 @@ export function registerBuiltinViews(): void {
       id: 'builtin.sessions',
       pluginId: BUILTIN_PLUGIN_ID,
       mount: 'sidebar',
-      title: '会话',
+      title: '连接',
       icon: { kind: 'react', node: <Terminal className="w-5 h-5" /> },
       navGroup: 'top',
       order: 10,
       component: async () => ({
-        default: (await import('@/components/layout/SidebarShell')).default,
+        default: (await import('@/components/connection/ConnectionList')).default,
+      }),
+    },
+    {
+      // AI 工作台入口：左侧竖栏独立图标，点入后左栏显示 AI 终端 + AI 命令记录，
+      // 右侧 agent 挂载点切换为外部调用面板（见 App.tsx），智能助手不跟随。
+      id: 'builtin.ai',
+      pluginId: BUILTIN_PLUGIN_ID,
+      mount: 'sidebar',
+      title: 'AI',
+      icon: { kind: 'react', node: <Sparkles className="w-5 h-5" /> },
+      navGroup: 'top',
+      order: 15,
+      component: async () => ({
+        default: (await import('@/components/ai/AiPanel')).default,
       }),
     },
     {
@@ -83,6 +97,7 @@ export function registerBuiltinViews(): void {
       }),
     },
     {
+      // 智能助手：默认右侧 agent 面板。
       id: 'builtin.agent',
       pluginId: BUILTIN_PLUGIN_ID,
       mount: 'agent',
@@ -91,6 +106,19 @@ export function registerBuiltinViews(): void {
       order: 10,
       component: async () => ({
         default: (await import('@/components/agent/AgentPanel')).default,
+      }),
+    },
+    {
+      // 外部调用：仅在 AI 工作台（builtin.ai）激活时由 App.tsx 挂到 agent 面板，
+      // 不再与智能助手挤在同一个 tab 里。
+      id: 'builtin.external-mcp',
+      pluginId: BUILTIN_PLUGIN_ID,
+      mount: 'agent',
+      title: '外部调用',
+      icon: { kind: 'react', node: <Plug className="w-5 h-5" /> },
+      order: 5,
+      component: async () => ({
+        default: (await import('@/components/mcp/ExternalMcpPanel')).default,
       }),
     },
   ];

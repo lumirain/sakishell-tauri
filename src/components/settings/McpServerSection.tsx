@@ -15,6 +15,10 @@ import {
 } from '@/lib/tauri';
 import type { McpClientConfig, McpHttpRuntimeInfo } from '@/lib/types';
 import { isExposedBind, isValidPort, sanitizePortInput } from '@/lib/mcpServerUi';
+import {
+  readMcpHttpSaved,
+  writeMcpHttpSaved,
+} from '@/lib/mcpHttpAutoStart';
 import { Card, SettingItem } from './helpers';
 
 /**
@@ -81,10 +85,14 @@ function StatusPill({ running }: { running: boolean }) {
 export function McpServerSection() {
   const [status, setStatus] = useState<McpHttpRuntimeInfo | null>(null);
   const [config, setConfig] = useState<McpClientConfig | null>(null);
-  const [bind, setBind] = useState('0.0.0.0');
-  const [port, setPort] = useState(8765);
+  // 初始值取本地保存（自启配置），defaults / 运行状态随后异步覆盖
+  const [initialSaved] = useState(() => readMcpHttpSaved());
+  const [bind, setBind] = useState(initialSaved.bind);
+  const [port, setPort] = useState(initialSaved.port);
   /** 停止状态下待用的令牌；启动后由后端返回的为准 */
-  const [pendingToken, setPendingToken] = useState('');
+  const [pendingToken, setPendingToken] = useState(initialSaved.token);
+  /** 程序启动时是否自动开启 HTTP 常驻服务（独立于当前是否在跑）。 */
+  const [autoStart, setAutoStart] = useState(initialSaved.autoStart);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -108,19 +116,18 @@ export function McpServerSection() {
 
   useEffect(() => {
     void (async () => {
+      // 仅在本地没有保存自定义值时用后端默认值兜底（已保存的 bind/port 优先，
+      // 否则用户自定义的端口会被默认值冲掉、自启连不上）。
       try {
         const defaults = await mcpServerDefaults();
-        setBind(defaults.bind);
-        setPort(defaults.port);
+        setBind((prev) => (prev === initialSaved.bind ? defaults.bind : prev));
+        setPort((prev) => (prev === initialSaved.port ? defaults.port : prev));
       } catch {
         // 拿不到默认值就用组件里的兜底值，不打断使用
       }
-      const st = await refresh();
-      // 停用状态下令牌默认留空（= 不启用认证，下方给出安全警示）；
-      // 需要令牌时点「重新生成」或手动填写固定值即可。
-      void st;
+      await refresh();
     })();
-  }, [refresh]);
+  }, [refresh, initialSaved.bind, initialSaved.port]);
 
   const handleToggle = async (next: boolean) => {
     setBusy(true);
@@ -128,6 +135,8 @@ export function McpServerSection() {
     try {
       if (next) {
         await mcpServerStartHttp(bind, port, pendingToken || undefined);
+        // 启动成功后把当前监听配置记下，供「启动时自动开启」复用
+        writeMcpHttpSaved({ bind, port, token: pendingToken });
       } else {
         await mcpServerStopHttp();
       }
@@ -138,6 +147,11 @@ export function McpServerSection() {
     } finally {
       setBusy(false);
     }
+  };
+
+  const handleAutoStart = (next: boolean) => {
+    setAutoStart(next);
+    writeMcpHttpSaved({ autoStart: next, bind, port, token: pendingToken });
   };
 
   const handleRegenerate = async () => {
@@ -224,6 +238,21 @@ export function McpServerSection() {
         </SettingItem>
 
         <SettingItem
+          id="mcp-http-auto-start"
+          label="程序启动时自动开启"
+          description="开启后，每次启动 SakiShell 都按当前监听地址、端口与令牌自动拉起常驻服务；关闭则只在你手动点「启用」时运行。"
+          sectionId="settings-mcp-server"
+          keywords={['自动启动', '自启', '开机', '常驻', 'auto start', 'boot']}
+        >
+          <div className="flex items-center gap-3">
+            <Toggle checked={autoStart} onChange={handleAutoStart} disabled={busy} />
+            <span className="text-xs text-zinc-500">
+              {autoStart ? '已开启：下次启动自动运行' : '已关闭：需手动启用'}
+            </span>
+          </div>
+        </SettingItem>
+
+        <SettingItem
           id="mcp-http-endpoint"
           label="监听地址"
           description={
@@ -238,7 +267,10 @@ export function McpServerSection() {
             <div className="flex items-center gap-2">
               <input
                 value={bind}
-                onChange={(e) => setBind(e.target.value)}
+                onChange={(e) => {
+                  setBind(e.target.value);
+                  writeMcpHttpSaved({ bind: e.target.value });
+                }}
                 disabled={running || busy}
                 aria-label="监听地址"
                 placeholder="0.0.0.0"
@@ -248,7 +280,11 @@ export function McpServerSection() {
               <span className="text-zinc-600 text-sm">:</span>
               <input
                 value={String(port)}
-                onChange={(e) => setPort(sanitizePortInput(e.target.value))}
+                onChange={(e) => {
+                  const n = sanitizePortInput(e.target.value);
+                  setPort(n);
+                  writeMcpHttpSaved({ port: n });
+                }}
                 disabled={running || busy}
                 inputMode="numeric"
                 aria-label="端口"
@@ -286,7 +322,10 @@ export function McpServerSection() {
               readOnly={running}
               spellCheck={false}
               aria-label="访问令牌"
-              onChange={(e) => setPendingToken(e.target.value)}
+              onChange={(e) => {
+                setPendingToken(e.target.value);
+                writeMcpHttpSaved({ token: e.target.value });
+              }}
               placeholder="留空=不启用令牌（不推荐）"
               className="flex-1 min-w-0 rounded-lg bg-zinc-800 border border-zinc-700 px-3 py-1.5 text-xs text-zinc-300 font-mono focus:outline-none focus:border-indigo-500 read-only:opacity-70"
             />

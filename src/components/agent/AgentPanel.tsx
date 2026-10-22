@@ -29,7 +29,6 @@ import type { AgentMessage } from "@/lib/types";
 import ChatHistoryModal from "@/components/settings/ChatHistoryModal";
 import AgentTranscript from "./AgentTranscript";
 import { isCommandDraft } from "./agentCommandEntries";
-import ExternalMcpPanel from "@/components/mcp/ExternalMcpPanel";
 import PlanList from "./PlanList";
 import type { AgentCommandMenuHandle } from "./AgentCommandMenu";
 import { notifyInputStopped } from "./panel/inputActivity";
@@ -56,20 +55,6 @@ export default function AgentPanel() {
   const [showHistoryModal, setShowHistoryModal] = useState(false);
   const [rollbackNotice, setRollbackNotice] = useState<string | null>(null);
   const [tasksDrawerTab, setTasksDrawerTab] = useState<'agents' | 'jobs'>('agents');
-  /** 面板视图：内置 AI 会话 / 外部 MCP 调用（见 ExternalMcpPanel）。 */
-  const [panelView, setPanelView] = useState<"agent" | "external">("agent");
-  /** 左侧「AI 会话」面板点击命令记录 → 切到外部调用 tab（跨组件解耦）。 */
-  useEffect(() => {
-    const onFocusExternal = (e: Event) => {
-      const detail = (e as CustomEvent<{ connectionId: string }>).detail;
-      if (detail?.connectionId) {
-        setPanelView("external");
-      }
-    };
-    window.addEventListener("sakishell:focus-external-mcp", onFocusExternal);
-    return () =>
-      window.removeEventListener("sakishell:focus-external-mcp", onFocusExternal);
-  }, []);
   /** 用户主动发送后允许一次强制贴底；流式更新只跟随近底区。 */
   const userJustSentRef = useRef(false);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -368,34 +353,6 @@ export default function AgentPanel() {
       data-region="agent-panel"
       className="relative flex flex-col h-full bg-zinc-900"
     >
-      {/* 视图切换：智能助手（内置 AI）/ 外部调用（外部 AI 经 MCP 执行的可见会话） */}
-      <div className="flex items-center gap-1 border-b border-zinc-800 px-3 pt-2 pb-1.5">
-        <button
-          type="button"
-          onClick={() => setPanelView("agent")}
-          className={`rounded-t-md px-3 py-1 text-xs font-medium transition-colors ${
-            panelView === "agent"
-              ? "bg-indigo-600/20 text-indigo-300"
-              : "text-zinc-400 hover:text-zinc-200"
-          }`}
-        >
-          智能助手
-        </button>
-        <button
-          type="button"
-          onClick={() => setPanelView("external")}
-          className={`rounded-t-md px-3 py-1 text-xs font-medium transition-colors ${
-            panelView === "external"
-              ? "bg-indigo-600/20 text-indigo-300"
-              : "text-zinc-400 hover:text-zinc-200"
-          }`}
-        >
-          外部调用
-        </button>
-      </div>
-
-      {panelView === "agent" ? (
-        <>
       <AgentPanelHeader
         activeUsageView={activeUsageView}
         tasks={tasks}
@@ -496,10 +453,6 @@ export default function AgentPanel() {
           onStop={handleStop}
           onCancelCompaction={handleCancelCompaction}
         />
-      )}
-        </>
-      ) : (
-        <ExternalMcpPanel />
       )}
 
       {/* History Drawer */}
