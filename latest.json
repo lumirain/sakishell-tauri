@@ -3,9 +3,9 @@
   "release_url": "https://github.com/lumirain/sakishell-tauri/releases/tag/v1.0.16",
   "installer_url": "https://github.com/lumirain/sakishell-tauri/releases/download/v1.0.16/SakiShell_1.0.16_x64-setup.exe",
   "installer_mirrors": [],
-  "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUSS9wR1E2NEJwTGFONzZlOW5HMHZDQmlPeVk0VGRXZmdadGZrcTZjaVpIb3VGOGQwSzJ6c2VUZWhHQVdaem1VamFseWdMbzgyWFJaL2ZiVk9Kb0F4b0NiV0huVThlRndBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyNzI4MDQxCWZpbGU6U2FraVNoZWxsXzEuMC4xNV94NjQtc2V0dXAuZXhlCmRoM2lIaGNEaUV4bW9ZaDVuM0dvNVJmaEthaUR4NEFKa2NoZGNBMVU2ODd6SmNMRmVEeXBYQjZPaVQvUmdZZ2g2d3FsL1NaL3FURHEzSjl3aFY0d0F3PT0K",
-  "sha256": "50fa01f0df4365a66f41bb2cea07d123ce7aee80b2edcdc325ca6ad0776f1193",
-  "size": 12487435,
+  "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUSS9wR1E2NEJwTFhZb3UxR2VKN0s3MmI0NGNuREcrZERodW1yS2tQdkR2c3kxbmhtNExrV2s0bWYyNUVSemtucThZQUJCNnVHSC9kNlEvYTFIWEZOUlpXOHB1YXVKSXdZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyNzM0NjcyCWZpbGU6U2FraVNoZWxsXzEuMC4xNl94NjQtc2V0dXAuZXhlClFWMHY4WVdlbS9OQnd2ZWt2b3ZFd3NRWHp3bXlrK2VHUHJBeVlHSkxnUk0rL2xoTVdCU2hvb2pzdHhnVVZtRzhNU0M5ODR5MHlnQkY0ZWxuMXcrQ0F3PT0K",
+  "sha256": "ee44c3186bbf4ef0429f77eef8e157ef37467da223f318b1d73e297dcffe67d7",
+  "size": 12485740,
   "android": {
     "version": "1.0.16",
     "release_url": "https://github.com/lumirain/sakishell-tauri/releases/tag/v1.0.16",
