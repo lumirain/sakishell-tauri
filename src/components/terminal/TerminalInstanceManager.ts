@@ -261,22 +261,7 @@ class TerminalInstanceManager {
     terminal.options.disableStdin = isDebugSession(sessionId) || instance.stdinDisabled;
 
     // WebGL renderer (GPU); fall back to Canvas 2D if context unavailable.
-    try {
-      const webglAddon = new WebglAddon();
-      terminal.loadAddon(webglAddon);
-      instance.webglAddon = webglAddon;
-      instance.webglContextLossDisposable = webglAddon.onContextLoss(() => {
-        try {
-          webglAddon.dispose();
-        } catch {
-          // already disposed
-        }
-        instance.webglAddon = undefined;
-        instance.webglContextLossDisposable = undefined;
-      });
-    } catch (err) {
-      console.warn('WebGL terminal renderer unavailable, using Canvas 2D:', err);
-    }
+    this.installWebgl(instance, terminal);
 
     // 内置 Nerd Font 是异步加载的。万一首个图标在它就绪前就被栅格化，缺字会被缓存进
     // 纹理图集，之后一直显示不出图标；就绪后清一次图集并重绘，用正确字形重新栅格化。
@@ -454,6 +439,51 @@ class TerminalInstanceManager {
     if (instance.lastResize?.cols === cols && instance.lastResize?.rows === rows) return;
     instance.lastResize = { cols, rows };
     sshResize(instance.id, cols, rows).catch(() => {});
+  }
+
+  /** 挂载 WebGL 渲染器（GPU），上下文不可用时回退 Canvas 2D。可重复调用以重建。 */
+  private installWebgl(instance: TerminalInstance, terminal: XTerm) {
+    try {
+      const webglAddon = new WebglAddon();
+      terminal.loadAddon(webglAddon);
+      instance.webglAddon = webglAddon;
+      instance.webglContextLossDisposable = webglAddon.onContextLoss(() => {
+        try {
+          webglAddon.dispose();
+        } catch {
+          // already disposed
+        }
+        instance.webglAddon = undefined;
+        instance.webglContextLossDisposable = undefined;
+      });
+    } catch (err) {
+      console.warn('WebGL terminal renderer unavailable, using Canvas 2D:', err);
+    }
+  }
+
+  /**
+   * 窗口最小化 / 失焦再恢复后的强制重绘。WebGL 画布隐藏期间尺寸与字形图集
+   * 失步会让字符散落到错误位置，光 `refresh` 修不回：这里先拆掉旧 WebGL 渲染器
+   * 重新挂载（彻底重置画布与图集），再重新 fit、整屏重画并向 pty 上报尺寸。
+   * 原本就回退 Canvas 2D 的终端只做 fit + refresh，不强行装 WebGL。
+   */
+  repaintAfterRestore(instance: TerminalInstance) {
+    const terminal = instance.terminal;
+    if (!terminal || !instance.fitAddon) return;
+    if (instance.webglAddon) {
+      try {
+        instance.webglContextLossDisposable?.dispose();
+        instance.webglAddon.dispose();
+      } catch {
+        // already disposed
+      }
+      instance.webglAddon = undefined;
+      instance.webglContextLossDisposable = undefined;
+      this.installWebgl(instance, terminal);
+    }
+    instance.fitAddon.fit();
+    terminal.refresh(0, terminal.rows - 1);
+    this.resizeRemoteIfChanged(instance);
   }
 
   /**

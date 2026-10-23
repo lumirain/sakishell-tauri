@@ -16,6 +16,7 @@ import { usePluginStore } from '@/stores/pluginStore';
 import { useClipboardHandler } from '@/hooks/useClipboardHandler';
 import { useTerminalBottomPanel } from './useTerminalBottomPanel';
 import { terminalInstanceManager } from './TerminalInstanceManager';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import {
   PanelTransition,
   PANEL_TRANSITION_EASING,
@@ -150,32 +151,56 @@ export default function Terminal() {
     });
   };
 
-  // 窗口最小化 / 失焦再恢复后重绘：WebView 隐藏期间 GPU 合成暂停，回来时
-  // 画布常停留在旧帧或尺寸未更新，导致字符错乱。监听可见性恢复、窗口聚焦与
-  // 尺寸变化，对活动终端重新 fit + 全屏 refresh + 向 pty 上报尺寸。
+  // 窗口最小化 / 失焦再恢复后重绘：WebView 隐藏期间 GPU 画布尺寸与字形图集
+  // 失步，恢复后字符会散落到错误位置。延迟到布局/画布就绪后，重新 fit + 清图集 +
+  // 整屏重画 + 上报 pty 尺寸。浏览器事件与 Tauri 原生窗口事件都订阅，覆盖最小化还原。
   useEffect(() => {
-    const repaint = () => {
-      const instanceId = activeInstanceIdRef.current;
-      if (!instanceId) return;
-      const instance = terminalInstanceManager.get(instanceId);
-      if (!instance?.fitAddon || !instance.terminal) return;
-      requestAnimationFrame(() => {
-        if (!instance.fitAddon || !instance.terminal) return;
-        instance.fitAddon.fit();
-        instance.terminal.refresh(0, instance.terminal.rows - 1);
-        terminalInstanceManager.resizeRemoteIfChanged(instance);
-      });
+    let timer: number | null = null;
+    const scheduleRepaint = () => {
+      if (timer !== null) window.clearTimeout(timer);
+      // 先等一小段时间让 WebView 完成布局、画布恢复尺寸，再排两帧确保渲染就绪。
+      timer = window.setTimeout(() => {
+        timer = null;
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            const instanceId = activeInstanceIdRef.current;
+            if (!instanceId) return;
+            const instance = terminalInstanceManager.get(instanceId);
+            if (!instance) return;
+            terminalInstanceManager.repaintAfterRestore(instance);
+          });
+        });
+      }, 80);
     };
     const onVisibility = () => {
-      if (!document.hidden) repaint();
+      if (!document.hidden) scheduleRepaint();
     };
     document.addEventListener('visibilitychange', onVisibility);
-    window.addEventListener('focus', repaint);
-    window.addEventListener('resize', repaint);
+    window.addEventListener('focus', scheduleRepaint);
+    window.addEventListener('resize', scheduleRepaint);
+
+    let unlistenFocus: (() => void) | null = null;
+    let unlistenResize: (() => void) | null = null;
+    void getCurrentWindow()
+      .onFocusChanged((e) => {
+        if (e.payload) scheduleRepaint();
+      })
+      .then((fn) => {
+        unlistenFocus = fn;
+      });
+    void getCurrentWindow()
+      .onResized(() => scheduleRepaint())
+      .then((fn) => {
+        unlistenResize = fn;
+      });
+
     return () => {
+      if (timer !== null) window.clearTimeout(timer);
       document.removeEventListener('visibilitychange', onVisibility);
-      window.removeEventListener('focus', repaint);
-      window.removeEventListener('resize', repaint);
+      window.removeEventListener('focus', scheduleRepaint);
+      window.removeEventListener('resize', scheduleRepaint);
+      unlistenFocus?.();
+      unlistenResize?.();
     };
   }, []);
 

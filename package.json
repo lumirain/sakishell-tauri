@@ -1,7 +1,7 @@
 {
   "name": "sakishell",
   "private": true,
-  "version": "1.0.12",
+  "version": "1.0.13",
   "description": "SakiShell — AI-Native SSH Client with Autonomous Agent Operations",
   "type": "module",
   "scripts": {
