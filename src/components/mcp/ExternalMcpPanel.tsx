@@ -6,7 +6,7 @@
 // 让你在同一连接上手动补命令（与 AI 的执行同流显示）。
 //
 // 交互：
-// - 每条命令头部有放大按钮：在中央弹出模态卡片单独查看该命令与输出（Esc / × / 点遮罩关闭）；
+// - 每条命令头部有放大按钮：经 Portal 在中间主区展开该命令与输出（Esc / × 还原，右侧边栏不动）；
 // - 会话列表与命令流之间可拖拽调节宽度；
 // - 会话项右上角终端按钮：直接打开该连接的终端标签页。
 //
@@ -15,6 +15,7 @@
 // 本组件纯展示 + 触发「打开终端」，不直接接触后端。
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { Maximize2, Minimize2, Terminal, X, MoreVertical, Download } from "lucide-react";
 import {
   useExternalMcpStore,
@@ -299,8 +300,12 @@ export default function ExternalMcpPanel() {
   const sessions = useExternalMcpStore((s) => s.sessions);
   const initEvents = useExternalMcpStore((s) => s.initEvents);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  // 单条命令放大：只覆盖该命令与输出（Esc / 按钮还原）。
+  // 单条命令放大：经 Portal 注入主区槽位，只覆盖中间主区域，右侧命令流边栏不动（Esc / × 还原）。
   const [maximizedSeq, setMaximizedSeq] = useState<number | null>(null);
+  const [maximizeSlot, setMaximizeSlot] = useState<HTMLElement | null>(null);
+  useEffect(() => {
+    setMaximizeSlot(document.getElementById("mcp-maximize-slot"));
+  }, []);
   const [terminalBusyId, setTerminalBusyId] = useState<string | null>(null);
   const [terminalError, setTerminalError] = useState<string | null>(null);
   const [exportBusy, setExportBusy] = useState(false);
@@ -491,74 +496,69 @@ export default function ExternalMcpPanel() {
         </div>
       </div>
 
-      {/* 单条命令放大视图（居中模态卡片，Esc / × / 点遮罩关闭还原） */}
-      {maximizedCmd && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
-          onClick={() => setMaximizedSeq(null)}
-        >
-          <div
-            className="flex h-[75vh] w-[80vw] max-w-5xl flex-col overflow-hidden rounded-lg border border-zinc-700 bg-zinc-900 shadow-2xl"
-            onClick={(e) => e.stopPropagation()}
-          >
-          <div className="flex items-center gap-2 border-b border-zinc-800 px-4 py-2.5">
-            <span
-              className={`flex-shrink-0 text-[10px] font-semibold px-1.5 py-0.5 rounded ${
-                maximizedCmd.source === "ai"
-                  ? "bg-indigo-500/20 text-indigo-300"
-                  : "bg-zinc-500/20 text-zinc-300"
-              }`}
-            >
-              {maximizedCmd.source === "ai" ? "AI" : "你"}
-            </span>
-            <code className="min-w-0 flex-1 truncate font-mono text-sm text-zinc-100">
-              {maximizedCmd.command}
-            </code>
-            <span
-              className={`flex-shrink-0 text-[11px] ${STATUS_COLOR[maximizedCmd.status]}`}
-            >
-              {STATUS_LABEL[maximizedCmd.status]}
-            </span>
-            <span className="flex-shrink-0 text-[11px] text-zinc-500 tabular-nums">
-              {formatTime(maximizedCmd.startedAt)}
-            </span>
-            <button
-              type="button"
-              onClick={() => setMaximizedSeq(null)}
-              title="还原（Esc）"
-              aria-label="还原"
-              className="flex-shrink-0 rounded-md border border-zinc-700 bg-zinc-800/60 p-1.5 text-zinc-400 transition-colors hover:bg-zinc-700 hover:text-zinc-100"
-            >
-              <Minimize2 className="h-3.5 w-3.5" />
-            </button>
-            <button
-              type="button"
-              onClick={() => setMaximizedSeq(null)}
-              title="关闭"
-              aria-label="关闭"
-              className="flex-shrink-0 rounded-md border border-zinc-700 bg-zinc-800/60 p-1.5 text-zinc-400 transition-colors hover:bg-zinc-700 hover:text-zinc-100"
-            >
-              <X className="h-3.5 w-3.5" />
-            </button>
-          </div>
-          <pre className="flex-1 min-h-0 overflow-auto px-4 py-3 font-mono text-xs leading-relaxed text-zinc-300 whitespace-pre-wrap break-all">
-            {sanitizeExecOutput(maximizedCmd.output)}
-          </pre>
-          <div className="flex items-center gap-3 border-t border-zinc-800 px-4 py-2 text-[11px] text-zinc-500">
-            {maximizedCmd.exitCode != null && <span>退出码 {maximizedCmd.exitCode}</span>}
-            {maximizedCmd.error && <span className="text-red-400">{maximizedCmd.error}</span>}
-            {maximizedCmd.finishedAt && (
-              <span className="tabular-nums">
-                结束于 {formatTime(maximizedCmd.finishedAt)}
+      {/* 单条命令放大视图：Portal 进主区槽位、占满中间区；无遮罩，右侧命令流边栏 / 左栏 / 顶栏均不动（Esc / × 还原） */}
+      {maximizedCmd &&
+        maximizeSlot &&
+        createPortal(
+          <div className="pointer-events-auto absolute inset-0 flex flex-col bg-zinc-900">
+            <div className="flex items-center gap-2 border-b border-zinc-800 px-4 py-2.5">
+              <span
+                className={`flex-shrink-0 text-[10px] font-semibold px-1.5 py-0.5 rounded ${
+                  maximizedCmd.source === "ai"
+                    ? "bg-indigo-500/20 text-indigo-300"
+                    : "bg-zinc-500/20 text-zinc-300"
+                }`}
+              >
+                {maximizedCmd.source === "ai" ? "AI" : "你"}
               </span>
-            )}
-            {maximizedCmd.status === "running" && (
-              <span className="animate-pulse">● 运行中</span>
-            )}
-          </div>
-          </div>
-        </div>
-      )}
+              <code className="min-w-0 flex-1 truncate font-mono text-sm text-zinc-100">
+                {maximizedCmd.command}
+              </code>
+              <span
+                className={`flex-shrink-0 text-[11px] ${STATUS_COLOR[maximizedCmd.status]}`}
+              >
+                {STATUS_LABEL[maximizedCmd.status]}
+              </span>
+              <span className="flex-shrink-0 text-[11px] text-zinc-500 tabular-nums">
+                {formatTime(maximizedCmd.startedAt)}
+              </span>
+              <button
+                type="button"
+                onClick={() => setMaximizedSeq(null)}
+                title="还原（Esc）"
+                aria-label="还原"
+                className="flex-shrink-0 rounded-md border border-zinc-700 bg-zinc-800/60 p-1.5 text-zinc-400 transition-colors hover:bg-zinc-700 hover:text-zinc-100"
+              >
+                <Minimize2 className="h-3.5 w-3.5" />
+              </button>
+              <button
+                type="button"
+                onClick={() => setMaximizedSeq(null)}
+                title="关闭"
+                aria-label="关闭"
+                className="flex-shrink-0 rounded-md border border-zinc-700 bg-zinc-800/60 p-1.5 text-zinc-400 transition-colors hover:bg-zinc-700 hover:text-zinc-100"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </div>
+            <pre className="flex-1 min-h-0 overflow-auto px-4 py-3 font-mono text-xs leading-relaxed text-zinc-300 whitespace-pre-wrap break-all">
+              {sanitizeExecOutput(maximizedCmd.output)}
+            </pre>
+            <div className="flex items-center gap-3 border-t border-zinc-800 px-4 py-2 text-[11px] text-zinc-500">
+              {maximizedCmd.exitCode != null && <span>退出码 {maximizedCmd.exitCode}</span>}
+              {maximizedCmd.error && <span className="text-red-400">{maximizedCmd.error}</span>}
+              {maximizedCmd.finishedAt && (
+                <span className="tabular-nums">
+                  结束于 {formatTime(maximizedCmd.finishedAt)}
+                </span>
+              )}
+              {maximizedCmd.status === "running" && (
+                <span className="animate-pulse">● 运行中</span>
+              )}
+            </div>
+          </div>,
+          maximizeSlot,
+        )}
     </>
   );
 }

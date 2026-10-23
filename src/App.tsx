@@ -900,6 +900,8 @@ export default function App() {
             ) : (
               terminalPane
             )}
+            {/* 命令放大层挂载槽位：由 ExternalMcpPanel 经 Portal 注入，只覆盖主区，右侧命令流边栏、左栏与顶栏均不动 */}
+            <div id="mcp-maximize-slot" className="pointer-events-none absolute inset-0 z-30" />
           </div>
 
           <div
