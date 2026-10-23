@@ -1,4 +1,5 @@
 import { predictShrinkScroll, readRowShiftState } from '@/lib/terminalRowShift';
+import { isUsableFitSize } from '@/lib/terminalFitGuard';
 import type { TerminalInstance } from './TerminalInstanceManager';
 
 /** 与底栏 max-height 过渡（Terminal.tsx）保持一致，改一处必须同步另一处。 */
@@ -153,7 +154,8 @@ export class PanelTransition {
     const { instance } = state;
     // 休眠或已销毁的终端没有 xterm 可 fit，唤醒 / 重建时会自己 fit。
     if (instance.terminal && instance.fitAddon) {
-      instance.fitAddon.fit();
+      // 塌缩（窗口最小化）时不 fit，见 terminalFitGuard。
+      if (isUsableFitSize(instance.fitAddon.proposeDimensions())) instance.fitAddon.fit();
       state.onSettled(instance);
     }
   }

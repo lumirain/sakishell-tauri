@@ -16,7 +16,6 @@ import { usePluginStore } from '@/stores/pluginStore';
 import { useClipboardHandler } from '@/hooks/useClipboardHandler';
 import { useTerminalBottomPanel } from './useTerminalBottomPanel';
 import { terminalInstanceManager } from './TerminalInstanceManager';
-import { getCurrentWindow } from '@tauri-apps/api/window';
 import {
   PanelTransition,
   PANEL_TRANSITION_EASING,
@@ -143,66 +142,14 @@ export default function Terminal() {
       const instance = terminalInstanceManager.get(instanceId);
       // 休眠中的终端没有 xterm 可 fit；唤醒后的 fit 由同步 effect 负责。
       if (!instance?.fitAddon || !instance.terminal) return;
-      instance.fitAddon.fit();
+      // 塌缩（窗口最小化）时 fit 守卫拦下，不动行列数，避免被缩成 2 列并通知远端重排。
+      if (!terminalInstanceManager.fit(instance)) return;
       // 全屏重绘：窗口最小化 / 切走再回来后，GPU 画布可能停留在旧帧，
       // 光 fit 不刷新会留下错乱字符，强制把整屏重画一遍。
       instance.terminal.refresh(0, instance.terminal.rows - 1);
       terminalInstanceManager.resizeRemoteIfChanged(instance);
     });
   };
-
-  // 窗口最小化 / 失焦再恢复后重绘：WebView 隐藏期间 GPU 画布尺寸与字形图集
-  // 失步，恢复后字符会散落到错误位置。延迟到布局/画布就绪后，重新 fit + 清图集 +
-  // 整屏重画 + 上报 pty 尺寸。浏览器事件与 Tauri 原生窗口事件都订阅，覆盖最小化还原。
-  useEffect(() => {
-    let timer: number | null = null;
-    const scheduleRepaint = () => {
-      if (timer !== null) window.clearTimeout(timer);
-      // 先等一小段时间让 WebView 完成布局、画布恢复尺寸，再排两帧确保渲染就绪。
-      timer = window.setTimeout(() => {
-        timer = null;
-        requestAnimationFrame(() => {
-          requestAnimationFrame(() => {
-            const instanceId = activeInstanceIdRef.current;
-            if (!instanceId) return;
-            const instance = terminalInstanceManager.get(instanceId);
-            if (!instance) return;
-            terminalInstanceManager.repaintAfterRestore(instance);
-          });
-        });
-      }, 80);
-    };
-    const onVisibility = () => {
-      if (!document.hidden) scheduleRepaint();
-    };
-    document.addEventListener('visibilitychange', onVisibility);
-    window.addEventListener('focus', scheduleRepaint);
-    window.addEventListener('resize', scheduleRepaint);
-
-    let unlistenFocus: (() => void) | null = null;
-    let unlistenResize: (() => void) | null = null;
-    void getCurrentWindow()
-      .onFocusChanged((e) => {
-        if (e.payload) scheduleRepaint();
-      })
-      .then((fn) => {
-        unlistenFocus = fn;
-      });
-    void getCurrentWindow()
-      .onResized(() => scheduleRepaint())
-      .then((fn) => {
-        unlistenResize = fn;
-      });
-
-    return () => {
-      if (timer !== null) window.clearTimeout(timer);
-      document.removeEventListener('visibilitychange', onVisibility);
-      window.removeEventListener('focus', scheduleRepaint);
-      window.removeEventListener('resize', scheduleRepaint);
-      unlistenFocus?.();
-      unlistenResize?.();
-    };
-  }, []);
 
   // Sync terminals with sessions
   useEffect(() => {
@@ -262,7 +209,7 @@ export default function Terminal() {
           if (useSessionStore.getState().activeSessionId !== focusId) return;
           const instance = terminalInstanceManager.get(focusId);
           if (!instance?.terminal || !instance.fitAddon) return;
-          instance.fitAddon.fit();
+          if (!terminalInstanceManager.fit(instance)) return;
           instance.terminal.focus();
           terminalInstanceManager.resizeRemoteIfChanged(instance);
         });
@@ -314,7 +261,7 @@ export default function Terminal() {
     for (const [, instance] of terminalInstanceManager.getAll()) {
       if (!instance.terminal) continue;
       requestAnimationFrame(() => {
-        instance.fitAddon?.fit();
+        if (!terminalInstanceManager.fit(instance)) return;
         if (instance.id === activeInstanceId) {
           terminalInstanceManager.resizeRemoteIfChanged(instance);
         }
