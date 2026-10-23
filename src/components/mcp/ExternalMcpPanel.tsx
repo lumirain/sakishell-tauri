@@ -6,7 +6,7 @@
 // 让你在同一连接上手动补命令（与 AI 的执行同流显示）。
 //
 // 交互：
-// - 每条命令头部有放大按钮：单独把该命令与输出全屏查看（Esc / 按钮还原）；
+// - 每条命令头部有放大按钮：在中央弹出模态卡片单独查看该命令与输出（Esc / × / 点遮罩关闭）；
 // - 会话列表与命令流之间可拖拽调节宽度；
 // - 会话项右上角终端按钮：直接打开该连接的终端标签页。
 //
@@ -491,9 +491,16 @@ export default function ExternalMcpPanel() {
         </div>
       </div>
 
-      {/* 单条命令放大视图（全屏覆盖，Esc / 关闭按钮还原） */}
+      {/* 单条命令放大视图（居中模态卡片，Esc / × / 点遮罩关闭还原） */}
       {maximizedCmd && (
-        <div className="fixed inset-0 z-50 flex flex-col bg-zinc-900">
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+          onClick={() => setMaximizedSeq(null)}
+        >
+          <div
+            className="flex h-[75vh] w-[80vw] max-w-5xl flex-col overflow-hidden rounded-lg border border-zinc-700 bg-zinc-900 shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
           <div className="flex items-center gap-2 border-b border-zinc-800 px-4 py-2.5">
             <span
               className={`flex-shrink-0 text-[10px] font-semibold px-1.5 py-0.5 rounded ${
@@ -548,6 +555,7 @@ export default function ExternalMcpPanel() {
             {maximizedCmd.status === "running" && (
               <span className="animate-pulse">● 运行中</span>
             )}
+          </div>
           </div>
         </div>
       )}
