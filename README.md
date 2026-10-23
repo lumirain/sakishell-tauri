@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="image/标签图.png" alt="SakiShell" width="520" />
-</p>
-
 <h1 align="center">SakiShell</h1>
 
 <p align="center">
@@ -18,9 +14,7 @@ SakiShell 是一款基于 **Tauri v2** 的开源桌面 SSH 终端（Windows）�
 它既可以当作一款干净好用的 SSH 客户端，也能让外部 AI 客户端（Claude Code 等支持 MCP 的工具）
 通过本机 HTTP MCP 服务复用你已保存的连接执行命令，并把全过程实时呈现在界面里。
 
-![SakiShell 工作台：AI 会话、终端与外部调用命令流三栏并排](image/工作台截图.jpg)
-
-_真实产品界面，使用脱敏示例数据。_
+> 本项目由 [q541810/Marcel_ssh](https://github.com/q541810/Marcel_ssh) 二次修改并开源而成，在其基础上做了 AI 会话隔离、外部调用命令流、命令导出等定制。
 
 ## 核心特性
 
@@ -104,6 +98,10 @@ pnpm tauri dev
 ```
 
 参与贡献前请先阅读 [贡献者说明](CONTRIBUTING.md)。
+
+## 基于上游
+
+SakiShell 基于 [q541810/Marcel_ssh](https://github.com/q541810/Marcel_ssh) 二次修改开发，感谢原项目作者的贡献。
 
 ## 开源许可
 
