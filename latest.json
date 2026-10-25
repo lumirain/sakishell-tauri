@@ -1,17 +1,47 @@
 {
-  "version": "1.0.17",
-  "release_url": "https://github.com/lumirain/sakishell-tauri/releases/tag/v1.0.17",
-  "installer_url": "https://github.com/lumirain/sakishell-tauri/releases/download/v1.0.17/SakiShell_1.0.17_x64-setup.exe",
+  "version": "1.0.18",
+  "release_url": "https://github.com/lumirain/sakishell-tauri/releases/tag/v1.0.18",
+  "installer_url": "https://github.com/lumirain/sakishell-tauri/releases/download/v1.0.18/SakiShell_1.0.18_x64-setup.exe",
   "installer_mirrors": [],
-  "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUSS9wR1E2NEJwTFh4Z21kUDc4Yng2NmxZRGVYR2Z6Y1hoV3l2ejhSRG5GL2Y5S3hDZWFzWmhZeTdNVC9GWXFhVUJuUHY4M0hzOEFhaDFtRFVTWFE2eHJ4NjJMQWFjRHdFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyOTAxODM4CWZpbGU6U2FraVNoZWxsXzEuMC4xN194NjQtc2V0dXAuZXhlCkdnOTkxT3JXUkJ4QkZZeDRheEkxbXpUNWlzOUpHOHRsZ3lyM0dIaEFyTGw1WUphV0xYdjdWM25xek9GWlh6eEhRcmJRN3hoQUxXbW1GS0RVN2NqTER3PT0K",
-  "sha256": "5ea9c5525e7097bb23216c4e52c064bfb297803d75525c6b153f4d5cd0e1ec1d",
-  "size": 12495822,
+  "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUSS9wR1E2NEJwTFRVYmpKUDBDN1ZYaFAxbFRKaXgvcVphZ0Rsek1rWGk3cFFZVXIwSlhnNHBQZTZ3QTdPSGVLRkY3WTN3elVFR3VDNG1KT3V0Z3I4Mk1Tclg4djFyVmdFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyOTE4OTE0CWZpbGU6U2FraVNoZWxsXzEuMC4xOF94NjQtc2V0dXAuZXhlClhvbkdUQkJBZWRuOUoreGxRWFRkb2NYMTB2RUFlbGp3ckNRWnhJc2tJS2dDYnh1YXZwcko5NFg4S3NwUHkrQ0xwakVNVTM0UXhIcFhZSjM2L3V2ZUFnPT0K",
+  "sha256": "25e07c262a6b11657bd3b2b9b3ef707d8abccd2da59a12dedc9a9bc715433b3d",
+  "size": 12500715,
   "android": {
-    "version": "1.0.17",
-    "release_url": "https://github.com/lumirain/sakishell-tauri/releases/tag/v1.0.17",
+    "version": "1.0.18",
+    "release_url": "https://github.com/lumirain/sakishell-tauri/releases/tag/v1.0.18",
     "installer_url": "",
     "installer_mirrors": [],
     "sha256": "",
     "size": 0
+  },
+  "platforms": {
+    "windows-x86_64": {
+      "installer_url": "https://github.com/lumirain/sakishell-tauri/releases/download/v1.0.18/SakiShell_1.0.18_x64-setup.exe",
+      "installer_mirrors": [],
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUSS9wR1E2NEJwTFRVYmpKUDBDN1ZYaFAxbFRKaXgvcVphZ0Rsek1rWGk3cFFZVXIwSlhnNHBQZTZ3QTdPSGVLRkY3WTN3elVFR3VDNG1KT3V0Z3I4Mk1Tclg4djFyVmdFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyOTE4OTE0CWZpbGU6U2FraVNoZWxsXzEuMC4xOF94NjQtc2V0dXAuZXhlClhvbkdUQkJBZWRuOUoreGxRWFRkb2NYMTB2RUFlbGp3ckNRWnhJc2tJS2dDYnh1YXZwcko5NFg4S3NwUHkrQ0xwakVNVTM0UXhIcFhZSjM2L3V2ZUFnPT0K",
+      "sha256": "25e07c262a6b11657bd3b2b9b3ef707d8abccd2da59a12dedc9a9bc715433b3d",
+      "size": 12500715
+    },
+    "windows-aarch64": {
+      "installer_url": "https://github.com/lumirain/sakishell-tauri/releases/download/v1.0.18/SakiShell_1.0.18_arm64-setup.exe",
+      "installer_mirrors": [],
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUSS9wR1E2NEJwTFdSdDNnODJnS1BlSDdDWGVaYVArbzIzcjY4WW92WkQ4b0JuRnpkc21pWndSYmJXcVpnS1BtVjlhbFMybEZWL3JnZTJYM2RTblhjWjNFL0RzaWpvQVFnPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyOTE4NTI5CWZpbGU6U2FraVNoZWxsXzEuMC4xOF9hcm02NC1zZXR1cC5leGUKRVVJZUViNXdSRXFMcVdrcUhsYWRPcTROZHdTUVFUcUJkdDZScm1GWU8xQXluMWNuK1ljaTRLai8ycGFQanpENjVnUmdwdVB6bUJhY0MybWF4T1Z0RGc9PQo=",
+      "sha256": "d53a02158b2eb05ae7ba741782dd542909eab058010a61268cc4cd6ff5cb5302",
+      "size": 11166968
+    },
+    "darwin-x86_64": {
+      "installer_url": "https://github.com/lumirain/sakishell-tauri/releases/download/v1.0.18/SakiShell_1.0.18_x64.dmg",
+      "installer_mirrors": [],
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUSS9wR1E2NEJwTFo0NHNvbjhQSXpPY1ViR1dvdldUMkdvckhMWC9nZTlJM044dlplKzVLUEplUXJPQ2d2OXNGeFM2RHpEZXVQVDZoWEYvajRyc1hSdWpCVnJxVXJBM2dJPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyOTE4NjYxCWZpbGU6U2FraVNoZWxsXzEuMC4xOF94NjQuZG1nClpyL1phbDg0RGgyU1FEQ01lWjJZTWI2cVZnWnloRnRHeElIb1ZlV0xQaE85TTdYaFM4bUg5Zlh1cHJCQlBUVEEzK2VDL2dkT0RJL3lrbnJQZmxrOUFBPT0K",
+      "sha256": "4c5370fca5b0ae81c1324534d849e022bc1f13e99321aece6f9b17f55eb4a0d9",
+      "size": 14815439
+    },
+    "darwin-aarch64": {
+      "installer_url": "https://github.com/lumirain/sakishell-tauri/releases/download/v1.0.18/SakiShell_1.0.18_aarch64.dmg",
+      "installer_mirrors": [],
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUSS9wR1E2NEJwTFhqa0VqZ3M0UlBtZG9TS3M2MWRhNGtPaTRYWXY2MXR2ellnWDc1VHZxQVBZMFN1Y2MrNHNwNlZuNUZZT0ROSHEvdXNMZFpSK3dRVFNHSXZBOTE5WEEwPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyOTE4NjY1CWZpbGU6U2FraVNoZWxsXzEuMC4xOF9hYXJjaDY0LmRtZwp1ckl6WDdoTW5BTUJ1QUF0TktkWnFZYTBFTFhaYTc3OXQ3QWRDdEdZMWRSOXVjekpHSmlhTUJJWE1ySTRlVVVqVHJhOE5qdDNjK0o1NTlHQUFLWlRDUT09Cg==",
+      "sha256": "33cc31c196f9b14dcd945d8aedc70421a13bd0b2c101079448dbf302f736150a",
+      "size": 14011510
+    }
   }
 }
