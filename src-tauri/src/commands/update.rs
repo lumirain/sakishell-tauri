@@ -800,7 +800,7 @@ mod tests {
             assert!(url.starts_with("https://"), "检查源必须 https: {}", url);
             assert!(url.ends_with("/latest.json"), "检查源指向了别的文件: {}", url);
             assert!(
-                url.contains("q541810/Marcel_ssh"),
+                url.contains("lumirain/sakishell-tauri"),
                 "检查源指向了别的仓库: {}",
                 url
             );

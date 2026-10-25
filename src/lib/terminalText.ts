@@ -6,6 +6,7 @@
 //   - SAKISHELL_DONE 结束标记行（内部用来判退出码，不该给用户看）。
 //
 // 这里只做展示层清洗，不改后端流式，也不动中间真实终端（xterm 自己会解析 ANSI）。
+/* eslint-disable no-control-regex -- ANSI 转义序列必须匹配真实控制字符 */
 
 /** OSC 序列：ESC ] ... BEL 或 ESC ] ... ESC \。 */
 const OSC_RE = /\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g;
