@@ -67,11 +67,19 @@ SakiShell 是一款基于 **Tauri v2** 的开源桌面 SSH 终端（Windows）�
 
 ## 快速开始
 
-1. 前往 [最新发布页](https://github.com/lumirain/sakishell-tauri/releases/latest) 下载 Windows 安装包（NSIS）与对应 `.sig` 签名。
+1. 前往 [最新发布页](https://github.com/lumirain/sakishell-tauri/releases/latest) 下载对应平台的安装包与 `.sig` 签名：
+   - **Windows x64**：`SakiShell_<版本>_x64-setup.exe`（NSIS，推荐）
+   - **Windows ARM64**：`SakiShell_<版本>_arm64-setup.exe`（NSIS，支持静默自动更新）
+   - **macOS Intel**：`SakiShell_<版本>_x64.dmg`
+   - **macOS Apple Silicon**：`SakiShell_<版本>_aarch64.dmg`
 2. 安装并打开 SakiShell，完成首次引导。
 3. 在左侧添加 SSH 连接，选择密码或私钥认证。
 4. 需要让外部 AI 接入时，在「设置 → 工具能力」开启 HTTP MCP 服务，按
    [MCP Server 文档](docs/mcp-server.md) 配置客户端。
+
+> **macOS 未签名说明**：本项目的 macOS 安装包未做 Apple 开发者签名（无付费开发者证书）。
+> 首次打开时若被 Gatekeeper 拦截：右键点击 `.dmg`（或安装后的应用）→「打开」→ 再次确认「打开」即可，
+> 之后不会再拦截。macOS 端暂不提供静默自动更新，新版本请手动到发布页下载。
 
 ## 作为 MCP Server 接入外部 Agent
 
