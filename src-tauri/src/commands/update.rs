@@ -5,7 +5,7 @@ use tauri_plugin_shell::ShellExt;
 
 use crate::error::AppError;
 
-const DEFAULT_RELEASE_URL: &str = "https://github.com/q541810/Marcel_ssh/releases";
+const DEFAULT_RELEASE_URL: &str = "https://github.com/lumirain/sakishell-tauri/releases";
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -822,7 +822,7 @@ mod tests {
                 continue;
             }
             assert!(
-                url.contains("/gh/q541810/Marcel_ssh@main/"),
+                url.contains("/gh/lumirain/sakishell-tauri@main/"),
                 "jsDelivr 源必须引用 main 分支而不是 tag（tag 需人工维护且有发布顺序陷阱）: {}",
                 url
             );
