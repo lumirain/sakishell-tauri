@@ -124,7 +124,7 @@ jobs:
 
   # ============ 汇总发布：建 Release 并上传全部平台的安装包与签名 ============
   publish:
-    name: Publish release v${{ env.VERSION }}
+    name: Publish release
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 20
