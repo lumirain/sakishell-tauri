@@ -29,28 +29,28 @@ jobs:
             target: x86_64-pc-windows-msvc
             bundle: nsis
             # NSIS 产物命名：x86_64 → x64
-            asset: SakiShell_${VERSION}_x64-setup.exe
+            suffix: x64-setup.exe
             artifact: saki-windows-x64
           - name: windows-arm64
             os: windows-latest
             target: aarch64-pc-windows-msvc
             bundle: nsis
             # NSIS 产物命名：aarch64 → arm64
-            asset: SakiShell_${VERSION}_arm64-setup.exe
+            suffix: arm64-setup.exe
             artifact: saki-windows-arm64
           - name: macos-intel
             os: macos-13
             target: x86_64-apple-darwin
             bundle: dmg
             # dmg 产物命名：x86_64 → x64
-            asset: SakiShell_${VERSION}_x64.dmg
+            suffix: x64.dmg
             artifact: saki-macos-x64
           - name: macos-apple-silicon
             os: macos-14
             target: aarch64-apple-darwin
             bundle: dmg
             # dmg 产物命名：aarch64 → aarch64
-            asset: SakiShell_${VERSION}_aarch64.dmg
+            suffix: aarch64.dmg
             artifact: saki-macos-aarch64
     steps:
       - uses: actions/checkout@v4
@@ -105,7 +105,7 @@ jobs:
           # 密钥为空密码，必须显式置空，否则 tauri signer 会尝试读密码失败
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
         run: |
-          BUNDLE="src-tauri/target/${{ matrix.target }}/release/bundle/${{ matrix.bundle }}/${{ matrix.asset }}"
+          BUNDLE="src-tauri/target/${{ matrix.target }}/release/bundle/${{ matrix.bundle }}/SakiShell_${{ env.VERSION }}_${{ matrix.suffix }}"
           if [ ! -f "$BUNDLE" ]; then
             echo "找不到构建产物: $BUNDLE" >&2
             find "src-tauri/target/${{ matrix.target }}/release/bundle" -maxdepth 2 -type f | head -20 >&2
@@ -118,8 +118,8 @@ jobs:
         with:
           name: ${{ matrix.artifact }}
           path: |
-            src-tauri/target/${{ matrix.target }}/release/bundle/${{ matrix.bundle }}/${{ matrix.asset }}
-            src-tauri/target/${{ matrix.target }}/release/bundle/${{ matrix.bundle }}/${{ matrix.asset }}.sig
+            src-tauri/target/${{ matrix.target }}/release/bundle/${{ matrix.bundle }}/SakiShell_${{ env.VERSION }}_${{ matrix.suffix }}
+            src-tauri/target/${{ matrix.target }}/release/bundle/${{ matrix.bundle }}/SakiShell_${{ env.VERSION }}_${{ matrix.suffix }}.sig
           if-no-files-found: error
 
   # ============ 汇总发布：建 Release 并上传全部平台的安装包与签名 ============
