@@ -8,6 +8,9 @@ pub mod child_resources;
 pub mod command_exec;
 pub mod commands;
 pub mod config;
+// 配置文件目录解析：环境变量 > 覆盖文件 > 平台默认（Windows=安装目录/config）。
+// 覆盖文件位于系统固定配置目录，设置界面「配置路径」项读写。
+pub mod config_dir;
 // 分段并发下载器（HTTP Range）：GitHub 这类线路按单连接限速，安装包下载
 // 靠把一条流拆成多条连接才能跑满带宽（见模块内实测数据）。
 pub mod download;
@@ -725,10 +728,30 @@ pub fn run() {
             }
         })
         .setup(|app| {
-            let config_dir = app
+            // 平台默认配置目录：Windows = 程序安装目录下的 `config` 文件夹；
+            // Android 等平台保持原 `app_config_dir()`（安装目录只读，不可自定义）。
+            #[cfg(target_os = "windows")]
+            let platform_default = std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
+                .map(|dir| dir.join("config"))
+                .unwrap_or_else(|| PathBuf::from("."));
+            #[cfg(not(target_os = "windows"))]
+            let platform_default = app
                 .path()
                 .app_config_dir()
                 .unwrap_or_else(|_| PathBuf::from("."));
+
+            let config_dir = crate::config_dir::resolve_config_dir(&platform_default);
+
+            // 首次切到新默认目录：旧 `%APPDATA%\com.sakishell.app` 有数据时自动
+            // 整体复制到新默认目录（旧目录保留不动，用户可自行删）。无自定义路径、
+            // 目标目录不存在时才触发。
+            let migrated = crate::config_dir::migrate_legacy_if_needed(&config_dir).unwrap_or(false);
+            crate::config_dir::set_migrated(migrated);
+            if let Err(e) = std::fs::create_dir_all(&config_dir) {
+                log::warn!("创建配置目录失败 {}: {}", config_dir.display(), e);
+            }
 
             log::info!("App config directory: {}", config_dir.display());
             // AppState::new is async — create a short-lived runtime to drive
@@ -962,6 +985,9 @@ pub fn run() {
             commands::settings::config_get_settings,
             commands::settings::config_save_settings,
             commands::settings::config_validate_custom_protected_paths,
+            commands::config_dir::config_path_get,
+            commands::config_dir::config_path_set,
+            commands::config_dir::config_path_reset,
             commands::settings::llm_list_models,
             commands::keychain::config_save_password,
             commands::keychain::config_has_password,

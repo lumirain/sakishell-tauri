@@ -23,6 +23,7 @@ export const SETTINGS_SECTION_SPAN: Record<string, SettingsSectionSpan> = {
   'settings-mcp-server': 'full',
   'settings-transfer': 'half',
   'settings-about': 'half',
+  'settings-config-path': 'full',
   'settings-plugins': 'full',
   'settings-market': 'full',
 };
@@ -78,7 +79,7 @@ export const SETTINGS_CATEGORIES: SettingsCategory[] = [
     id: 'about',
     label: '关于',
     icon: <Info className="w-4 h-4" />,
-    sections: ['settings-about'],
+    sections: ['settings-about', 'settings-config-path'],
   },
 ];
 

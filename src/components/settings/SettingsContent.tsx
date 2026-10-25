@@ -3,6 +3,7 @@ import { useSearchRegistry } from './helpers';
 import { AgentPolicySection } from './AgentPolicySection';
 import { AgentSystemPromptSection } from './AgentSystemPromptSection';
 import AboutSection from './AboutSection';
+import ConfigPathSection from './ConfigPathSection';
 import { ConversationDisplaySection } from './ConversationDisplaySection';
 import { ModelServiceSection } from './ModelServiceSection';
 import { NotificationSection } from './NotificationSection';
@@ -66,6 +67,7 @@ export function SettingsContent({ activeCategory, searchQuery }: SettingsContent
     { id: 'settings-mcp-server', element: <McpServerSection /> },
     { id: 'settings-transfer', element: <TransferSection /> },
     { id: 'settings-about', element: <AboutSection /> },
+    { id: 'settings-config-path', element: <ConfigPathSection /> },
     { id: 'settings-plugins', element: <PluginSection /> },
     { id: 'settings-market', element: <MarketSection /> },
   ];

@@ -4,6 +4,7 @@ pub mod agent_conversation;
 pub mod agent_lifecycle;
 pub mod agent_policy;
 pub mod app_bootstrap;
+pub mod config_dir;
 pub mod connections;
 pub mod job;
 pub mod keychain;
