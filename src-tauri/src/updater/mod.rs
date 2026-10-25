@@ -937,7 +937,12 @@ fn hash_file(path: &Path) -> Result<String, String> {
 /// 落盘与清理，必须两端一致地由版本号推导，不能各处硬编码）。
 fn installer_file_name(version: &str) -> String {
     if cfg!(windows) {
-        format!("SakiShell_{}_x64-setup.exe", version)
+        // NSIS 产物命名：x86_64 → x64，aarch64 → arm64
+        if std::env::consts::ARCH == "aarch64" {
+            format!("SakiShell_{}_arm64-setup.exe", version)
+        } else {
+            format!("SakiShell_{}_x64-setup.exe", version)
+        }
     } else if cfg!(target_os = "android") {
         format!("SakiShell_{}_universal-release.apk", version)
     } else {

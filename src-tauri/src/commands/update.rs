@@ -141,17 +141,31 @@ fn pick_latest(latest: &serde_json::Value, is_android: bool) -> (String, String)
 
 /// 资产字段的来源对象：**严格按平台**。
 ///
-/// 桌面 = 顶层；Android = `android` 对象，且**不回退顶层** —— 顶层的
+/// Android = `android` 对象，且**不回退顶层** —— 顶层的
 /// `installer_url`/`sha256`/`size` 描述的是桌面 NSIS 包，回退会让安卓客户端
 /// 拿到一个装不上的 exe（版本号还会和它自相矛盾）。平台分离前的旧
 /// latest.json 里 `android` 对象不含资产字段 → 返回 None → 降级为跳浏览器，
 /// 与老客户端行为一致。
+///
+/// 桌面 = `platforms.<本平台key>`（如 `windows-x86_64` / `windows-aarch64` /
+/// `darwin-x86_64` / `darwin-aarch64`）；**取不到时回退顶层** —— 顶层字段
+/// 描述 Windows x64 包（历史结构），老版本客户端（不识别 `platforms`）读的
+/// 正是顶层，必须保留，否则老客户端更新会断。
 fn asset_target(latest: &serde_json::Value, is_android: bool) -> Option<&serde_json::Value> {
     if is_android {
-        latest.get("android").filter(|v| v.is_object())
-    } else {
-        Some(latest)
+        return latest.get("android").filter(|v| v.is_object());
     }
+    // 先按运行平台取 platforms 子对象
+    let key = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+    if let Some(target) = latest
+        .get("platforms")
+        .and_then(|p| p.get(&key))
+        .filter(|v| v.is_object())
+    {
+        return Some(target);
+    }
+    // 无 platforms 结构（旧 latest.json）→ 回退顶层（Windows x64 资产）
+    Some(latest)
 }
 
 /// 读取某个对象内的安装包资产字段（缺失/空串一律视为缺失）。
@@ -703,6 +717,43 @@ mod tests {
         // 非对象的 android 字段同样视为缺失
         let latest = json!({ "android": "1.5.0" });
         assert!(asset_target(&latest, true).is_none());
+    }
+
+    /// 桌面优先取 `platforms.<本平台key>`；无 platforms 结构时回退顶层（老
+    /// latest.json 兼容）。顶层字段必须继续保留，老客户端只读顶层。
+    #[test]
+    fn asset_target_prefers_platforms_key_and_falls_back_to_top() {
+        let key = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+        let latest = json!({
+            "installer_url": "https://example.com/legacy-x64.exe",
+            "platforms": {
+                key: {
+                    "installer_url": "https://example.com/platform.bin",
+                    "signature": "sig",
+                    "sha256": "abc",
+                    "size": 123
+                }
+            }
+        });
+        let target = asset_target(&latest, false).unwrap();
+        let assets = pick_assets(target);
+        assert_eq!(assets.installer_url.as_deref(), Some("https://example.com/platform.bin"));
+        assert_eq!(assets.signature.as_deref(), Some("sig"));
+        assert_eq!(assets.sha256.as_deref(), Some("abc"));
+        assert_eq!(assets.size, Some(123));
+
+        // 无 platforms → 回退顶层
+        let latest = json!({ "installer_url": "https://example.com/legacy-x64.exe" });
+        let assets = pick_assets(asset_target(&latest, false).unwrap());
+        assert_eq!(assets.installer_url.as_deref(), Some("https://example.com/legacy-x64.exe"));
+
+        // 有 platforms 但无本平台 key → 回退顶层
+        let latest = json!({
+            "installer_url": "https://example.com/legacy-x64.exe",
+            "platforms": { "other-arch": { "installer_url": "https://example.com/other.bin" } }
+        });
+        let assets = pick_assets(asset_target(&latest, false).unwrap());
+        assert_eq!(assets.installer_url.as_deref(), Some("https://example.com/legacy-x64.exe"));
     }
 
     #[test]

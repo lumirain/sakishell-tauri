@@ -141,3 +141,77 @@ jobs:
         if: ${{ !cancelled() }}
         continue-on-error: true
         run: cargo fmt --check
+
+  # ============ 交叉平台编译检查 ============
+  # 发布矩阵已扩展到 Windows x64/arm64 + macOS Intel/Apple Silicon（release.yml）。
+  # 这里的 check 快速暴露平台编译问题（cfg 分支、平台专属依赖），不用等到发版
+  # 时 30 分钟构建结束才发现。只做 cargo check，不打包。
+  rust-cross-macos:
+    name: Rust 交叉编译检查（macOS arm64）
+    runs-on: macos-14 # Apple Silicon 原生 runner
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+        working-directory: src-tauri
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 去掉国内 cargo 镜像配置
+        working-directory: .
+        run: rm -f .cargo/config.toml
+
+      # tauri 的 generate_context! 编译期要求 frontendDist 存在
+      - name: 放置占位 dist
+        working-directory: .
+        run: |
+          mkdir -p dist
+          printf '<!doctype html><title>ci</title>' > dist/index.html
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: src-tauri
+
+      - name: cargo check（macOS arm64）
+        run: cargo check --locked
+
+  rust-cross-windows-arm64:
+    name: Rust 交叉编译检查（Windows ARM64）
+    runs-on: windows-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+        working-directory: src-tauri
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 去掉国内 cargo 镜像配置
+        working-directory: .
+        run: rm -f .cargo/config.toml
+
+      - name: 放置占位 dist
+        working-directory: .
+        run: |
+          mkdir -p dist
+          printf '<!doctype html><title>ci</title>' > dist/index.html
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: aarch64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: src-tauri
+
+      - name: cargo check（Windows ARM64）
+        run: cargo check --locked --target aarch64-pc-windows-msvc
