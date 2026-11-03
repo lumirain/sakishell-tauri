@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import { listen } from '@tauri-apps/api/event';
 import Modal from '@/components/ui/Modal';
 import Button from '@/components/ui/Button';
 import { readBusyWork, useBusyWork, useIsBusy } from '@/hooks/useBusyWork';
@@ -9,20 +10,27 @@ import { busyConsequences, busyItems, isBusy } from '@/lib/quitGuard';
 /** 清单最多列几条；多出来的折成一句「另有 N 项」，别把对话框撑成一页。 */
 const MAX_LISTED = 4;
 
+/** 托盘「退出 SakiShell」事件：Rust 侧托盘菜单点击后广播，本组件统一处理退出确认。 */
+const TRAY_QUIT_EVENT = 'sakishell://quit';
+
 /**
- * 退出确认（桌面）。关主窗口时，如果还有任务在跑（Agent 任务 / 后台作业 / 传输），
- * 先拦下来问一句 —— 关掉窗口会同时中止它们，而这一步用户没法撤销。
+ * 退出确认（桌面）+ 关闭驻留后台。
  *
- * 这是个 **manager**：它不拥有任何任务，只是把「窗口关闭」与「忙碌清单」
- * （`lib/quitGuard` 的口径，三张表的汇总）接在一起，所以判定全部在 `lib/quitGuard`，
- * 这里只负责拦截时机与对话框。没有任务在跑时**不拦**：Tauri 的默认行为接着关窗，
- * 用户不会为一次普通退出多点一下。
+ * **关闭主窗口（自定义标题栏 × / Alt+F4 / 任务栏关闭）一律进后台**：拦截默认的
+ * 关窗（销毁窗口 = 退出进程），改为隐藏窗口驻留系统托盘。此时无论有没有任务在跑
+ * 都不再询问 —— 后台运行本来就不中断 Agent 任务 / 后台作业 / 传输。
  *
- * 关闭窗口的几种入口（自定义标题栏的 ×、Alt+F4、任务栏右键关闭）最终都是
- * `CloseRequested`，一处拦住即可。确认后用 `destroy()` 强制关闭 —— 走 `close()`
- * 会再次触发 `CloseRequested`，把自己拦在门口。
+ * **真正的「退出」只有一条路：托盘菜单「退出 SakiShell」**。Rust 侧广播
+ * {@link TRAY_QUIT_EVENT} 到这里，如果还有任务在跑（`lib/quitGuard` 的口径，三张表
+ * 的汇总），先把窗口带回来弹确认框问一句；空闲则直接 `destroy()` 退出。
  *
- * 对话框开着时再次点关闭：事件仍会进来，但对话框已经在了，保持原样（不叠第二个）。
+ * 这是个 **manager**：它不拥有任何任务，只把「关闭 / 退出意图」与「忙碌清单」接在
+ * 一起，判定全部在 `lib/quitGuard`，这里只负责拦截时机与对话框。
+ *
+ * 确认后用 `destroy()` 强制关闭 —— 走 `close()` 会再次触发 `CloseRequested`，把自己
+ * 拦在门口（进后台而不是退出）。
+ *
+ * 对话框开着时点了窗口关闭：视作放弃退出，对话框就地关掉、窗口进后台。
  * 对话框开着期间任务全跑完了：就地改口成「可以放心退出了」，而不是对着一份
  * 过期的清单问「确定要中断吗」。
  *
@@ -43,22 +51,41 @@ export default function QuitGuard() {
 
   useEffect(() => {
     let disposed = false;
-    let unlisten: (() => void) | undefined;
+    const cleanups: (() => void)[] = [];
+
+    // 关闭主窗口：一律拦截默认关窗，隐藏窗口驻留后台。
+    // 有任务在跑也不再询问 —— 后台运行不中断任务；退出只走托盘菜单（下方监听）。
     void getCurrentWindow()
       .onCloseRequested((event) => {
-        // 读此刻的 store，而不是上次渲染时的快照：关闭请求可能就夹在状态更新的间隙里。
-        if (!isBusy(readBusyWork())) return; // 放行：Tauri 接着关窗
         event.preventDefault();
+        // 退出确认框正开着时点关闭 = 放弃退出，直接进后台。
+        setOpen(false);
         setError(null);
-        setOpen(true);
+        void getCurrentWindow().hide();
       })
       .then((fn) => {
         if (disposed) fn();
-        else unlisten = fn;
+        else cleanups.push(fn);
       });
+
+    // 托盘「退出 SakiShell」：忙碌时把窗口带回来弹确认，空闲直接销毁退出。
+    // 与关闭路径共享同一份 busy 口径（lib/quitGuard）。
+    void listen(TRAY_QUIT_EVENT, () => {
+      if (isBusy(readBusyWork())) {
+        void getCurrentWindow().show();
+        setError(null);
+        setOpen(true);
+      } else {
+        void getCurrentWindow().destroy();
+      }
+    }).then((fn) => {
+      if (disposed) fn();
+      else cleanups.push(fn);
+    });
+
     return () => {
       disposed = true;
-      unlisten?.();
+      cleanups.forEach((fn) => fn());
     };
   }, []);
 

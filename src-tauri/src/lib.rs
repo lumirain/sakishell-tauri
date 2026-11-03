@@ -693,6 +693,16 @@ fn append_load_warning(slot: &mut Option<String>, msg: String) {
     }
 }
 
+/// 托盘恢复入口：显示并聚焦主窗口（窗口可能处于隐藏 / 最小化状态）。
+/// 托盘左键单击与「显示主窗口」菜单项共用。
+fn focus_main_window(app: &tauri::AppHandle) {
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.show();
+        let _ = win.unminimize();
+        let _ = win.set_focus();
+    }
+}
+
 /// Build and run the Tauri application.
 ///
 /// `mobile_entry_point` generates the JNI entry symbol Android needs to boot
@@ -716,10 +726,9 @@ pub fn run() {
             // 主窗口真正销毁时同步关闭所有插件独立窗口：Tauri 只在最后一个窗口
             // 关闭后退出应用，悬浮的插件窗口（如桌宠）不关会挡住应用退出。
             //
-            // 挂在 `Destroyed` 而不是 `CloseRequested`：前端的退出确认
-            // （`QuitGuard`，还有任务在跑时拦住关闭并询问）可能把这次关闭否决掉，
-            // 而 `CloseRequested` 是在前端有机会否决**之前**触发的 —— 挂在那里，
-            // 用户点了「继续使用」之后插件窗口（桌宠等）已经被提前关光了。
+            // 关闭主窗口本身已改为「驻留后台」（前端 QuitGuard 拦截 CloseRequested
+            // 后只隐藏不销毁），`Destroyed` 只发生在真正退出时（托盘「退出」走
+            // destroy / 前端销毁路径）——挂在这里，退出那一刻插件窗口仍然会被收干净。
             #[cfg(desktop)]
             if window.label() == "main" {
                 if let tauri::WindowEvent::Destroyed = event {
@@ -915,6 +924,49 @@ pub fn run() {
             // 无感更新器：启动清理 + 恢复未装上的安装包 + 后台检查循环。
             // 全平台启动；退出时静默安装只在 Windows 有意义（见下方 RunEvent::Exit）。
             crate::updater::init(app.handle());
+
+            // 系统托盘：关闭主窗口后程序驻留后台的入口（Cargo 已启用 tray-icon）。
+            // 左键单击恢复主窗口；右键菜单「显示主窗口」/「退出 SakiShell」。
+            // 「退出」不直接杀进程，而是广播事件给前端走 QuitGuard 的忙碌确认
+            // （有任务在跑时先问一句）——关闭窗口从此不再中断任何任务。
+            {
+                use tauri::menu::{Menu, MenuItem};
+                use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+
+                let show_item = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
+                let quit_item = MenuItem::with_id(app, "quit", "退出 SakiShell", true, None::<&str>)?;
+                let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+
+                let tray_builder = TrayIconBuilder::with_id("sakishell-tray")
+                    .menu(&menu)
+                    .show_menu_on_left_click(false)
+                    .on_menu_event(|app, event| match event.id.as_ref() {
+                        "show" => focus_main_window(app),
+                        "quit" => {
+                            let _ = app.emit("sakishell://quit", ());
+                        }
+                        _ => {}
+                    })
+                    .on_tray_icon_event(|tray, event| {
+                        if let TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            button_state: MouseButtonState::Up,
+                            ..
+                        } = event
+                        {
+                            focus_main_window(tray.app_handle());
+                        }
+                    });
+                // 图标缺省时（理论上不会，配置里恒有图标）退化为无图标托盘，不 panic。
+                let tray = match app.default_window_icon() {
+                    Some(icon) => tray_builder.icon(icon.clone()),
+                    None => tray_builder,
+                };
+                let tray = tray.build(app)?;
+                // 托盘必须常驻：交给 app 托管，防止局部变量 drop 后托盘消失。
+                app.manage(tray);
+                log::info!("系统托盘已就绪（关闭主窗口将驻留后台）");
+            }
 
             Ok(())
         })
