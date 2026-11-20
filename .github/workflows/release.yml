@@ -39,7 +39,9 @@ jobs:
             suffix: arm64-setup.exe
             artifact: saki-windows-arm64
           - name: macos-intel
-            os: macos-15-intel
+            # macos-14 已于 2026-11-02 退役；macos-15-intel 实测太慢（1h5m 打不完、
+            # 撞 60 分钟超时），改为在 Apple Silicon runner 上交叉编译 x86_64。
+            os: macos-15
             target: x86_64-apple-darwin
             bundle: dmg
             # dmg 产物命名：x86_64 → x64
