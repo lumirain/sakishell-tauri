@@ -3,9 +3,9 @@
   "release_url": "https://github.com/lumirain/sakishell-tauri/releases/tag/v1.0.20",
   "installer_url": "https://github.com/lumirain/sakishell-tauri/releases/download/v1.0.20/SakiShell_1.0.20_x64-setup.exe",
   "installer_mirrors": [],
-  "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUSS9wR1E2NEJwTGVjZUQ4Z015R0QvRSthaWRWWmhPNzdVUjJvZ1F4dFBUd3p4R3FqcTRTK1Q4VVpOQmQwVjROMDVvNnN6UjFMYndaMmZIVGphV01VRXhLa3gvL0hidmdrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk1MTQ3NDYwCWZpbGU6U2FraVNoZWxsXzEuMC4yMF94NjQtc2V0dXAuZXhlCkpURFYxeEtNMlQ2WEk2MWdFQjVvalg1N0IxTTByZkt2N2Q1V0pCc0JZWC8vVFFCcmcyQklESVRhVEVwSHhTZDBWeW0zekR1TVYzUEJ4eVovNFExTkRRPT0K",
-  "sha256": "8bc38df68884d1896798a47f617cf9d7ebe5e4ff619bd14ccb473ec8ccd70794",
-  "size": 12609976,
+  "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTUGJFVFhFa290NlAwR3MyZUkrZDYyKzk3RXJQekgzRnk0ZTNoZ1hJUzA4VkNydXFxM1VmcjZkZEZIb2VuOE5kbHQwbnlKelEvY1p0aGd5N0xjU2RmNUVCVFNoSUtUbkF3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk1MTU2NzA1CWZpbGU6U2FraVNoZWxsXzEuMC4yMF94NjQtc2V0dXAuZXhlCkZmMHNFSWcyNlR1NHI4R3lIYmltY2ZNbkZnSDFyVUhMdjBUSmRMdFlvM1EzVXh5SzJINCtKVGRSNUFvU3RGWll3WTU2ZUZqeHFnSXpTeGV3MW1IcENRPT0K",
+  "sha256": "cbb93c5b14cdcc7fb3c25f3ad3aeafcfdafc7a993581cd97604510e510f8c8db",
+  "size": 12556579,
   "android": {
     "version": "1.0.20",
     "release_url": "https://github.com/lumirain/sakishell-tauri/releases/tag/v1.0.20",
@@ -18,30 +18,30 @@
     "windows-x86_64": {
       "installer_url": "https://github.com/lumirain/sakishell-tauri/releases/download/v1.0.20/SakiShell_1.0.20_x64-setup.exe",
       "installer_mirrors": [],
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUSS9wR1E2NEJwTGVjZUQ4Z015R0QvRSthaWRWWmhPNzdVUjJvZ1F4dFBUd3p4R3FqcTRTK1Q4VVpOQmQwVjROMDVvNnN6UjFMYndaMmZIVGphV01VRXhLa3gvL0hidmdrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk1MTQ3NDYwCWZpbGU6U2FraVNoZWxsXzEuMC4yMF94NjQtc2V0dXAuZXhlCkpURFYxeEtNMlQ2WEk2MWdFQjVvalg1N0IxTTByZkt2N2Q1V0pCc0JZWC8vVFFCcmcyQklESVRhVEVwSHhTZDBWeW0zekR1TVYzUEJ4eVovNFExTkRRPT0K",
-      "sha256": "8bc38df68884d1896798a47f617cf9d7ebe5e4ff619bd14ccb473ec8ccd70794",
-      "size": 12609976
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTUGJFVFhFa290NlAwR3MyZUkrZDYyKzk3RXJQekgzRnk0ZTNoZ1hJUzA4VkNydXFxM1VmcjZkZEZIb2VuOE5kbHQwbnlKelEvY1p0aGd5N0xjU2RmNUVCVFNoSUtUbkF3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk1MTU2NzA1CWZpbGU6U2FraVNoZWxsXzEuMC4yMF94NjQtc2V0dXAuZXhlCkZmMHNFSWcyNlR1NHI4R3lIYmltY2ZNbkZnSDFyVUhMdjBUSmRMdFlvM1EzVXh5SzJINCtKVGRSNUFvU3RGWll3WTU2ZUZqeHFnSXpTeGV3MW1IcENRPT0K",
+      "sha256": "cbb93c5b14cdcc7fb3c25f3ad3aeafcfdafc7a993581cd97604510e510f8c8db",
+      "size": 12556579
     },
     "windows-aarch64": {
       "installer_url": "https://github.com/lumirain/sakishell-tauri/releases/download/v1.0.20/SakiShell_1.0.20_arm64-setup.exe",
       "installer_mirrors": [],
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUSS9wR1E2NEJwTFdRZmo1aDVoQkV1TkxIdlArK0RTMFRyV0hVNWQ3SGppUXNITjlOamFqWnc1NXNkK0h4aUsxNkpVcjRiVEFJaVpYejlJb24wQ2pLZkNteHU4YnV5ZFFJPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk1MTQ3NDkxCWZpbGU6U2FraVNoZWxsXzEuMC4yMF9hcm02NC1zZXR1cC5leGUKeVJtZksyZ3FhRTV4L0JmNXgxUnp1YWc0YmRXcGpMeFMxN3dzaXNMcW5paFdHWUlib0d4a0ptd0xuZld3UEVNR0o2TmlTUDVQNkcvd1RlRExPcG9IRGc9PQo=",
-      "sha256": "6b44c8612ba8317a41622762b1b52c3226a419aaeb54958d30aa8688f633a75e",
-      "size": 11269064
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTUGJFVFhFa290NkV6MTZMNDdOcHMyaVNHSkoyMHd4RndUMGY3ZjRBUWhrZ05KcWd2Z0hwWnpwWGMwcXozb2xWKytPUDY1RFEzUC9mcW9xZVJ2R21LQ0txb25UcUFOT3dvPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk1MTU2ODI1CWZpbGU6U2FraVNoZWxsXzEuMC4yMF9hcm02NC1zZXR1cC5leGUKT2JPZ2Q0V3NxTEFCSTJXb2JROFdkLzRoeENIcmlTb3E2MllmYlUwZitWWUs5WDl4c3g5bEdXQXVMSjE4VzRZSjl5emxOUWtoRHpheEpnMUx3aTNYQnc9PQo=",
+      "sha256": "a732dc2b5a2fb22925ff4578a42a2cf7de5c128eef8f94321f935def2f0af8f9",
+      "size": 11216566
     },
     "darwin-x86_64": {
       "installer_url": "https://github.com/lumirain/sakishell-tauri/releases/download/v1.0.20/SakiShell_1.0.20_x64.dmg",
       "installer_mirrors": [],
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUSS9wR1E2NEJwTGFGZlBrajZEQjE3MVBFcjdZa1RnaUp5a2RBcmZoaFdoYXB6MG1Gck5IYnR6YWRSZWFTU3YzazhITjNSN0tmeWFvd0EwVFJhQmVCRVk5YWhsOGpqSHdNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk1MTQ4NzU5CWZpbGU6U2FraVNoZWxsXzEuMC4yMF94NjQuZG1nCjcvbldnUklUVnZ3N3J3WlMwaGphY1gxdHJEZVNoNXdjYTNrelZEWmVQcHdGdDdZVkx2ejR5UXpUY0QvMlNaSG9WZzR1WjNxQmZRQkxBRVNjQ3I1M0N3PT0K",
-      "sha256": "bde16c46fccb067bb587cda5b75bddb7db9ee4554caf74f0929e1656a1909926",
-      "size": 14804939
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTUGJFVFhFa290NkV6Y1ZTZ016Z0JzWTBvUFBTUUNHaTRDTEthL253Nk9ldkhtMUVsNHdZdkxReFVqYlg3c0MxZHovNm8renhnY2FoOVlmNFNxNjJvYWkvMk9hRFFlb0FZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk1MTU2NDQ3CWZpbGU6U2FraVNoZWxsXzEuMC4yMF94NjQuZG1nCjVqZ2VhZmlrYXdGU2d4L0dZTCt6RnY0bXdCclhBZE1VN0VuQkp5RWlSaDdQZDBhNGE1STlEUDRDQUNreVNDUWVVMTl6cHRoTkJzaHhZcWVkdkpzR0FnPT0K",
+      "sha256": "4b2841affee32e7cc5bf02ac32fe1b67c7da68ab407382b3a41c8e09ef139135",
+      "size": 14919956
     },
     "darwin-aarch64": {
       "installer_url": "https://github.com/lumirain/sakishell-tauri/releases/download/v1.0.20/SakiShell_1.0.20_aarch64.dmg",
       "installer_mirrors": [],
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUSS9wR1E2NEJwTGVyTkNuRkVLcGxlSmxRQkVGTy9hdS9ORSsxdGU4eXdNbm9WR21Lekk5NHlzSGd0MFFaREpuOXNLK2Y2RE92aThDY2MyRHFabXZMYjlNNUJkcVRPeFFNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk1MTQ3MzcxCWZpbGU6U2FraVNoZWxsXzEuMC4yMF9hYXJjaDY0LmRtZwpESUY2MDBlcDVlVUhPRkx3WmFjaG5jM1hSOG1ZazQ1RFBMejhHejZtQi9oV0JMWDlGWnd1ZCs2R2pCeko2ZWJUS093S1lxVzhjbnFiVi9SVTVPeFVDZz09Cg==",
-      "sha256": "8b807cdc94e8dc3566e6cd2e8025fc99b1896b316a9dfcb785c90e0854d217c6",
-      "size": 14071135
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTUGJFVFhFa290NkJBaEY5Ymw5SUhWbWgxVmc4SlVxMEowb2g5M01QczM0QUo4U29MUENJTTJ2MXBWUVk1VzVDM2Q0QS9Qa2ZyY2JTa0tXeWo2UUlab3kxNlFLY2R3clFBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk1MTU2NDQwCWZpbGU6U2FraVNoZWxsXzEuMC4yMF9hYXJjaDY0LmRtZwp2M0ltZUpnbk0xNUtob3pqcnRYckhiWTNrZmRhbG1FaDRqSHRmNUdteitGMy9uK2E0dk96YjFDTzJiQlp5UWprK3dFUTBBWGY4SjFjUHI1OWxGaVZDdz09Cg==",
+      "sha256": "0a1eff849b3c3bc234c84d151948e2dd2ced424ee4873b54d6c8f0b705e7017c",
+      "size": 14112197
     }
   }
 }
