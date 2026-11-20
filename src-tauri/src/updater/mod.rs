@@ -48,7 +48,11 @@ mod notify;
 /// 仅 Windows 使用：Android 的 APK 由系统安装器强制校验签名与已装版本一致，
 /// 不走（也无法走）minisign 链。
 #[cfg(windows)]
-const UPDATE_PUBKEY_B64: &str = "ZFc1MGNuVnpkR1ZrSUdOdmJXMWxiblE2SUcxcGJtbHphV2R1SUhCMVlteHBZeUJyWlhrNklESkVOams0TUVWQ09UQTVNVVpGUXpnS1VsZFVTUzl3UjFFMk5FSndUR1U1V1ZJM1FuSk5MMXBSYjNJdmFsSnNUV3B4Tml0RlZrSXphMGRQVjJWTlowZG9TRVpsZGs4dmRra0s=";
+/// 内置生产公钥（minisign `.pub` 文件整体做 base64，解码后是两行：
+/// `untrusted comment: ...` 与 `RW...` 的公钥行）。
+/// 之前这里误把「已经 base64 过一次的内容」又包了一层，解码后拿不到公钥行，
+/// 导致 Windows 上所有签名验证都以「公钥文件格式无效」失败、更新静默不可用。
+const UPDATE_PUBKEY_B64: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDJENjk4MEVCOTA5MUZFQzgKUldUSS9wR1E2NEJwTGU5WVI3QnJNL1pRb3IvalJsTWpxNitFVkIza0dPV2VNZ0doSEZldk8vdkkK";
 
 /// 启动后首次检查的延迟（秒）。
 const FIRST_CHECK_DELAY_SECS: u64 = 30;

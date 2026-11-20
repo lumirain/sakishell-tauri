@@ -204,6 +204,15 @@ pub async fn start_http_server(
     // 允许空令牌：空令牌 = 不启用 Bearer 认证（前端会给出安全警示）。
     // 若调用方明确要求无认证模式（如内网可信环境），这里不设硬门槛；
     // 限流（`RateLimiter`）始终生效，防止端口被滥用。
+    //
+    // 但「全是空白字符」的令牌要拦住：用户多半是想设令牌却粘成了空格，
+    // 这种值既不构成真正的认证，又会让界面误以为已开启认证。
+    // （真正的空字符串仍按「显式关闭认证」处理。）
+    if !cfg.token.is_empty() && cfg.token.trim().is_empty() {
+        return Err(AppError::Config(
+            "MCP HTTP 令牌不能只包含空白字符：请填写有效令牌，或清空以显式关闭认证".into(),
+        ));
+    }
     let registry = server.build_registry()?;
     let state = HttpState {
         server: Arc::new(server.clone()),
