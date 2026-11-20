@@ -1,0 +1,4 @@
+# 签名样本必须逐字节保持原样：Windows runner 默认 autocrlf=true，
+# 一旦把 LF 转成 CRLF，签名内容就变了、验签必然失败。
+src-tauri/tests/fixtures/** -text
+*.sig -text
