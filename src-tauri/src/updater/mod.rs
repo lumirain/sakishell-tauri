@@ -41,18 +41,18 @@ pub mod install;
 mod notify;
 
 /// 更新签名公钥：minisign 公钥文件整体 base64（`pnpm tauri signer generate`
-/// 产出的 `.pub` 内容）。对应私钥 `~/.tauri/sakishell-update.key`（空密码，
-/// 不进 git；丢失则无法继续推更新，需换公钥发版）。CI 签名用同一私钥，
-/// 存于 GitHub repo secret `TAURI_SIGNING_PRIVATE_KEY`。
+/// 产出的 `.pub` 内容）。对应私钥不进 git，存于 GitHub repo secret
+/// `TAURI_SIGNING_PRIVATE_KEY`（空密码）；丢失则无法继续推更新，需换公钥发版。
 ///
 /// 仅 Windows 使用：Android 的 APK 由系统安装器强制校验签名与已装版本一致，
 /// 不走（也无法走）minisign 链。
+///
+/// 换钥须知：这里的公钥必须与 CI 里那把私钥严格配对。此前曾经出现「能解析
+/// 但验不过」的情况（公钥与签名私钥不是同一对），所以 `tests` 里有一条
+/// `builtin_pubkey_verifies_repo_sample` 用仓库内样本做真实验签，换钥时会立刻
+/// 报警。key id 见下面的 untrusted comment（E82D4A12D7446C8F）。
 #[cfg(windows)]
-/// 内置生产公钥（minisign `.pub` 文件整体做 base64，解码后是两行：
-/// `untrusted comment: ...` 与 `RW...` 的公钥行）。
-/// 之前这里误把「已经 base64 过一次的内容」又包了一层，解码后拿不到公钥行，
-/// 导致 Windows 上所有签名验证都以「公钥文件格式无效」失败、更新静默不可用。
-const UPDATE_PUBKEY_B64: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDJENjk4MEVCOTA5MUZFQzgKUldUSS9wR1E2NEJwTGU5WVI3QnJNL1pRb3IvalJsTWpxNitFVkIza0dPV2VNZ0doSEZldk8vdkkK";
+const UPDATE_PUBKEY_B64: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEU4MkQ0QTEyRDc0NDZDOEYKUldTUGJFVFhFa290NkJ1dXA4V01GUFd6MkZXdzJQa0dyQVdNMjdTa3NORWZEWTM2RkNIT3A2UnQK";
 
 /// 启动后首次检查的延迟（秒）。
 const FIRST_CHECK_DELAY_SECS: u64 = 30;
@@ -1282,6 +1282,23 @@ mod tests {
             line
         );
         assert!(minisign_verify::PublicKey::from_base64(&line).is_ok());
+    }
+
+    /// 用仓库内样本做一次**真实验签**：光「能解析」挡不住「换错钥」——
+    /// 之前就出过公钥与 CI 私钥不是同一对、所有更新静默验签失败的事故。
+    /// 换钥时必须同时重签 `tests/fixtures/updater_pubkey_selftest.txt`。
+    #[cfg(windows)]
+    #[test]
+    fn builtin_pubkey_verifies_repo_sample() {
+        let pubkey_line = decode_wrapped_pubkey().expect("内置公钥应可解析");
+        let payload = include_bytes!("../../tests/fixtures/updater_pubkey_selftest.txt");
+        // 样本 .sig 与 Release 里的 .sig 同格式：签名文本再 base64 一层，
+        // 正好是 `verify_signature_with` 需要的 `signature_b64`。
+        let sig_b64 = include_str!("../../tests/fixtures/updater_pubkey_selftest.txt.sig").trim();
+
+        verify_signature_with(&pubkey_line, payload, sig_b64).expect(
+            "内置公钥验不过仓库样本：公钥与 CI 签名私钥不是同一对，或样本没跟着换钥重签",
+        );
     }
 
     #[cfg(windows)]
