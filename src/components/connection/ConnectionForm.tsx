@@ -1,5 +1,10 @@
 import { useEffect, useState } from 'react';
-import type { JumpAuthMethod, SavedConnection, StoredKeyMeta } from '@/lib/types';
+import type {
+  ConnectionProtocol,
+  JumpAuthMethod,
+  SavedConnection,
+  StoredKeyMeta,
+} from '@/lib/types';
 import { DEFAULT_PORT } from '@/lib/constants';
 import * as tauri from '@/lib/tauri';
 import {
@@ -44,6 +49,9 @@ export default function ConnectionForm({
   const [port, setPort] = useState(connection?.port ?? DEFAULT_PORT);
   const [portInput, setPortInput] = useState(String(connection?.port ?? DEFAULT_PORT));
   const [username, setUsername] = useState(connection?.username ?? '');
+  const [protocol, setProtocol] = useState<ConnectionProtocol>(
+    connection?.protocol === 'telnet' ? 'telnet' : 'ssh',
+  );
   const [authMethod, setAuthMethod] = useState(connection?.authMethod ?? 'Password');
   const [keyPath, setKeyPath] = useState(connection?.keyPath ?? '');
   const [keyId, setKeyId] = useState(connection?.keyId ?? '');
@@ -160,6 +168,7 @@ export default function ConnectionForm({
       host,
       port,
       username,
+      protocol,
       authMethod,
       keyId,
       keyPath,
@@ -179,6 +188,7 @@ export default function ConnectionForm({
       host,
       username,
       port,
+      protocol,
       authMethod,
       keyId,
       keyPath,
@@ -200,6 +210,12 @@ export default function ConnectionForm({
   const keyUsage = (id: string) => keyUsageCount(connections, id);
 
   const persistSecrets = async (id: string) => {
+    // Telnet：密码就是自动登录凭据，存在 account = 连接 id 的密钥链条目里
+    // （与 SSH 密码认证同一个账号，连接时由 `ssh_connect_with_saved_password` 取出）。
+    if (protocol === 'telnet') {
+      if (loginPassword) await tauri.savePassword(id, loginPassword);
+      return;
+    }
     // 主连接的密钥密码：只在用户这次真的填了才写，留空表示"保持已保存的那把"
     if (authMethod === 'PrivateKey' && passphrase) {
       await tauri.savePassphrase(id, passphrase);
@@ -320,39 +336,99 @@ export default function ConnectionForm({
         />
       </div>
 
+      {/* 协议：SSH（缺省）或 Telnet。Telnet 没有密钥认证与跳板机，切换时把
+          端口从 22 顺带改成 23、并收起这两个区块。 */}
+      <div>
+        <label className="block text-sm font-medium text-zinc-300 mb-1">
+          连接方式
+        </label>
+        <div className="flex gap-2">
+          {(['ssh', 'telnet'] as const).map((value) => (
+            <button
+              key={value}
+              type="button"
+              onClick={() => {
+                setProtocol(value);
+                if (value === 'telnet') {
+                  setAuthMethod('Password');
+                  setUseJump(false);
+                  if (port === DEFAULT_PORT) {
+                    setPort(23);
+                    setPortInput('23');
+                  }
+                }
+              }}
+              className={`flex-1 rounded-lg border px-3 py-2 text-sm transition-colors ${
+                protocol === value
+                  ? 'border-indigo-500 bg-indigo-500/10 text-indigo-300'
+                  : 'border-zinc-700 bg-zinc-800 text-zinc-300 hover:border-zinc-600'
+              }`}
+            >
+              {value === 'ssh' ? 'SSH' : 'Telnet'}
+            </button>
+          ))}
+        </div>
+        {protocol === 'telnet' && (
+          <p className="mt-1 text-xs text-zinc-500">
+            Telnet 为明文协议（无加密、无主机密钥校验）。密码只用于连上后自动登录；
+            不支持 SFTP，Agent 命令靠终端回显与其模拟，可靠性低于 SSH。
+          </p>
+        )}
+      </div>
+
       <Input
-        label="用户名"
+        label={protocol === 'telnet' ? '用户名（自动登录用，可留空）' : '用户名'}
         value={username}
         onChange={(e) => setUsername(e.target.value)}
         placeholder="root"
         error={errors.username}
       />
 
-      <div>
-        <label className="block text-sm font-medium text-zinc-300 mb-1">
-          认证方式
-        </label>
-        <div className="flex gap-2 items-center">
-          <select
-            value={authMethod}
-            onChange={(e) => setAuthMethod(e.target.value)}
-            className="flex-1 rounded-lg bg-zinc-800 border border-zinc-700 px-3 py-2 text-sm text-zinc-100 focus:outline-none focus:border-indigo-500"
-          >
-            <option value="Password">密码</option>
-            <option value="PrivateKey">私钥</option>
-          </select>
-          {/* 还没存过密码才给这个入口；存过则下面有「密码：已保存 / 修改 / 清除」 */}
-          {authMethod === 'Password' && connection?.id && !hasLoginPassword && (
-            <Button
-              variant="secondary"
-              onClick={() => setPasswordPromptOpen(true)}
-              className="whitespace-nowrap py-2"
+      {protocol === 'telnet' && (
+        <Input
+          label="密码（自动登录用，可留空）"
+          type="password"
+          value={loginPassword}
+          onChange={(e) => {
+            setLoginPassword(e.target.value);
+            setLoginPasswordDirty(true);
+          }}
+          placeholder={
+            connection?.id && hasLoginPassword
+              ? '留空则保持已保存的密码'
+              : '留空则连接时手动输入'
+          }
+          autoComplete="new-password"
+        />
+      )}
+
+      {protocol === 'ssh' && (
+        <div>
+          <label className="block text-sm font-medium text-zinc-300 mb-1">
+            认证方式
+          </label>
+          <div className="flex gap-2 items-center">
+            <select
+              value={authMethod}
+              onChange={(e) => setAuthMethod(e.target.value)}
+              className="flex-1 rounded-lg bg-zinc-800 border border-zinc-700 px-3 py-2 text-sm text-zinc-100 focus:outline-none focus:border-indigo-500"
             >
-              重设密码
-            </Button>
-          )}
+              <option value="Password">密码</option>
+              <option value="PrivateKey">私钥</option>
+            </select>
+            {/* 还没存过密码才给这个入口；存过则下面有「密码：已保存 / 修改 / 清除」 */}
+            {authMethod === 'Password' && connection?.id && !hasLoginPassword && (
+              <Button
+                variant="secondary"
+                onClick={() => setPasswordPromptOpen(true)}
+                className="whitespace-nowrap py-2"
+              >
+                重设密码
+              </Button>
+            )}
+          </div>
         </div>
-      </div>
+      )}
 
       {/*
         密码认证下已保存的凭证：密钥链里 account = 连接 id 的那条（登录时用的就是
@@ -383,7 +459,7 @@ export default function ConnectionForm({
         </div>
       )}
 
-      {authMethod === 'PrivateKey' && (
+      {protocol === 'ssh' && authMethod === 'PrivateKey' && (
         <>
           <div>
             <label className="block text-sm font-medium text-zinc-300 mb-1">
@@ -523,7 +599,8 @@ export default function ConnectionForm({
         placeholder="生产环境"
       />
 
-      {/* Jump host (ProxyJump) */}
+      {/* Jump host (ProxyJump)：Telnet 协议没有跳板机，整块不渲染 */}
+      {protocol === 'ssh' && (
       <div className="rounded-lg border border-zinc-800 bg-zinc-900/40">
         <button
           type="button"
@@ -718,6 +795,7 @@ export default function ConnectionForm({
           </div>
         )}
       </div>
+      )}
 
       {/* Actions */}
       <div className="flex justify-end gap-2 pt-2">

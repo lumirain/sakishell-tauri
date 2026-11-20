@@ -191,6 +191,12 @@ export interface ReloadDiff {
 
 // Connection types
 
+/**
+ * 连接协议。`ssh` 是历史与缺省值；`telnet` 走裸 TCP 终端（无主机密钥校验、
+ * 无 SFTP，Agent 命令用「发命令 + 回显/哨兵」模拟）。
+ */
+export type ConnectionProtocol = 'ssh' | 'telnet';
+
 export interface JumpConfig {
   host: string;
   port: number;
@@ -203,6 +209,8 @@ export interface ConnectionConfig {
   port: number;
   username: string;
   authMethod: AuthMethod;
+  /** 协议：缺省 = SSH；`telnet` 时后端走 Telnet 驱动（无主机密钥、无 SFTP）。 */
+  protocol?: ConnectionProtocol;
   /** Saved connection ID, used by Agent tools for password lookup (sudo auto-fill). */
   connectionId?: string;
   /**
@@ -236,6 +244,11 @@ export interface SavedConnection {
   port: number;
   username: string;
   authMethod: string;
+  /**
+   * 连接协议：`ssh`（缺省，老数据即此值）或 `telnet`。
+   * Telnet 下 `authMethod` 固定为 `Password`，密码用作自动登录凭据。
+   */
+  protocol?: ConnectionProtocol;
   keyPath?: string;
   /** 密钥库里那把私钥的 id；缺失（老数据）时按 keyPath 走 */
   keyId?: string;

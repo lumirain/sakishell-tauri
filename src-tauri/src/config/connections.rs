@@ -13,6 +13,10 @@ pub struct SavedConnection {
     pub port: u16,
     pub username: String,
     pub auth_method: String,
+    /// 连接协议：`"ssh"`（缺省）或 `"telnet"`。老数据没有这个字段 = SSH。
+    /// Telnet 下 `auth_method` 固定为 `Password`，密码用作自动登录凭据。
+    #[serde(default = "default_protocol")]
+    pub protocol: String,
     pub key_path: Option<String>,
     /// 密钥库里那把私钥的 id（导入进来的私钥）。老数据没有这个字段，
     /// 为 `None` 时按 `key_path` 走——两条路都保留见 `ssh::key_store::resolve_pem`。
@@ -37,6 +41,11 @@ pub struct SavedConnection {
     /// 跳板机私钥的密钥库 id，语义同 `key_id`
     #[serde(default)]
     pub jump_key_id: Option<String>,
+}
+
+/// `SavedConnection.protocol` 的缺省值：老数据（没有该字段）一律视为 SSH。
+fn default_protocol() -> String {
+    "ssh".into()
 }
 
 /// Store for managing saved SSH connections.
@@ -145,6 +154,7 @@ mod tests {
             port: 22,
             username: "root".into(),
             auth_method: "Agent".into(),
+            protocol: "ssh".into(),
             key_path: None,
             key_id: None,
             group: group.map(String::from),

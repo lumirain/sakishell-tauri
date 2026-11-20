@@ -45,6 +45,25 @@ pub struct ConnectionConfig {
     /// direct-tcpip to the target, then handshake SSH over that stream.
     #[serde(default)]
     pub jump: Option<crate::ssh::auth::JumpConfig>,
+    /// 连接协议：`"ssh"`（缺省，等价于旧数据）或 `"telnet"`。
+    /// Telnet 走 `crate::telnet` 的独立驱动，不使用 `auth_method` 里的密钥认证，
+    /// 也不支持跳板机与 SFTP；`auth_method` 里的密码在 Telnet 下用作自动登录凭据。
+    #[serde(default)]
+    pub protocol: Option<String>,
+}
+
+impl ConnectionConfig {
+    /// 协议名归一化：`None` / 大小写差异 / 空串都按 SSH 处理。
+    pub fn protocol_name(&self) -> &str {
+        match self.protocol.as_deref() {
+            Some("telnet") | Some("TELNET") | Some("Telnet") => "telnet",
+            _ => "ssh",
+        }
+    }
+
+    pub fn is_telnet(&self) -> bool {
+        self.protocol_name() == "telnet"
+    }
 }
 
 impl fmt::Debug for ConnectionConfig {
@@ -57,6 +76,7 @@ impl fmt::Debug for ConnectionConfig {
             .field("connection_id", &self.connection_id)
             .field("trust_new_host_key", &self.trust_new_host_key)
             .field("jump", &self.jump)
+            .field("protocol", &self.protocol)
             .finish()
     }
 }
@@ -65,6 +85,10 @@ impl fmt::Debug for ConnectionConfig {
 #[derive(Clone)]
 pub struct SshManager {
     connections: Arc<RwLock<HashMap<String, Arc<SshConnection>>>>,
+    /// Telnet 会话（与 `connections` 并存、互不覆盖）。对外方法同时查两张表，
+    /// 所以命令层与 Agent 工具按 session_id 使用时不需要区分协议；只有在
+    /// 依赖 russh handle 的地方（exec / SFTP）才分流到 `crate::telnet`。
+    telnet: Arc<RwLock<HashMap<String, Arc<crate::telnet::TelnetSession>>>>,
     /// Per-session generation counter. Incremented each time a new connection
     /// replaces an existing one for the same session_id (reconnect). The driver
     /// task captures its generation at spawn time; during cleanup it only
@@ -91,6 +115,7 @@ impl SshManager {
     pub fn with_known_hosts(known_hosts: Arc<KnownHostsStore>) -> Self {
         Self {
             connections: Arc::new(RwLock::new(HashMap::new())),
+            telnet: Arc::new(RwLock::new(HashMap::new())),
             generations: Arc::new(RwLock::new(HashMap::new())),
             known_hosts,
             disconnect_observers: Arc::new(RwLock::new(Vec::new())),
@@ -177,6 +202,10 @@ impl SshManager {
     ) -> Result<(), AppError> {
         if config.host.is_empty() {
             return Err(AppError::Ssh("主机地址不能为空".into()));
+        }
+        // Telnet 走独立驱动：没有 SSH 握手 / 主机密钥 / PTY，也没有跳板机。
+        if config.is_telnet() {
+            return self.connect_telnet_inner(session_id, config, app).await;
         }
         if config.username.is_empty() {
             return Err(AppError::Ssh("用户名不能为空".into()));
@@ -434,6 +463,136 @@ impl SshManager {
         Ok(())
     }
 
+    /// 建立一条 Telnet 会话。
+    ///
+    /// 与 SSH 路径保持同一套登记 / 清理语义：generation 自增 → 插入 `telnet`
+    /// 表 → 入激活队列 → 发 `Connected` → 起驱动 → 退出时按 generation 判定
+    /// 归属 → 摘表 → 发 `Disconnected` → 通知断连观察者。**不碰** known_hosts
+    /// （Telnet 没有主机密钥概念）。
+    async fn connect_telnet_inner(
+        &self,
+        session_id: String,
+        config: ConnectionConfig,
+        app: Option<AppHandle>,
+    ) -> Result<(), AppError> {
+        if config.port == 0 {
+            return Err(AppError::Ssh("端口不能为 0".into()));
+        }
+        if config.jump.is_some() {
+            return Err(AppError::Config(
+                "Telnet 连接不支持跳板机，请在连接设置里关闭跳板机".into(),
+            ));
+        }
+
+        let host = config.host.clone();
+        let port = config.port;
+        let username = config.username.clone();
+        let connection_id = config.connection_id.clone();
+
+        // 自动登录凭据：只有密码认证可用（Telnet 没有密钥认证）。用户名为空或
+        // 密码为空时不做自动登录——连接照常建立，用户手动输。
+        let credentials = match &config.auth_method {
+            AuthMethod::Password { password } if !username.is_empty() && !password.is_empty() => {
+                Some(crate::telnet::session::LoginCredentials {
+                    username: username.clone(),
+                    password: password.clone(),
+                })
+            }
+            _ => None,
+        };
+
+        log::info!(
+            "Telnet connecting to {}@{}:{} auto_login={} (session={})",
+            username,
+            host,
+            port,
+            credentials.is_some(),
+            session_id
+        );
+
+        let stream = crate::telnet::session::open_tcp(&host, port).await?;
+
+        let generation = {
+            let mut gens = self.generations.write().await;
+            let g = gens.get(&session_id).copied().unwrap_or(0) + 1;
+            gens.insert(session_id.clone(), g);
+            g
+        };
+
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let session = Arc::new(crate::telnet::TelnetSession::new(
+            session_id.clone(),
+            host.clone(),
+            port,
+            username.clone(),
+            connection_id.clone(),
+            generation,
+            cmd_tx,
+        ));
+
+        self.telnet
+            .write()
+            .await
+            .insert(session_id.clone(), session.clone());
+
+        {
+            let mut order = self.activation_order.write().await;
+            order.retain(|sid| sid != &session_id);
+            order.push_back(session_id.clone());
+        }
+
+        if let Some(app) = app.as_ref() {
+            emit_event(
+                app,
+                &format!("ssh://status/{}", session_id),
+                SshStatus::Connected,
+            );
+        }
+
+        let manager_telnet = self.telnet.clone();
+        let manager_observers = self.disconnect_observers.clone();
+        let capture = session.capture.clone();
+        let sid = session_id.clone();
+        tokio::spawn(async move {
+            let reason = crate::telnet::session::drive(
+                sid.clone(),
+                stream,
+                cmd_rx,
+                app.clone(),
+                credentials,
+                crate::telnet::session::default_size(),
+                capture,
+            )
+            .await;
+            let mut guard = manager_telnet.write().await;
+            let owned = guard.get(&sid).map_or(true, |c| c.generation == generation);
+            if owned {
+                guard.remove(&sid);
+                drop(guard);
+                if let Some(app) = app.as_ref() {
+                    emit_event(
+                        app,
+                        &format!("ssh://status/{}", sid),
+                        SshStatus::Disconnected { reason },
+                    );
+                }
+                log::info!("Telnet session {} cleaned up", sid);
+                let observers = manager_observers.read().await.clone();
+                for cb in observers {
+                    cb(&sid);
+                }
+            } else {
+                log::info!(
+                    "Telnet session {} stale driver exited (gen {} vs current), skipping cleanup",
+                    sid,
+                    generation
+                );
+            }
+        });
+
+        Ok(())
+    }
+
     /// 关闭一个无头会话（`connect_headless` 建的那些）。
     ///
     /// 有头会话的清理挂在终端驱动上（驱动退出即摘表）；无头会话没有驱动，
@@ -448,6 +607,16 @@ impl SshManager {
                 order.retain(|sid| sid != session_id);
             }
             log::info!("[无头] SSH 会话 {} 已关闭", session_id);
+        }
+        // Telnet 的「无头」与有头共用同一个驱动，摘表 + 让驱动退出即可。
+        let telnet = self.telnet.write().await.remove(session_id);
+        if let Some(session) = telnet {
+            session.request_disconnect();
+            {
+                let mut order = self.activation_order.write().await;
+                order.retain(|sid| sid != session_id);
+            }
+            log::info!("[无头] Telnet 会话 {} 已关闭", session_id);
         }
     }
 
@@ -628,11 +797,16 @@ impl SshManager {
             let guard = self.connections.read().await;
             guard.get(session_id).cloned()
         };
-        let conn = conn.ok_or_else(|| AppError::Ssh(format!("会话不存在: {}", session_id)))?;
-        conn.cmd_tx
-            .send(SessionCommand::Input(data.to_vec()))
-            .map_err(|_| AppError::Ssh("会话已断开".into()))?;
-        Ok(())
+        if let Some(conn) = conn {
+            return conn
+                .cmd_tx
+                .send(SessionCommand::Input(data.to_vec()))
+                .map_err(|_| AppError::Ssh("会话已断开".into()));
+        }
+        if let Some(telnet) = self.telnet_session(session_id).await {
+            return telnet.send_input(data);
+        }
+        Err(AppError::Ssh(format!("会话不存在: {}", session_id)))
     }
 
     /// Resize the PTY associated with a session.
@@ -641,11 +815,19 @@ impl SshManager {
             let guard = self.connections.read().await;
             guard.get(session_id).cloned()
         };
-        let conn = conn.ok_or_else(|| AppError::Ssh(format!("会话不存在: {}", session_id)))?;
-        conn.cmd_tx
-            .send(SessionCommand::Resize { cols, rows })
-            .map_err(|_| AppError::Ssh("会话已断开".into()))?;
-        Ok(())
+        if let Some(conn) = conn {
+            return conn
+                .cmd_tx
+                .send(SessionCommand::Resize { cols, rows })
+                .map_err(|_| AppError::Ssh("会话已断开".into()));
+        }
+        // Telnet 没有 PTY，窗口大小通过 NAWS 子协商告诉对端（u16 上限）。
+        if let Some(telnet) = self.telnet_session(session_id).await {
+            let cols = cols.min(u16::MAX as u32) as u16;
+            let rows = rows.min(u16::MAX as u32) as u16;
+            return telnet.resize(cols, rows);
+        }
+        Err(AppError::Ssh(format!("会话不存在: {}", session_id)))
     }
 
     /// Disconnect an active SSH session.
@@ -654,37 +836,60 @@ impl SshManager {
             let mut guard = self.connections.write().await;
             guard.remove(session_id)
         };
-        match conn {
-            Some(conn) => {
-                // Best-effort: tell the driver task to close. Even if the send
-                // fails (driver already gone), the connection is removed.
-                let _ = conn.cmd_tx.send(SessionCommand::Disconnect);
-                Ok(())
-            }
-            None => Err(AppError::Ssh(format!("会话不存在: {}", session_id))),
+        if let Some(conn) = conn {
+            // Best-effort: tell the driver task to close. Even if the send
+            // fails (driver already gone), the connection is removed.
+            let _ = conn.cmd_tx.send(SessionCommand::Disconnect);
+            return Ok(());
         }
+        // Telnet：先摘表再让驱动收尾；驱动退出时按 generation 判定归属，
+        // 表里已经没有它 → 照常发 Disconnected 并通知观察者。
+        let telnet = {
+            let mut guard = self.telnet.write().await;
+            guard.remove(session_id)
+        };
+        if let Some(telnet) = telnet {
+            telnet.request_disconnect();
+            return Ok(());
+        }
+        Err(AppError::Ssh(format!("会话不存在: {}", session_id)))
     }
 
     /// Check if a session exists.
     pub async fn is_connected(&self, session_id: &str) -> bool {
         self.connections.read().await.contains_key(session_id)
+            || self.telnet.read().await.contains_key(session_id)
     }
 
     /// List active session IDs.
     pub async fn list_sessions(&self) -> Vec<String> {
-        self.connections.read().await.keys().cloned().collect()
+        let mut ids: Vec<String> = self.connections.read().await.keys().cloned().collect();
+        ids.extend(self.telnet.read().await.keys().cloned());
+        ids
     }
 
     /// Get the connection_id associated with a session, if available.
     pub async fn get_connection_id(&self, session_id: &str) -> Option<String> {
         let guard = self.connections.read().await;
-        guard.get(session_id).and_then(|c| c.connection_id.clone())
+        if let Some(conn) = guard.get(session_id) {
+            return conn.connection_id.clone();
+        }
+        drop(guard);
+        self.telnet_session(session_id)
+            .await
+            .and_then(|t| t.connection_id.clone())
     }
 
     /// Get the host and port for a session.
     pub async fn get_connection_info(&self, session_id: &str) -> Option<(String, u16)> {
         let guard = self.connections.read().await;
-        guard.get(session_id).map(|c| (c.host.clone(), c.port))
+        if let Some(conn) = guard.get(session_id) {
+            return Some((conn.host.clone(), conn.port));
+        }
+        drop(guard);
+        self.telnet_session(session_id)
+            .await
+            .map(|t| (t.host.clone(), t.port))
     }
 
     /// Get all session metadata in a single lock acquisition. Used by agent
@@ -692,11 +897,20 @@ impl SshManager {
     /// the connections map.
     pub async fn get_session_info(&self, session_id: &str) -> Option<SessionInfo> {
         let guard = self.connections.read().await;
-        guard.get(session_id).map(|c| SessionInfo {
-            host: c.host.clone(),
-            port: c.port,
-            username: c.username.clone(),
-            connection_id: c.connection_id.clone(),
+        if let Some(conn) = guard.get(session_id) {
+            return Some(SessionInfo {
+                host: conn.host.clone(),
+                port: conn.port,
+                username: conn.username.clone(),
+                connection_id: conn.connection_id.clone(),
+            });
+        }
+        drop(guard);
+        self.telnet_session(session_id).await.map(|t| SessionInfo {
+            host: t.host.clone(),
+            port: t.port,
+            username: t.username.clone(),
+            connection_id: t.connection_id.clone(),
         })
     }
 
@@ -704,6 +918,15 @@ impl SshManager {
     /// Used by the command_exec executor to open dedicated exec channels.
     pub async fn get_connection(&self, session_id: &str) -> Option<Arc<SshConnection>> {
         self.connections.read().await.get(session_id).cloned()
+    }
+
+    /// 取 Telnet 会话（不存在返回 None）。命令层与工具层用它判断当前会话
+    /// 是否需要分流到 `crate::telnet`（exec 模拟 / SFTP 拒绝）。
+    pub async fn telnet_session(
+        &self,
+        session_id: &str,
+    ) -> Option<Arc<crate::telnet::TelnetSession>> {
+        self.telnet.read().await.get(session_id).cloned()
     }
 
     /// 列出某 SavedConnection（config_id）当前**在线**的全部 session id。
@@ -717,6 +940,14 @@ impl SshManager {
             .map(|(sid, _)| sid.clone())
             .collect();
         drop(guard);
+        ids.extend(
+            self.telnet
+                .read()
+                .await
+                .iter()
+                .filter(|(_, c)| c.connection_id.as_deref() == Some(connection_id))
+                .map(|(sid, _)| sid.clone()),
+        );
         // 稳定顺序：按激活先后（早激活在前）。
         let order = self.activation_order.read().await;
         ids.sort_by_key(|sid| order.iter().position(|s| s == sid).unwrap_or(usize::MAX));
@@ -730,9 +961,15 @@ impl SshManager {
         connection_id: &str,
     ) -> Option<String> {
         let conns = self.connections.read().await;
+        let telnet = self.telnet.read().await;
         let order = self.activation_order.read().await;
         for sid in order.iter().rev() {
             if let Some(c) = conns.get(sid) {
+                if c.connection_id.as_deref() == Some(connection_id) {
+                    return Some(sid.clone());
+                }
+            }
+            if let Some(c) = telnet.get(sid) {
                 if c.connection_id.as_deref() == Some(connection_id) {
                     return Some(sid.clone());
                 }
@@ -750,6 +987,7 @@ impl SshManager {
         connection_id: &str,
     ) -> Option<String> {
         let conns = self.connections.read().await;
+        let telnet = self.telnet.read().await;
         let order = self.activation_order.read().await;
         let ai = self.ai_sessions.read().await;
         for sid in order.iter().rev() {
@@ -757,6 +995,11 @@ impl SshManager {
                 continue;
             }
             if let Some(c) = conns.get(sid) {
+                if c.connection_id.as_deref() == Some(connection_id) {
+                    return Some(sid.clone());
+                }
+            }
+            if let Some(c) = telnet.get(sid) {
                 if c.connection_id.as_deref() == Some(connection_id) {
                     return Some(sid.clone());
                 }
@@ -775,7 +1018,16 @@ impl SshManager {
     /// normally" from "the connection itself died"（reconnect 会换代，
     /// 旧代连接的通道以 None 结束时据此判定断连）.
     pub async fn is_generation_active(&self, session_id: &str, generation: u64) -> bool {
-        self.connections
+        if self
+            .connections
+            .read()
+            .await
+            .get(session_id)
+            .map_or(false, |c| c.generation == generation)
+        {
+            return true;
+        }
+        self.telnet
             .read()
             .await
             .get(session_id)
@@ -875,6 +1127,11 @@ impl SshManager {
         &self,
         session_id: &str,
     ) -> Result<russh_sftp::client::SftpSession, AppError> {
+        if self.telnet.read().await.contains_key(session_id) {
+            return Err(AppError::Ssh(
+                "当前连接是 Telnet：不支持 SFTP 文件传输，请改用 SSH 连接".into(),
+            ));
+        }
         let conn = {
             let guard = self.connections.read().await;
             guard.get(session_id).cloned()
@@ -900,6 +1157,11 @@ impl SshManager {
         F: FnMut(Arc<russh_sftp::client::SftpSession>) -> Fut,
         Fut: std::future::Future<Output = Result<T, russh_sftp::client::error::Error>>,
     {
+        if self.telnet.read().await.contains_key(session_id) {
+            return Err(AppError::Ssh(
+                "当前连接是 Telnet：不支持 SFTP 文件传输，请改用 SSH 连接".into(),
+            ));
+        }
         let conn = self
             .get_connection(session_id)
             .await

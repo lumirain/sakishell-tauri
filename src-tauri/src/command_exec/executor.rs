@@ -275,6 +275,15 @@ pub(crate) async fn run_raw<O: OutputSink>(
     output: O,
     cancel: Option<&watch::Receiver<CancelReason>>,
 ) -> Result<ExecOutcome<O::Output>, AppError> {
+    // Telnet 会话没有 exec 通道：走「发命令 + 回显/哨兵」的模拟执行。
+    // 分流放在这里而不是每个调用方，命令层 / Agent 工具 / 多机操控都不用改。
+    if let Some(telnet) = ssh.telnet_session(session_id).await {
+        return crate::telnet::exec::run(
+            &telnet, command, timeout, streaming, output, cancel,
+        )
+        .await;
+    }
+
     let conn = ssh
         .get_connection(session_id)
         .await
@@ -403,7 +412,7 @@ where
 /// 交付一个 chunk：进 sink（前台收集 / 后台沉淀），并在声明了流式目标时发
 /// `{type:"toolOutput", toolCallId, chunk}` 事件。远端通道与本机传输共用这一份，
 /// 两条路径的事件协议因此不会漂移。
-pub(super) fn deliver<O: OutputSink>(
+pub(crate) fn deliver<O: OutputSink>(
     output: &mut O,
     chunk: &str,
     streaming: Option<(&AppHandle, &str, &str)>,

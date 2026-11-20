@@ -448,6 +448,11 @@ export default function MobileConnectionList({
                             <div className="min-w-0 flex-1">
                               <div className="truncate text-sm font-medium text-zinc-100">
                                 {conn.name || formatConnLabel(conn.username, conn.host, conn.port, privacyMode)}
+                                {conn.protocol === 'telnet' && (
+                                  <span className="ml-1.5 rounded bg-amber-500/15 px-1 py-0.5 text-[10px] font-normal text-amber-400 align-middle">
+                                    Telnet
+                                  </span>
+                                )}
                               </div>
                               <div className="truncate text-xs text-zinc-500">
                                 {formatConnLabel(conn.username, conn.host, conn.port, privacyMode)}

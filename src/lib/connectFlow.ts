@@ -163,6 +163,9 @@ export function createConnectFlow(deps: ConnectFlowDeps) {
       authMethod,
       connectionId: conn.id,
       trustNewHostKey: trust,
+      // Telnet 与 SSH 共用这一条连接流程：只有协议字段不同，后端按它选择驱动。
+      // 缺省（老数据）即 SSH，所以这里显式写 'ssh' 也不会改变既有行为。
+      protocol: conn.protocol === 'telnet' ? 'telnet' : 'ssh',
     };
     beforeAttempt(conn.id, { clearLocalError: true });
     try {
@@ -170,7 +173,8 @@ export function createConnectFlow(deps: ConnectFlowDeps) {
       const sessionId = await connect(config);
       onSessionEstablished(config.connectionId, sessionId);
     } catch (err) {
-      if (!trust) {
+      // Telnet 没有主机密钥概念，`HostKeyMismatch` 只可能来自 SSH。
+      if (!trust && conn.protocol !== 'telnet') {
         const m = asHostKeyMismatch(parseAppError(err));
         if (m) {
           promptMismatch({
@@ -194,10 +198,14 @@ export function createConnectFlow(deps: ConnectFlowDeps) {
    * 自己从没存过密码。
    */
   const promptForPassword = (conn: SavedConnection, rejectedSaved = false) => {
+    const isTelnet = conn.protocol === 'telnet';
     promptPassword({
-      title: 'SSH 密码',
+      title: isTelnet ? 'Telnet 密码' : 'SSH 密码',
       description:
-        `连接到 ${formatConnLabel(conn.username, conn.host, conn.port, privacyMode)}。密码会加密保存在本设备，下次自动使用。` +
+        `连接到 ${formatConnLabel(conn.username, conn.host, conn.port, privacyMode)}。` +
+        (isTelnet
+          ? '密码会加密保存在本设备，连上后遇到登录提示时自动填写（明文协议，密码在网络上不加密）。'
+          : '密码会加密保存在本设备，下次自动使用。') +
         (rejectedSaved ? '上次保存的密码被服务器拒绝，请输入新的。' : ''),
       onSubmit: async (password) => {
         // 一律保存（没有"不记住"这个选项）：没存下来的密码会一路带来两个坏结果——

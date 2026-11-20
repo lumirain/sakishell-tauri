@@ -24,6 +24,9 @@ pub mod notification;
 pub mod plugins;
 pub mod skills;
 pub mod ssh;
+// Telnet 支持：与 SSH 并排登记在 SshManager 里，共用终端/状态事件；
+// exec 用「发命令 + 回显/哨兵」模拟，SFTP 明确不支持。
+pub mod telnet;
 // 跨读取块的 UTF-8 解码器：终端 / 远端命令通道 / 本机命令管道共用，
 // 避免多字节字符被包边界切开后变成 U+FFFD。
 pub(crate) mod utf8_carry;

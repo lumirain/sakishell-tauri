@@ -370,6 +370,7 @@ pub async fn ssh_connect_with_saved_password(
         connection_id: Some(connection_id),
         trust_new_host_key: trust_new_host_key.unwrap_or(false),
         jump,
+        protocol: Some(saved.protocol),
     };
 
     state.ssh_manager.connect(config, app).await
@@ -413,6 +414,7 @@ pub async fn ssh_connect_with_saved_passphrase(
         connection_id: Some(connection_id),
         trust_new_host_key: trust_new_host_key.unwrap_or(false),
         jump,
+        protocol: Some(saved.protocol),
     };
 
     state.ssh_manager.connect(config, app).await
@@ -466,6 +468,7 @@ pub(crate) fn build_saved_connection_config(
         connection_id: Some(connection_id.to_string()),
         trust_new_host_key,
         jump,
+        protocol: Some(saved.protocol.clone()),
     })
 }
 

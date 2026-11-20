@@ -1038,6 +1038,11 @@ export default function ConnectionList() {
                         >
                           <div className="font-medium text-zinc-200 truncate">
                             {conn.name}
+                            {conn.protocol === 'telnet' && (
+                              <span className="ml-1.5 rounded bg-amber-500/15 px-1 py-0.5 text-[10px] font-normal text-amber-400 align-middle">
+                                Telnet
+                              </span>
+                            )}
                           </div>
                           <div className="text-xs text-zinc-500 truncate">
                             {formatConnLabel(conn.username, conn.host, conn.port, privacyMode)}

@@ -1,4 +1,4 @@
-import type { JumpAuthMethod, SavedConnection } from '@/lib/types';
+import type { ConnectionProtocol, JumpAuthMethod, SavedConnection } from '@/lib/types';
 import { getErrorMessage } from '@/lib/errors';
 
 /**
@@ -15,6 +15,8 @@ export interface ConnectionFormValues {
   host: string;
   username: string;
   port: number;
+  /** 协议：缺省 / 'ssh' = SSH；'telnet' 时认证方式与跳板机规则全部不适用。 */
+  protocol?: ConnectionProtocol;
   authMethod: string;
   keyId: string;
   keyPath: string;
@@ -35,17 +37,22 @@ export interface ConnectionFormValues {
  *
  * 五条跳板机规则与主连接规则同源：必填三项、端口范围、私钥（密钥库 id 或手填
  * 路径二选一）、跳板机密码（本次没填且以前也没存过才算缺）。
+ *
+ * Telnet 例外：没有密钥认证、没有跳板机，也允许不填用户名（不填 = 不自动登录，
+ * 连上后手动输）。
  */
 export function validateConnectionForm(
   values: ConnectionFormValues,
 ): Record<string, string> {
   const errors: Record<string, string> = {};
+  const isTelnet = values.protocol === 'telnet';
   if (!values.name.trim()) errors.name = '名称为必填项';
   if (!values.host.trim()) errors.host = '主机为必填项';
-  if (!values.username.trim()) errors.username = '用户名为必填项';
+  if (!values.username.trim() && !isTelnet) errors.username = '用户名为必填项';
   if (values.port < 1 || values.port > 65535) {
     errors.port = '端口必须在 1-65535 之间';
   }
+  if (isTelnet) return errors;
   if (values.authMethod === 'PrivateKey' && !values.keyId && !values.keyPath.trim()) {
     errors.keyPath = '请选择或导入一把私钥';
   }
@@ -80,6 +87,7 @@ export interface ConnectionFormDraft {
   host: string;
   port: number;
   username: string;
+  protocol?: ConnectionProtocol;
   authMethod: string;
   keyId: string;
   keyPath: string;
@@ -100,33 +108,37 @@ export interface ConnectionFormDraft {
  * - 选了密钥库里的私钥就不再记路径；反之保留手填路径（老数据与高级用法）
  * - 分组 trim 后为空 = 未分组（落盘为缺省）
  * - 跳板机关闭时所有 jump* 字段一律缺省，不留残值
+ * - Telnet 没有密钥认证与跳板机：认证方式固定 Password、jump* 一律缺省，
+ *   私钥字段清空（避免切换协议后留下指向 SSH 私钥的残值）
  */
 export function buildSavedConnection(draft: ConnectionFormDraft): SavedConnection {
+  const isTelnet = draft.protocol === 'telnet';
+  const authMethod = isTelnet ? 'Password' : draft.authMethod;
+  const usePrivateKey = !isTelnet && authMethod === 'PrivateKey';
+  const useJump = !isTelnet && draft.useJump;
   return {
     id: draft.existing?.id ?? crypto.randomUUID(),
     name: draft.name.trim(),
     host: draft.host.trim(),
     port: draft.port,
     username: draft.username.trim(),
-    authMethod: draft.authMethod,
-    keyPath:
-      draft.authMethod === 'PrivateKey' && !draft.keyId
-        ? draft.keyPath.trim()
-        : undefined,
-    keyId: draft.authMethod === 'PrivateKey' ? draft.keyId || undefined : undefined,
+    authMethod,
+    protocol: isTelnet ? 'telnet' : 'ssh',
+    keyPath: usePrivateKey && !draft.keyId ? draft.keyPath.trim() : undefined,
+    keyId: usePrivateKey ? draft.keyId || undefined : undefined,
     group: draft.group.trim() || undefined,
     lastConnected: draft.existing?.lastConnected,
-    useJump: draft.useJump,
-    jumpHost: draft.useJump ? draft.jumpHost.trim() : undefined,
-    jumpPort: draft.useJump ? draft.jumpPort : undefined,
-    jumpUsername: draft.useJump ? draft.jumpUsername.trim() : undefined,
-    jumpAuthMethod: draft.useJump ? draft.jumpAuthMethod : undefined,
+    useJump,
+    jumpHost: useJump ? draft.jumpHost.trim() : undefined,
+    jumpPort: useJump ? draft.jumpPort : undefined,
+    jumpUsername: useJump ? draft.jumpUsername.trim() : undefined,
+    jumpAuthMethod: useJump ? draft.jumpAuthMethod : undefined,
     jumpKeyPath:
-      draft.useJump && draft.jumpAuthMethod === 'PrivateKey' && !draft.jumpKeyId
+      useJump && draft.jumpAuthMethod === 'PrivateKey' && !draft.jumpKeyId
         ? draft.jumpKeyPath.trim()
         : undefined,
     jumpKeyId:
-      draft.useJump && draft.jumpAuthMethod === 'PrivateKey'
+      useJump && draft.jumpAuthMethod === 'PrivateKey'
         ? draft.jumpKeyId || undefined
         : undefined,
   };

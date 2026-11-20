@@ -124,6 +124,29 @@ describe('validateConnectionForm', () => {
     expect(errors.jumpHost).toBeUndefined();
     expect(errors.jumpPort).toBeUndefined();
   });
+
+  it('Telnet：用户名可留空，认证方式与跳板机规则不再适用', () => {
+    const errors = validateConnectionForm({
+      ...validValues,
+      protocol: 'telnet',
+      username: '',
+      authMethod: 'PrivateKey',
+      keyId: '',
+      keyPath: '',
+      useJump: true,
+      jumpHost: '',
+      jumpUsername: '',
+      jumpPort: 0,
+    });
+    expect(errors.username).toBeUndefined();
+    expect(errors.keyPath).toBeUndefined();
+    expect(errors.jumpHost).toBeUndefined();
+    expect(errors.jumpPort).toBeUndefined();
+    // 名称 / 主机 / 端口这些通用规则仍照常生效
+    expect(
+      validateConnectionForm({ ...validValues, protocol: 'telnet', host: '' }).host,
+    ).toBe('主机为必填项');
+  });
 });
 
 describe('buildSavedConnection', () => {
@@ -250,6 +273,34 @@ describe('buildSavedConnection', () => {
     });
     expect(withPath.jumpKeyId).toBeUndefined();
     expect(withPath.jumpKeyPath).toBe('/home/me/key');
+  });
+
+  it('Telnet：认证方式固定 Password，私钥与跳板机字段一律清空', () => {
+    const saved = buildSavedConnection({
+      ...validValues,
+      protocol: 'telnet',
+      authMethod: 'PrivateKey',
+      keyId: 'k1',
+      keyPath: '/tmp/key',
+      useJump: true,
+      jumpHost: 'bastion',
+      jumpPort: 2222,
+      jumpUsername: 'jump',
+      jumpAuthMethod: 'PrivateKey',
+      jumpKeyId: 'k9',
+    });
+    expect(saved.protocol).toBe('telnet');
+    expect(saved.authMethod).toBe('Password');
+    expect(saved.keyId).toBeUndefined();
+    expect(saved.keyPath).toBeUndefined();
+    expect(saved.useJump).toBe(false);
+    expect(saved.jumpHost).toBeUndefined();
+    expect(saved.jumpKeyId).toBeUndefined();
+  });
+
+  it('SSH（缺省）：protocol 落成 ssh，行为与之前一致', () => {
+    const saved = buildSavedConnection({ ...validValues, authMethod: 'Password' });
+    expect(saved.protocol).toBe('ssh');
   });
 });
 

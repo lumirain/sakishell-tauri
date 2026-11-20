@@ -295,6 +295,7 @@ async fn spawn_connection(
         connection_id: Some(saved.id.clone()),
         trust_new_host_key: false,
         jump,
+        protocol: Some(saved.protocol.clone()),
     };
 
     state.ssh_manager.connect(config, app.clone()).await

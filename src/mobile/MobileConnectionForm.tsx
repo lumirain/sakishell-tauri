@@ -1,5 +1,10 @@
 import { useEffect, useState, type ReactNode } from 'react';
-import type { JumpAuthMethod, SavedConnection, StoredKeyMeta } from '@/lib/types';
+import type {
+  ConnectionProtocol,
+  JumpAuthMethod,
+  SavedConnection,
+  StoredKeyMeta,
+} from '@/lib/types';
 import { DEFAULT_PORT } from '@/lib/constants';
 import * as tauri from '@/lib/tauri';
 import {
@@ -70,6 +75,7 @@ export default function MobileConnectionForm({
   const [port, setPort] = useState(DEFAULT_PORT);
   const [portInput, setPortInput] = useState(String(DEFAULT_PORT));
   const [username, setUsername] = useState('');
+  const [protocol, setProtocol] = useState<ConnectionProtocol>('ssh');
   const [authMethod, setAuthMethod] = useState('Password');
   const [keyPath, setKeyPath] = useState('');
   const [keyId, setKeyId] = useState('');
@@ -119,6 +125,7 @@ export default function MobileConnectionForm({
     setPort(mainPort);
     setPortInput(String(mainPort));
     setUsername(connection?.username ?? '');
+    setProtocol(connection?.protocol === 'telnet' ? 'telnet' : 'ssh');
     setAuthMethod(connection?.authMethod ?? 'Password');
     setKeyPath(connection?.keyPath ?? '');
     setKeyId(connection?.keyId ?? '');
@@ -224,6 +231,7 @@ export default function MobileConnectionForm({
       host,
       port,
       username,
+      protocol,
       authMethod,
       keyId,
       keyPath,
@@ -243,6 +251,7 @@ export default function MobileConnectionForm({
       host,
       username,
       port,
+      protocol,
       authMethod,
       keyId,
       keyPath,
@@ -265,6 +274,11 @@ export default function MobileConnectionForm({
 
   /** Persist secrets to keychain (best-effort, same semantics as desktop). */
   const persistSecrets = async (id: string) => {
+    // Telnet：密码即自动登录凭据（密钥链 account 仍是连接 id，与 SSH 密码共用）。
+    if (protocol === 'telnet') {
+      if (secret) await tauri.savePassword(id, secret);
+      return;
+    }
     if (secret) {
       if (authMethod === 'Password') {
         await tauri.savePassword(id, secret);
@@ -318,7 +332,11 @@ export default function MobileConnectionForm({
   };
 
   const secretLabel =
-    authMethod === 'Password' ? '密码（可选）' : '密钥密码（可选）';
+    protocol === 'telnet'
+      ? '密码（自动登录用，可选）'
+      : authMethod === 'Password'
+        ? '密码（可选）'
+        : '密钥密码（可选）';
   const secretPlaceholder = connection?.id
     ? '留空则保持不变'
     : '留空则连接时输入';
@@ -400,7 +418,7 @@ export default function MobileConnectionForm({
           </Field>
         </div>
 
-        <Field label="用户名" error={errors.username}>
+        <Field label={protocol === 'telnet' ? '用户名（自动登录用，可留空）' : '用户名'} error={errors.username}>
           <input
             type="text"
             value={username}
@@ -413,6 +431,44 @@ export default function MobileConnectionForm({
           />
         </Field>
 
+        <Field label="连接方式">
+          <div className="flex gap-2">
+            {(['ssh', 'telnet'] as const).map((value) => (
+              <button
+                key={value}
+                type="button"
+                onClick={() => {
+                  setProtocol(value);
+                  if (value === 'telnet') {
+                    setAuthMethod('Password');
+                    setSecret('');
+                    setSecretDirty(false);
+                    setUseJump(false);
+                    if (port === DEFAULT_PORT) {
+                      setPort(23);
+                      setPortInput('23');
+                    }
+                  }
+                }}
+                className={`flex-1 rounded-lg border px-3 py-2.5 text-sm ${
+                  protocol === value
+                    ? 'border-indigo-500 bg-indigo-500/10 text-indigo-300'
+                    : 'border-zinc-700 bg-zinc-800 text-zinc-300'
+                }`}
+              >
+                {value === 'ssh' ? 'SSH' : 'Telnet'}
+              </button>
+            ))}
+          </div>
+          {protocol === 'telnet' && (
+            <p className="mt-1 text-[11px] leading-relaxed text-zinc-500">
+              Telnet 为明文协议（无加密、无主机密钥校验）。不支持
+              SFTP，Agent 命令靠终端回显模拟。
+            </p>
+          )}
+        </Field>
+
+        {protocol === 'ssh' && (
         <Field label="认证方式">
           <select
             value={authMethod}
@@ -431,8 +487,9 @@ export default function MobileConnectionForm({
             <option value="PrivateKey">私钥</option>
           </select>
         </Field>
+        )}
 
-        {authMethod === 'PrivateKey' && (
+        {protocol === 'ssh' && authMethod === 'PrivateKey' && (
           <>
             <Field label="私钥">
               <div className="flex gap-2">
@@ -609,7 +666,8 @@ export default function MobileConnectionForm({
           />
         </Field>
 
-        {/* Jump host (ProxyJump) */}
+        {/* Jump host (ProxyJump)：Telnet 没有跳板机 */}
+        {protocol === 'ssh' && (
         <div className="rounded-xl border border-zinc-800 bg-zinc-900/40">
           <button
             type="button"
@@ -800,6 +858,7 @@ export default function MobileConnectionForm({
             </div>
           )}
         </div>
+        )}
       </div>
 
       {/* 私钥库：选文件 / 粘贴内容 / 重命名 / 删除都在同一个界面里。

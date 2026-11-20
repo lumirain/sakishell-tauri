@@ -216,7 +216,7 @@ impl ExternalExecutor {
         {
             let sessions = self.sessions.lock().await;
             if let Some(session_id) = sessions.get(connection_id) {
-                if self.ssh_manager.get_connection(session_id).await.is_some() {
+                if self.ssh_manager.is_connected(session_id).await {
                     return Ok(session_id.clone());
                 }
             }
@@ -262,6 +262,8 @@ impl ExternalExecutor {
             trust_new_host_key: false,
             // 临时连接不支持跳板机（外部调用没有配置跳板机的入口）
             jump: None,
+            // 临时连接只用 SSH（外部执行依赖 exec 通道，Telnet 没有）
+            protocol: None,
         })
     }
 
@@ -817,6 +819,8 @@ impl ExternalExecutor {
                 port,
                 username: username.to_string(),
                 auth_method: stored_auth_method.to_string(),
+                // 外部调用只建立 SSH 会话（Telnet 没有 exec 通道可用）
+                protocol: "ssh".into(),
                 key_path: private_key_path.map(str::to_string),
                 key_id: None,
                 group: None,
