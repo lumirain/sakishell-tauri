@@ -148,7 +148,7 @@ jobs:
   # 时 30 分钟构建结束才发现。只做 cargo check，不打包。
   rust-cross-macos:
     name: Rust 交叉编译检查（macOS arm64）
-    runs-on: macos-14 # Apple Silicon 原生 runner
+    runs-on: macos-15 # Apple Silicon 原生 runner（macos-14 已于 2026-11-02 退役）
     timeout-minutes: 40
     defaults:
       run:

@@ -39,14 +39,14 @@ jobs:
             suffix: arm64-setup.exe
             artifact: saki-windows-arm64
           - name: macos-intel
-            os: macos-14
+            os: macos-15-intel
             target: x86_64-apple-darwin
             bundle: dmg
             # dmg 产物命名：x86_64 → x64
             suffix: x64.dmg
             artifact: saki-macos-x64
           - name: macos-apple-silicon
-            os: macos-14
+            os: macos-15
             target: aarch64-apple-darwin
             bundle: dmg
             # dmg 产物命名：aarch64 → aarch64
